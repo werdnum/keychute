@@ -198,6 +198,10 @@ One binary, several logical components:
   `Host`/`:authority` and hop-by-hop headers are synthesized from the approved
   origin, never taken from the caller (a caller-supplied authority could route the
   credential to a different virtual host behind the same wildcard certificate).
+  Inbound authentication — the caller's Keychute API token or SA token — and any
+  gateway cookies are consumed at the API boundary and never copied into the
+  outbound request, so the upstream service never sees credentials that could
+  impersonate the client back to Keychute.
 - **Crypto**: envelope encryption (§5).
 - **Audit log**: append-only record of every request, decision, and release/use.
 
@@ -288,7 +292,11 @@ the ciphertext-only design removes the main reason to isolate.
   (`auto-approve` / `notify-only` / `require-approval` / `deny`), expiry.
   Standing grants (CUJ 3 pre-approval) are rows here with an expiry, created from
   the approval UI. Resolution over overlapping rows is deterministic and total:
-  `deny` overrides any other matching outcome; otherwise rows are ordered
+  `deny` overrides any other matching outcome, and deny rows match on
+  **overlap**, not subset — a requested grant whose usable scope intersects a
+  denied scope is rejected outright, since a broader grant would implicitly
+  contain the denied region (re-request with a narrower scope if the remainder
+  was wanted); otherwise rows are ordered
   lexicographically by specificity — client dimension first (specific client
   over wildcard), then secret dimension (exact secret over tag) — then by
   explicit integer priority, and a residual tie resolves to the most restrictive
@@ -306,7 +314,14 @@ the ciphertext-only design removes the main reason to isolate.
   machinery as secret payloads: a tier-2/3 client may have credential bytes in a
   reason or script source, and context must not become a plaintext side channel
   into the DB and its backups. It is decrypted only to render the approval page,
-  never copied into plaintext audit rows, and purged with the request.
+  never copied into plaintext audit rows, and purged with the request. Requested
+  **constraints** (origins, methods, path prefixes) and the per-call paths in
+  the audit log are deliberately *not* encrypted: the server must evaluate,
+  index, and display them, so they are structural metadata, and the
+  ciphertext-only guarantee is explicitly scoped to secret payloads and
+  freeform context. A URL is not a place for a secret — that is already true
+  end-to-end (upstream access logs see it too), and the operator sees every
+  constraint verbatim in the approval UI.
 - `grants` — issued capability: request_id, constraints, TTL, max_uses, use_count,
   revoked. (One-shot releases are grants with max_uses = 1.) A passthrough secret
   entered at approval time but not stored is encrypted and attached to its grant,
@@ -320,9 +335,19 @@ the ciphertext-only design removes the main reason to isolate.
   caller against the client on the originating access request, so a leaked
   `grant_id` is useless to any other client identity. A grant issued under a
   standing policy row also expires no later than that row does — a request made
-  minutes before a policy lapses cannot extend access past it.
+  minutes before a policy lapses cannot extend access past it. Every access
+  additionally revalidates current state — client enabled, secret and client max
+  tiers, allowed mechanism — so tightening a cap or disabling a client takes
+  effect immediately for already-issued grants rather than waiting for their
+  expiry. Consumption of a single-use grant is atomic: the expiry/revocation
+  check, idempotency-key binding, and use-count increment happen in one
+  conditional `UPDATE … RETURNING`, so racing first reads cannot both be
+  treated as the first.
 - `audit_log` — append-only: every request, decision, release, and each individual
-  proxied call (method, host, path, status — never bodies or credentials).
+  proxied call (method, host, path, status — never bodies or credentials). Each
+  release or proxy event records the immutable `secret_version_id` actually
+  decrypted, so incident response can tell exactly which credential was exposed
+  even across rotations.
 
 ---
 
@@ -407,7 +432,10 @@ grant is thereby visible.
   protection (per-session token plus `Origin`/Fetch-Metadata checks) — an
   authenticated gateway session alone never proves the operator initiated the
   action, since the gateway attaches the operator's token to whatever their
-  browser sends. Cluster-
+  browser sends. Human pages are served with
+  `Content-Security-Policy: frame-ancestors 'none'` (plus `X-Frame-Options:
+  DENY`) so an authenticated approval page cannot be clickjacked from a framing
+  site. Cluster-
   internal client API routes bypass OIDC (the sudo-service shape: internal service
   URL for machines, OIDC-fronted external URL for me).
 
