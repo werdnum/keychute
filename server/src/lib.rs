@@ -16,7 +16,9 @@ use anyhow::Context;
 
 /// Run the server until shutdown.
 pub async fn run(config: config::Config) -> anyhow::Result<()> {
-    let state = state::AppState::init(config).await.context("initializing")?;
+    let state = state::AppState::init(config)
+        .await
+        .context("initializing")?;
     let app = api::router(state.clone()).merge(ui::router(state.clone()));
 
     // Background sweeps: push outbox retry + request expiry + purge.
@@ -26,12 +28,10 @@ pub async fn run(config: config::Config) -> anyhow::Result<()> {
     tracing::info!(%addr, tls = state.config.tls.is_some(), "keychute-server listening");
     match &state.config.tls {
         Some(tls) => {
-            let rustls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(
-                &tls.cert_path,
-                &tls.key_path,
-            )
-            .await
-            .context("loading TLS cert/key")?;
+            let rustls_config =
+                axum_server::tls_rustls::RustlsConfig::from_pem_file(&tls.cert_path, &tls.key_path)
+                    .await
+                    .context("loading TLS cert/key")?;
             axum_server::bind_rustls(addr, rustls_config)
                 .serve(app.into_make_service())
                 .await?;

@@ -376,6 +376,116 @@ audit rows + fake upstream. Fake services in-harness: upstream HTTPS-less HTTP
 server (axum) recording requests; fake Pushover recording pushes; fake
 TokenReview endpoint.
 
+## Review addendum — pinned resolutions (Codex round 1)
+
+These override anything above where they conflict.
+
+1. **Ownership on every object operation.** `GET /v1/access-requests/{id}`,
+   `/wait`, `POST /v1/grants/{id}/read`, and `/proxy` all require
+   `authenticated_client == row.client_name`; mismatch → 404 (not 403 — do not
+   confirm existence). Replay reads too.
+2. **Unique authn bindings.** Partial unique indexes on
+   `clients(api_token_sha256) WHERE api_token_sha256 IS NOT NULL` and
+   `clients(sa_audience, sa_subject) WHERE sa_audience IS NOT NULL`. Config
+   validation also rejects duplicate token hashes / SA bindings across clients.
+3. **TokenReview algorithm.** Send `spec.audiences` = the union of all
+   configured client SA audiences. Accept only if `status.authenticated ==
+   true`, `status.user.username` exactly equals some client's `sa_subject`, and
+   that client's `sa_audience` ∈ `status.audiences` (the intersection the API
+   server validated). Exactly one client row may match (guaranteed by #2);
+   otherwise reject.
+4. **Proxy header contract (exact).** Outbound request is built fresh:
+   - Never forwarded from caller: `Host`, `Authorization`, `Proxy-Authorization`,
+     `Cookie`, `Set-Cookie`, `Forwarded`, any `X-Forwarded-*`, `X-Real-IP`,
+     `X-HTTP-Method-Override`, `X-Method-Override`, `X-Original-URL`,
+     `X-Rewrite-URL`, `X-Original-Method`, all RFC hop-by-hop headers
+     (`Connection`, `Keep-Alive`, `Proxy-Connection`, `TE`, `Trailer`,
+     `Transfer-Encoding`, `Upgrade`), every header named in the caller's
+     `Connection` value, `Content-Length` (recomputed), `Expect`, and any header
+     equal (case-insensitive) to the injection header.
+   - Synthesized: `Host` from the approved origin; injection header from the
+     template.
+   - Injection template validation (at secret create/update time): header kind
+     must be a valid token, not in the strip/reserved list above, not `Host`,
+     and value placement is always the full header value.
+   - Response passthrough strips hop-by-hop headers likewise. Response is
+     otherwise verbatim (incl. `Set-Cookie` from upstream — that is upstream
+     state for the client, allowed).
+5. **Push vocabulary for unknown secrets.** If `secret_name` does not match a
+   stored secret at push time, the push says `a not-yet-stored secret` (generic
+   label); the name appears only on the approval page. Stored-secret names are
+   operator vocabulary and may appear.
+6. **Replay window enforced in SQL.** The replay branch requires
+   `first_read_at + replay_window >= now()` inside the same transaction,
+   plus grant not revoked and `now() < not_after`, plus caller ownership.
+   Stale replay rows (outside window) → `Exhausted` (or normal first-use path
+   if uses remain).
+7. **Plaintext HTTP requires explicit opt-in.** Config gains
+   `allow_insecure_http: false` (default). Without TLS config, the server
+   refuses to start unless `allow_insecure_http: true`; additionally refuse
+   non-loopback binds without TLS unless `allow_insecure_http_non_loopback:
+   true` (e2e uses loopback).
+8. **Approval checks expiry.** The approve UPDATE includes
+   `AND now() < expires_at`. Same for deny.
+9. **CSRF.** UI POST protection: (a) if an `Origin` header is present it must
+   exactly equal the configured `external_url` origin (or the request's own
+   scheme+host when accessed via internal URL — pin: compare against
+   `external_url` origin OR `Host`-derived origin, exact match); missing
+   `Origin` + present `Sec-Fetch-Site` other than `same-origin`/`none` →
+   reject; (b) the form token MACs (route, action id i.e. request/grant/policy
+   id, subject, expiry) and is single-purpose. Both required on every POST.
+10. **Push dedup key** = client + secret + mechanism + hash of normalized
+    constraints (origins, methods, prefixes, ttl, max_uses). Retry cap: after 5
+    failed attempts, keep retrying but back off to once per sweep (30s) —
+    never abandon a pending undelivered request while it is pending.
+11. **Purge lifecycle (sweeper, every 30s).** (a) pending past expiry →
+    expired + audit; (b) grants: passthrough payload nulled when [consumed and
+    replay window closed] or [expired] or [revoked]; (c) request context
+    ciphertext nulled when request reached terminal state more than 24 h ago;
+    (d) grant_reads rows older than replay window deleted (their pin on
+    secret_versions ends with them).
+12. **Outbound URL construction.** Build `Url` from the approved origin
+    (`https://host[:port]`), then `set_path(&encoded_canonical_path)` and
+    `set_query(...)` on that parsed URL. Never string-concat, never `join()`.
+    Origin host normalization: lowercase ASCII, strip trailing dot, reject
+    userinfo/IP-with-brackets oddities at parse (already in types Origin);
+    ports compared *effective* (443 == None).
+13. *(already in config)* `limits.max_proxy_streams_per_client` — enforced via
+    `AppState::try_take_slot(client, SlotKind::Proxy)` for the whole
+    request/response stream lifetime.
+14. **`Cache-Control: no-store` on every secret-bearing response**: grant read,
+    proxy responses (add the header to the proxied response in addition to
+    upstream's headers — override upstream's value), and all UI pages.
+15. **Revalidation rule (final).** At access time re-check: grant not revoked,
+    `now() < not_after`, client exists+enabled, mechanism still in client's
+    list, tier ≤ client.max_tier, and (if the secret row exists) secret
+    enabled + tier ≤ secret.max_tier. Policy-row existence is NOT re-checked
+    (grants already carry the policy-capped `not_after`); revocation is the
+    retroactive kill switch.
+16. **Approval-time storage metadata.** The approval form for a not-yet-stored
+    secret with "store" checked requires `max_tier` (default = the tier of the
+    requested mechanism — never broader) and optional injection template
+    (default bearer). Secret + version creation joins the approval transaction.
+17. **Injection kinds.** `bearer` (Authorization: Bearer <secret>), `header`
+    (named header, validated per #4), `basic-password` (config stores
+    `injection_username`; header = `Authorization: Basic
+    base64(username ":" secret)`). Malformed/NUL/CR/LF bytes in the secret for
+    header placement → the proxy call fails closed with 502 code
+    `bad-credential-encoding` (never sent partially).
+18. **Idempotency canonicalization + bounds.** The MAC input is the canonical
+    JSON serialization (serde_json with sorted keys — serialize
+    `CreateAccessRequest` to `serde_json::Value`, then a canonical writer that
+    sorts object keys, no whitespace) of the request body MINUS
+    `idempotency_key`. Bounds enforced at the API: `idempotency_key` ≤ 128
+    bytes, `reason` ≤ 4 KiB, `structured` context ≤ 16 KiB serialized,
+    constraints lists ≤ 32 entries each. Oversize → 400.
+19. **KEK retirement lock.** Every transaction that INSERTs a wrapped DEK takes
+    `pg_advisory_xact_lock_shared(hashtext('keychute-kek'))`. The (admin CLI /
+    future) retirement path takes the exclusive form before checking
+    zero-references. v1 ships the shared-side discipline in the store layer +
+    a `verify_no_references(kek_id)` store function; the operator runbook does
+    the rest.
+
 ## Definition of done per module
 
 Unit tests in-crate for: crypto roundtrip/AAD-swap/rewrap/retirement-lock,

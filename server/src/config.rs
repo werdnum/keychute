@@ -12,6 +12,12 @@ pub struct Config {
     pub external_url: String,
     #[serde(default)]
     pub tls: Option<TlsConfig>,
+    /// Plaintext HTTP requires explicit opt-in (addendum #7). Loopback only
+    /// unless `allow_insecure_http_non_loopback` is also set.
+    #[serde(default)]
+    pub allow_insecure_http: bool,
+    #[serde(default)]
+    pub allow_insecure_http_non_loopback: bool,
     #[serde(default)]
     pub database_url: Option<String>,
     pub kek_file: PathBuf,
@@ -152,8 +158,8 @@ impl Default for Limits {
 
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Config> {
-        let raw = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let raw =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let mut config: Config = serde_yaml::from_str(&raw).context("parsing config YAML")?;
         if let Ok(url) = std::env::var("KEYCHUTE_DATABASE_URL") {
             config.database_url = Some(url);
@@ -166,6 +172,24 @@ impl Config {
         if self.database_url.is_none() {
             bail!("database_url missing (config or KEYCHUTE_DATABASE_URL)");
         }
+        if self.tls.is_none() {
+            if !self.allow_insecure_http {
+                bail!(
+                    "no TLS configured: refusing plaintext HTTP without allow_insecure_http: true"
+                );
+            }
+            let loopback = self
+                .listen_addr
+                .parse::<std::net::SocketAddr>()
+                .map(|a| a.ip().is_loopback())
+                .unwrap_or(false);
+            if !loopback && !self.allow_insecure_http_non_loopback {
+                bail!(
+                    "refusing plaintext HTTP on non-loopback {} without allow_insecure_http_non_loopback: true",
+                    self.listen_addr
+                );
+            }
+        }
         match self.human_auth.mode {
             HumanAuthMode::Static => {
                 if self.human_auth.r#static.is_none() {
@@ -173,11 +197,9 @@ impl Config {
                 }
             }
             HumanAuthMode::Oidc => {
-                let oidc = self
-                    .human_auth
-                    .oidc
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("human_auth.mode=oidc requires human_auth.oidc"))?;
+                let oidc = self.human_auth.oidc.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("human_auth.mode=oidc requires human_auth.oidc")
+                })?;
                 if oidc.allowed_subjects.is_empty() && oidc.allowed_group.is_none() {
                     bail!("oidc human auth requires allowed_subjects or allowed_group (authorization allowlist)");
                 }
@@ -206,6 +228,25 @@ impl Config {
         let names: std::collections::HashSet<_> = self.clients.iter().map(|c| &c.name).collect();
         if names.len() != self.clients.len() {
             bail!("duplicate client names in config");
+        }
+        // Addendum #2: authn bindings must be unambiguous across clients.
+        let mut token_hashes = std::collections::HashSet::new();
+        let mut sa_bindings = std::collections::HashSet::new();
+        for c in &self.clients {
+            if let Some(h) = &c.auth.api_token_sha256 {
+                if !token_hashes.insert(h.to_ascii_lowercase()) {
+                    bail!("duplicate api_token_sha256 across clients (ambiguous binding)");
+                }
+            }
+            if let Some(sa) = &c.auth.service_account {
+                if !sa_bindings.insert((sa.audience.clone(), sa.subject.clone())) {
+                    bail!(
+                        "duplicate service-account binding {}/{} across clients",
+                        sa.audience,
+                        sa.subject
+                    );
+                }
+            }
         }
         Ok(())
     }
