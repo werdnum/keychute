@@ -17,6 +17,9 @@ pub struct AccessRequestRow {
     pub context_wrapped_dek: Option<Vec<u8>>,
     pub context_kek_id: Option<String>,
     pub state: String,
+    /// Expiry of the standing policy row that matched at creation time, when
+    /// one did. A later human approval caps the grant at it (migration 0005).
+    pub policy_not_after: Option<DateTime<Utc>>,
     pub deny_reason: Option<String>,
     pub resolved_by: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -42,6 +45,9 @@ pub struct NewAccessRequest {
     pub context_wrapped_dek: Option<Vec<u8>>,
     pub context_kek_id: Option<String>,
     pub expires_at: DateTime<Utc>,
+    /// Cap inherited from the matching standing policy row (see
+    /// [`AccessRequestRow::policy_not_after`]).
+    pub policy_not_after: Option<DateTime<Utc>>,
     pub idem_client: String,
     pub idem_key: String,
     pub idem_mac: Vec<u8>,
@@ -71,8 +77,8 @@ pub async fn insert_access_request(
         "INSERT INTO access_requests \
          (client_name, secret_name, mechanism, constraints, \
           context_ciphertext, context_nonce, context_wrapped_dek, context_kek_id, \
-          expires_at, idem_client, idem_key, idem_mac) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
+          expires_at, policy_not_after, idem_client, idem_key, idem_mac) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
          ON CONFLICT (idem_client, idem_key) DO NOTHING \
          RETURNING *",
     )
@@ -85,6 +91,7 @@ pub async fn insert_access_request(
     .bind(&req.context_wrapped_dek)
     .bind(&req.context_kek_id)
     .bind(req.expires_at)
+    .bind(req.policy_not_after)
     .bind(&req.idem_client)
     .bind(&req.idem_key)
     .bind(&req.idem_mac)

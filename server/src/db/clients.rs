@@ -21,6 +21,22 @@ pub struct ClientRow {
 /// upsert by name (re-enabling), disable rows not present in config.
 pub async fn reconcile_clients(db: &PgPool, clients: &[ClientConfig]) -> anyhow::Result<()> {
     let mut tx = db.begin().await?;
+    let names: Vec<String> = clients.iter().map(|c| c.name.clone()).collect();
+    // Retire clients absent from config FIRST, releasing their authn bindings:
+    // the unique indexes on api_token_sha256 and (sa_audience, sa_subject)
+    // (migration 0002) cover disabled rows too, so a credential moved to a
+    // renamed or replacement client would collide with the stale row and roll
+    // the whole reconciliation back — i.e. block startup. A disabled row keeps
+    // its identity and history; it just no longer holds a credential (and
+    // could not authenticate anyway).
+    sqlx::query(
+        "UPDATE clients \
+         SET enabled = false, api_token_sha256 = NULL, sa_audience = NULL, sa_subject = NULL \
+         WHERE name <> ALL($1)",
+    )
+    .bind(&names)
+    .execute(&mut *tx)
+    .await?;
     for c in clients {
         let auth_kind = if c.auth.api_token_sha256.is_some() {
             "api-token"
@@ -61,11 +77,6 @@ pub async fn reconcile_clients(db: &PgPool, clients: &[ClientConfig]) -> anyhow:
         .execute(&mut *tx)
         .await?;
     }
-    let names: Vec<String> = clients.iter().map(|c| c.name.clone()).collect();
-    sqlx::query("UPDATE clients SET enabled = false WHERE name <> ALL($1)")
-        .bind(&names)
-        .execute(&mut *tx)
-        .await?;
     tx.commit().await?;
     Ok(())
 }

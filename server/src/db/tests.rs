@@ -93,6 +93,7 @@ fn new_request(client: &str, idem_key: &str, mac: &[u8]) -> NewAccessRequest {
         context_wrapped_dek: None,
         context_kek_id: None,
         expires_at: Utc::now() + Duration::hours(1),
+        policy_not_after: None,
         idem_client: client.to_owned(),
         idem_key: idem_key.to_owned(),
         idem_mac: mac.to_vec(),
@@ -166,6 +167,49 @@ async fn reconcile_clients_is_idempotent_and_disables_removed() -> anyhow::Resul
     let k8s2 = get_client_by_name(&t.pool, "k8s-agent").await?.unwrap();
     assert!(k8s2.enabled);
     assert_eq!(k8s2.id, k8s.id);
+    t.teardown().await;
+    Ok(())
+}
+
+/// A credential must be able to move from a client dropped from config to a
+/// new one across two reconcile calls: the unique authn-binding indexes
+/// (migration 0002) cover disabled rows, so retired bindings have to be
+/// released before the replacement is upserted (else reconciliation — and
+/// therefore startup — fails).
+#[tokio::test]
+async fn reconcile_clients_moves_credentials_off_removed_clients() -> anyhow::Result<()> {
+    let Some(t) = setup().await? else {
+        return Ok(());
+    };
+    // Same api-token hash, different client name (token_client hardcodes it).
+    let old = token_client("old-agent");
+    let renamed = token_client("new-agent");
+    reconcile_clients(&t.pool, std::slice::from_ref(&old)).await?;
+    reconcile_clients(&t.pool, std::slice::from_ref(&renamed)).await?;
+
+    let old_row = get_client_by_name(&t.pool, "old-agent").await?.unwrap();
+    assert!(!old_row.enabled);
+    assert_eq!(old_row.api_token_sha256, None);
+    let new_row = get_client_by_name(&t.pool, "new-agent").await?.unwrap();
+    assert!(new_row.enabled);
+    assert_eq!(new_row.api_token_sha256.as_deref(), Some(&*"ab".repeat(32)));
+
+    // Same for a service-account binding.
+    let old_sa = sa_client("k8s-old");
+    let mut new_sa = sa_client("k8s-new");
+    new_sa.auth.service_account = old_sa.auth.service_account.clone();
+    reconcile_clients(&t.pool, &[renamed.clone(), old_sa]).await?;
+    reconcile_clients(&t.pool, &[renamed, new_sa]).await?;
+    let old_row = get_client_by_name(&t.pool, "k8s-old").await?.unwrap();
+    assert!(!old_row.enabled);
+    assert_eq!(old_row.sa_subject, None);
+    assert_eq!(old_row.sa_audience, None);
+    let new_row = get_client_by_name(&t.pool, "k8s-new").await?.unwrap();
+    assert!(new_row.enabled);
+    assert_eq!(
+        new_row.sa_subject.as_deref(),
+        Some("system:serviceaccount:k8s-old:k8s-old")
+    );
     t.teardown().await;
     Ok(())
 }

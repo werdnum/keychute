@@ -222,6 +222,11 @@ async fn sweep_once(state: &AppState) -> anyhow::Result<()> {
         )
         .await?;
         if dedup {
+            // The operator was just told about an identical pending request,
+            // so this one is covered. Record it as delivered (same as the
+            // create path) — leaving it undelivered would re-select the row
+            // every sweep and fire a duplicate push once the window ages out.
+            db::mark_push_delivered(&state.db, row.id).await?;
             continue;
         }
         let Some(mechanism) = Mechanism::from_str_opt(&row.mechanism) else {

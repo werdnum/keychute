@@ -294,24 +294,18 @@ goldilocks:
   vpaUpdateMode: "Off"
   vpaResourcePolicy: '{"containerPolicies":[{"containerName":"*","controlledValues":"RequestsOnly","maxAllowed":{"cpu":"1","memory":"1Gi"}}]}'
 
-# Create the ServiceMonitor (requires the Prometheus operator CRDs).
-serviceMonitor:
-  enabled: false
-  interval: 60s
-  path: /metrics
-  scheme: https
-  # The internal CA is not in the scraper's trust store by default; the
-  # certificate is issued for the Service DNS name.
-  tlsConfig:
-    insecureSkipVerify: true
+# No `serviceMonitor` block: the server exposes only /healthz and the API/UI
+# routes, so a ServiceMonitor would scrape a 404 and collect nothing. It (and
+# the matching NetworkPolicy rule for the monitoring namespace) will be added
+# when the server grows a /metrics endpoint.
 
 # Create the NetworkPolicy locking ingress to the Keychute Pod.
 networkPolicy:
   enabled: false
   # Namespace (by metadata.name) running the gateway that fronts the human UI.
   ingressNamespace: ingress
-  # Namespace allowed to scrape metrics.
-  monitoringNamespace: monitoring
+  # No monitoringNamespace: there is no /metrics endpoint to scrape yet, so the
+  # scraper is not given reachability to the TLS listener.
   # Namespaces whose pods may reach the client API on the TLS port. Machine
   # clients are in-cluster and dial the internal Service directly. Network
   # reachability is not authorization — authn/authz is upstack (API tokens,

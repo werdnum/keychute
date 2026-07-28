@@ -361,3 +361,56 @@ async fn ownership_on_wait_and_no_store_on_read() {
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.headers().get("cache-control").unwrap(), "no-store");
 }
+
+/// A grant approved by a human under a standing policy row must expire no
+/// later than that row does (DESIGN §5) — approving minutes before a policy
+/// lapses must not mint a grant that outlives it. The auto-approve path always
+/// applied this cap; the manual-approval path used to discard it.
+#[tokio::test(flavor = "multi_thread")]
+async fn manual_approval_is_capped_at_standing_policy_expiry() {
+    let env = TestEnv::spawn(SpawnOpts::default()).await.unwrap();
+
+    // A require-approval policy that lapses ~5 minutes from now.
+    let policy_not_after = chrono::Utc::now() + chrono::Duration::minutes(5);
+    env.create_policy(&[
+        ("client_name", "k8s-agent"),
+        ("secret_name", "capped-secret"),
+        ("mechanism", "cli-read"),
+        ("outcome", "require-approval"),
+        ("priority", "0"),
+        ("max_ttl_seconds", "86400"),
+        (
+            "not_after",
+            &policy_not_after.format("%Y-%m-%dT%H:%M:%S").to_string(),
+        ),
+    ])
+    .await
+    .unwrap();
+
+    // Request a TTL far beyond the policy's remaining life.
+    let (status, body) = env
+        .k8s()
+        .create_request(cli_read_request("cap-1", "capped-secret", 86400, "capped"))
+        .await
+        .unwrap();
+    assert_eq!(status, 201, "{body}");
+    assert_eq!(body["state"], "pending", "policy requires human approval");
+    let request_id = body["request_id"].as_str().unwrap().to_owned();
+
+    // The operator approves, accepting the full requested TTL.
+    env.approve(&request_id, &[("secret_value", "capped-value")])
+        .await
+        .unwrap();
+
+    let grant_not_after: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT g.not_after FROM grants g WHERE g.request_id = $1")
+            .bind(request_id.parse::<uuid::Uuid>().unwrap())
+            .fetch_one(&env.db)
+            .await
+            .unwrap();
+
+    assert!(
+        grant_not_after <= policy_not_after + chrono::Duration::seconds(1),
+        "grant outlives its standing policy: grant {grant_not_after}, policy {policy_not_after}"
+    );
+}

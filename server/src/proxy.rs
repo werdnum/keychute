@@ -265,6 +265,12 @@ async fn handle_inner(
         }
     };
 
+    // Buffer and size-check the request body BEFORE use-accounting: a 413 must
+    // not burn a use of a finite-max_uses grant (it never reaches upstream).
+    let body_bytes = axum::body::to_bytes(body, state.config.limits.proxy_max_body_bytes)
+        .await
+        .map_err(|_| ApiFailure::BodyTooLarge)?;
+
     // Resolve the credential version BEFORE use-accounting (pins the audit).
     let version = db::get_secret_version(&state.db, secret.id, secret.current_version)
         .await?
@@ -343,7 +349,7 @@ async fn handle_inner(
     let mut outbound = build_outbound_headers(&parts.headers, &header_name);
     outbound.insert(header_name, header_value);
     forward(
-        state, parts, body, grant, version.id, origin, &canonical, &method, outbound, slot,
+        state, parts, body_bytes, grant, version.id, origin, &canonical, &method, outbound, slot,
         deadline,
     )
     .await
@@ -353,7 +359,8 @@ async fn handle_inner(
 async fn forward(
     state: &AppState,
     parts: axum::http::request::Parts,
-    body: Body,
+    // Already buffered and size-checked by the caller (before use-accounting).
+    body_bytes: axum::body::Bytes,
     grant: db::GrantRow,
     secret_version_id: Uuid,
     origin: &Origin,
@@ -369,11 +376,6 @@ async fn forward(
         .map_err(|e| ApiFailure::Internal(anyhow::anyhow!("origin parse: {e}")))?;
     url.set_path(&paths::encode_for_forwarding(canonical_path));
     url.set_query(parts.uri.query());
-
-    // Request body, capped.
-    let body_bytes = axum::body::to_bytes(body, state.config.limits.proxy_max_body_bytes)
-        .await
-        .map_err(|_| ApiFailure::BodyTooLarge)?;
 
     let upstream = state
         .upstream

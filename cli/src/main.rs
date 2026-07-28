@@ -2,8 +2,9 @@
 //!
 //! The secret goes to STDOUT and nowhere else; all diagnostics go to stderr.
 //!
-//! Exit codes: 0 success, 2 usage/config error, 3 denied, 4 timeout/expired,
-//! 5 payload lost, 1 anything else.
+//! Exit codes: 0 success, 2 usage/config error, 3 denied, 4 timeout/expired
+//! (including an expired grant), 5 payload lost, 1 anything else (including a
+//! grant whose uses are already exhausted).
 
 mod pipeline;
 
@@ -34,6 +35,12 @@ const WAIT_HTTP_SLACK_SECONDS: u64 = 15;
 const HTTP_TIMEOUT_SECONDS: u64 = 30;
 /// Attempts for the grant read (same idempotency key each time).
 const READ_ATTEMPTS: u32 = 3;
+/// Attempts for the access-request creation (same idempotency key each time,
+/// so a retry after a lost response returns the original request rather than
+/// minting a duplicate pending request and a duplicate operator push).
+const CREATE_ATTEMPTS: u32 = 3;
+/// Backoff between creation/read retries.
+const RETRY_BACKOFF_SECONDS: u64 = 1;
 /// Consecutive network failures tolerated while waiting for approval.
 const MAX_WAIT_NETWORK_ERRORS: u32 = 5;
 
@@ -263,6 +270,50 @@ fn api_error_message(status: reqwest::StatusCode, body: &str) -> String {
     }
 }
 
+/// Classify an HTTP 410 from the grant-read endpoint. The server uses 410 for
+/// three distinct, differently-remediable conditions (server/src/api/error.rs):
+///
+/// - `payload-lost`: the plaintext is gone because the process restarted under
+///   the ephemeral KEK. Nothing was released; ask for re-approval. Exit 5.
+/// - `grant-expired`: the grant is revoked or past `not_after`. That is the
+///   documented timeout/expired condition. Exit 4.
+/// - `grant-exhausted`: the grant's uses are spent — the secret was already
+///   released (outside the replay window, or to an earlier invocation). This is
+///   neither a timeout nor a payload loss, and blindly re-requesting would burn
+///   operator attention on a duplicate approval, so it gets the generic code so
+///   callers surface it instead of treating it as "just ask again". Exit 1.
+///
+/// An unknown or unparseable 410 body also gets the generic code.
+fn classify_gone(body: &str) -> Failure {
+    let code = serde_json::from_str::<ApiError>(body)
+        .ok()
+        .map(|e| e.error.code);
+    match code.as_deref() {
+        Some("payload-lost") => fail(
+            EXIT_PAYLOAD_LOST,
+            "the grant's payload was lost (server restarted before the read); \
+             submit a new request for re-approval",
+        ),
+        Some("grant-expired") => fail(
+            EXIT_TIMEOUT,
+            "the grant has expired or was revoked before the read; \
+             submit a new request for re-approval",
+        ),
+        Some("grant-exhausted") => fail(
+            EXIT_OTHER,
+            "the grant has no uses remaining (the secret was already released); \
+             submit a new request if you need it again",
+        ),
+        _ => fail(
+            EXIT_OTHER,
+            format!(
+                "grant is no longer usable: {}",
+                api_error_message(reqwest::StatusCode::GONE, body)
+            ),
+        ),
+    }
+}
+
 async fn run_request(cfg: &Config, http: &reqwest::Client, args: RequestArgs) -> CliResult<()> {
     let RequestArgs {
         secret_name,
@@ -305,34 +356,7 @@ async fn run_request(cfg: &Config, http: &reqwest::Client, args: RequestArgs) ->
     let deadline = Instant::now() + Duration::from_secs(timeout);
 
     // Create the access request.
-    let resp = http
-        .post(format!("{}/v1/access-requests", cfg.url))
-        .bearer_auth(cfg.bearer()?)
-        .timeout(Duration::from_secs(HTTP_TIMEOUT_SECONDS))
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| fail(EXIT_OTHER, format!("request creation failed: {e}")))?;
-    let status = resp.status();
-    let text = resp
-        .text()
-        .await
-        .map_err(|e| fail(EXIT_OTHER, format!("failed reading server response: {e}")))?;
-    if !status.is_success() {
-        let msg = api_error_message(status, &text);
-        let code = match status.as_u16() {
-            401 => EXIT_CONFIG,
-            403 => EXIT_DENIED,
-            _ => EXIT_OTHER,
-        };
-        return Err(fail(code, format!("access request rejected: {msg}")));
-    }
-    let mut st: StatusResponse = serde_json::from_str(&text).map_err(|e| {
-        fail(
-            EXIT_OTHER,
-            format!("unexpected create response from server: {e}"),
-        )
-    })?;
+    let mut st = create_access_request(cfg, http, &body).await?;
 
     if st.state == RequestState::Pending {
         eprintln!(
@@ -371,6 +395,88 @@ async fn run_request(cfg: &Config, http: &reqwest::Client, args: RequestArgs) ->
 
     let released = read_grant(cfg, http, grant_id, &read_idempotency_key(&idem_key)).await?;
     write_secret(&released, newline)
+}
+
+/// Create the access request, retrying transient failures with the SAME
+/// idempotency key.
+///
+/// If the server commits the request but the response is lost in flight, a
+/// retry with the same key returns the original request (IMPLEMENTATION
+/// addendum #18: same key + same canonical body → the original; a different
+/// body under the same key → 409). Without the retry, the CLI would exit and a
+/// rerun without `--idempotency-key` would mint a fresh UUID, duplicating both
+/// the pending request and the operator push.
+///
+/// Retry discipline mirrors `read_grant`: transport errors, unreadable bodies
+/// and 5xx retry; a fully parsed 4xx is definitive.
+async fn create_access_request(
+    cfg: &Config,
+    http: &reqwest::Client,
+    body: &CreateAccessRequest,
+) -> CliResult<StatusResponse> {
+    let mut last_err = String::new();
+    for attempt in 1..=CREATE_ATTEMPTS {
+        if attempt > 1 {
+            tokio::time::sleep(Duration::from_secs(RETRY_BACKOFF_SECONDS)).await;
+        }
+        // One attempt end-to-end; Err(msg) means "transient, retry".
+        let attempt_result: Result<CliResult<StatusResponse>, String> = async {
+            let bearer = match cfg.bearer() {
+                Ok(b) => b,
+                // Config errors are definitive, not transient.
+                Err(f) => return Ok(Err(f)),
+            };
+            let resp = http
+                .post(format!("{}/v1/access-requests", cfg.url))
+                .bearer_auth(bearer)
+                .timeout(Duration::from_secs(HTTP_TIMEOUT_SECONDS))
+                .json(body)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            let status = resp.status();
+            let text = resp
+                .text()
+                .await
+                .map_err(|e| format!("failed reading server response: {e}"))?;
+            if status.is_client_error() {
+                // Definitive, fully parsed 4xx: retrying cannot change it.
+                let msg = api_error_message(status, &text);
+                let code = match status.as_u16() {
+                    401 => EXIT_CONFIG,
+                    403 => EXIT_DENIED,
+                    _ => EXIT_OTHER,
+                };
+                return Ok(Err(fail(code, format!("access request rejected: {msg}"))));
+            }
+            if !status.is_success() {
+                // 5xx and everything else: transient, retry (same idem key).
+                return Err(format!(
+                    "access request rejected: {}",
+                    api_error_message(status, &text)
+                ));
+            }
+            match serde_json::from_str::<StatusResponse>(&text) {
+                Ok(st) => Ok(Ok(st)),
+                // Truncated/garbled success body: the retry replays the create.
+                Err(e) => Err(format!("unexpected create response from server: {e}")),
+            }
+        }
+        .await;
+        match attempt_result {
+            Ok(done) => return done,
+            Err(msg) => {
+                eprintln!(
+                    "keychute: request creation attempt {attempt}/{CREATE_ATTEMPTS} failed: {msg}"
+                );
+                last_err = msg;
+            }
+        }
+    }
+    Err(fail(
+        EXIT_OTHER,
+        format!("request creation failed after {CREATE_ATTEMPTS} attempts: {last_err}"),
+    ))
 }
 
 /// Long-poll the wait endpoint until the request resolves or `deadline` passes.
@@ -454,7 +560,7 @@ async fn read_grant(
     let mut last_err = String::new();
     for attempt in 1..=READ_ATTEMPTS {
         if attempt > 1 {
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            tokio::time::sleep(Duration::from_secs(RETRY_BACKOFF_SECONDS)).await;
         }
         // One attempt end-to-end; Err(msg) means "transient, retry".
         let attempt_result: Result<CliResult<ReadGrantResponse>, String> = async {
@@ -477,11 +583,7 @@ async fn read_grant(
                 .await
                 .map_err(|e| format!("failed reading response body: {e}"))?;
             if status == reqwest::StatusCode::GONE {
-                return Ok(Err(fail(
-                    EXIT_PAYLOAD_LOST,
-                    "the grant's payload was lost (server restarted before the read); \
-                     submit a new request for re-approval",
-                )));
+                return Ok(Err(classify_gone(&text)));
             }
             if status.is_client_error() {
                 // Definitive, fully parsed 4xx: retrying cannot change it.
@@ -690,5 +792,42 @@ mod tests {
         assert_eq!(msg, "nope (policy-deny)");
         let msg = api_error_message(reqwest::StatusCode::BAD_GATEWAY, "not json");
         assert!(msg.contains("502"));
+    }
+
+    fn gone_body(code: &str) -> String {
+        format!(r#"{{"error":{{"code":"{code}","message":"m"}}}}"#)
+    }
+
+    #[test]
+    fn gone_codes_map_to_distinct_exit_codes() {
+        let lost = classify_gone(&gone_body("payload-lost"));
+        assert_eq!(lost.code, EXIT_PAYLOAD_LOST);
+        assert!(
+            lost.message.contains("payload was lost"),
+            "{}",
+            lost.message
+        );
+
+        let expired = classify_gone(&gone_body("grant-expired"));
+        assert_eq!(expired.code, EXIT_TIMEOUT);
+        assert!(expired.message.contains("expired"), "{}", expired.message);
+
+        let exhausted = classify_gone(&gone_body("grant-exhausted"));
+        assert_eq!(exhausted.code, EXIT_OTHER);
+        assert!(
+            exhausted.message.contains("no uses remaining"),
+            "{}",
+            exhausted.message
+        );
+    }
+
+    #[test]
+    fn unknown_or_unparseable_gone_is_generic() {
+        let unknown = classify_gone(&gone_body("something-else"));
+        assert_eq!(unknown.code, EXIT_OTHER);
+        assert!(unknown.message.contains("something-else"));
+        let garbage = classify_gone("not json at all");
+        assert_eq!(garbage.code, EXIT_OTHER);
+        assert!(garbage.message.contains("410"), "{}", garbage.message);
     }
 }

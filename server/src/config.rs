@@ -227,8 +227,18 @@ impl Config {
         for c in &self.clients {
             let has_token = c.auth.api_token_sha256.is_some();
             let has_sa = c.auth.service_account.is_some();
+            // Exactly one binding: reconciliation stores both columns and
+            // authn accepts either path, so two bindings silently widen what
+            // can act as this client.
             if !has_token && !has_sa {
                 bail!("client {} has no auth binding", c.name);
+            }
+            if has_token && has_sa {
+                bail!(
+                    "client {} has two auth bindings (api_token_sha256 and service_account): \
+                     configure exactly one",
+                    c.name
+                );
             }
             if c.mechanisms.is_empty() {
                 bail!("client {} has no allowed mechanisms", c.name);
@@ -297,6 +307,37 @@ clients:
     auth:
       api_token_sha256: "  FFEE00112233445566778899AABBCCDDEEFF00112233445566778899AABBCC  "
 "#;
+
+    #[test]
+    fn client_auth_binding_is_exactly_one() {
+        // Both bindings: rejected (either would authenticate as this client).
+        let yaml = format!(
+            "{BASE_YAML}      service_account:\n        \
+             audience: \"keychute.example.dev\"\n        \
+             subject: \"system:serviceaccount:ns:agent\"\n"
+        );
+        let mut cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        cfg.normalize();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("two auth bindings"), "{err}");
+
+        // Neither binding: still rejected.
+        let mut cfg: Config = serde_yaml::from_str(BASE_YAML).unwrap();
+        cfg.clients[0].auth.api_token_sha256 = None;
+        cfg.normalize();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("no auth binding"), "{err}");
+
+        // Service account alone: accepted.
+        let mut cfg: Config = serde_yaml::from_str(BASE_YAML).unwrap();
+        cfg.clients[0].auth.api_token_sha256 = None;
+        cfg.clients[0].auth.service_account = Some(ServiceAccountAuth {
+            audience: "keychute.example.dev".into(),
+            subject: "system:serviceaccount:ns:agent".into(),
+        });
+        cfg.normalize();
+        cfg.validate().unwrap();
+    }
 
     #[test]
     fn normalize_lowercases_token_hashes() {

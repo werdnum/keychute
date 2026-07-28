@@ -6,7 +6,7 @@ description: |-
   cert-manager CA), its ServiceAccount + `system:auth-delegator` binding for
   TokenReview-based client authentication, the rendered server config, and the
   supporting Service, Certificate, Ingress, Envoy Gateway OIDC SecurityPolicy,
-  BackendTLSPolicy, ServiceMonitor and NetworkPolicy.
+  BackendTLSPolicy and NetworkPolicy.
 type: application
 # Chart version is bumped on chart changes; appVersion tracks the container
 # image and is rewritten by .github/workflows/build.yaml on each push to main.

@@ -382,6 +382,7 @@ mod tests {
             context_wrapped_dek: None,
             context_kek_id: None,
             expires_at,
+            policy_not_after: None,
             idem_client: "test-client".into(),
             idem_key: idem.into(),
             idem_mac: vec![0u8; 32],

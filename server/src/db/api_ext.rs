@@ -5,16 +5,42 @@ use crate::audit::{insert_audit, kinds, AuditEvent};
 
 use super::clients::ClientRow;
 use super::grants::GrantRow;
-use super::requests::{AccessRequestRow, NewAccessRequest};
+use super::requests::{AccessRequestRow, GrantParams, NewAccessRequest};
 use sqlx::PgPool;
 use uuid::Uuid;
+
+/// The policy outcome decided *before* the insert, applied inside the same
+/// transaction so a created request is never observably pending when policy
+/// already decided it (a partial failure would otherwise leave a
+/// policy-denied request sitting in the operator's approval queue, and an
+/// idempotent retry would return that pending state without re-evaluating).
+pub enum InitialResolution<'a> {
+    /// Standing policy requires a human: the row is created `pending`.
+    Pending,
+    /// Policy denied: the row is created `denied` with its audit row.
+    Denied {
+        reason: &'a str,
+        resolved_by: &'a str,
+    },
+    /// Policy auto-approved: the row is created `approved` and the grant is
+    /// minted in the same transaction.
+    Approved {
+        resolved_by: &'a str,
+        grant: &'a GrantParams,
+    },
+}
 
 /// Outcome of [`insert_access_request_with_id`].
 #[derive(Debug, Clone)]
 pub enum InsertOutcome {
-    /// New row committed (with its `request-created` audit row in the same
+    /// New row committed (with its `request-created` audit row, and — when
+    /// policy already decided — its resolution and grant, in the same
     /// transaction).
-    Created(AccessRequestRow),
+    Created {
+        row: AccessRequestRow,
+        /// Set when the request was created already-approved.
+        grant_id: Option<Uuid>,
+    },
     /// An existing row for (idem_client, idem_key) was returned — an
     /// idempotent retry. The caller decides 200-vs-409 by comparing
     /// `idem_mac` with the MAC of the incoming payload. Never subject to the
@@ -32,13 +58,17 @@ pub enum InsertOutcome {
 ///
 /// One transaction: KEK shared advisory lock (when a wrapped DEK is stored,
 /// addendum #19), the insert, the pending-cap check (`pending_cap`, applied
-/// only to newly created rows so idempotent retries always succeed), and the
-/// `request-created` audit row.
+/// only to newly created rows so idempotent retries always succeed), the
+/// `request-created` audit row, and — when policy already decided the outcome
+/// (`resolution`) — the deny/approve transition, the grant, and the
+/// corresponding resolution audit row. Creation and resolution therefore
+/// commit together: an `Existing` row always carries the decided state.
 pub async fn insert_access_request_with_id(
     db: &PgPool,
     id: Uuid,
     req: &NewAccessRequest,
     pending_cap: Option<i64>,
+    resolution: &InitialResolution<'_>,
 ) -> anyhow::Result<InsertOutcome> {
     let mut tx = db.begin().await?;
     if req.context_wrapped_dek.is_some() {
@@ -56,8 +86,8 @@ pub async fn insert_access_request_with_id(
         "INSERT INTO access_requests \
          (id, client_name, secret_name, mechanism, constraints, \
           context_ciphertext, context_nonce, context_wrapped_dek, context_kek_id, \
-          expires_at, idem_client, idem_key, idem_mac) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
+          expires_at, policy_not_after, idem_client, idem_key, idem_mac) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
          ON CONFLICT (idem_client, idem_key) DO NOTHING \
          RETURNING *",
     )
@@ -71,12 +101,13 @@ pub async fn insert_access_request_with_id(
     .bind(&req.context_wrapped_dek)
     .bind(&req.context_kek_id)
     .bind(req.expires_at)
+    .bind(req.policy_not_after)
     .bind(&req.idem_client)
     .bind(&req.idem_key)
     .bind(&req.idem_mac)
     .fetch_optional(&mut *tx)
     .await?;
-    if let Some(row) = inserted {
+    if let Some(mut row) = inserted {
         if let Some(cap) = pending_cap {
             let pending: i64 = sqlx::query_scalar(
                 "SELECT count(*) FROM access_requests \
@@ -103,8 +134,97 @@ pub async fn insert_access_request_with_id(
             },
         )
         .await?;
+        // Policy already decided: apply the resolution in this same
+        // transaction so the row is never observably pending.
+        let mut grant_id = None;
+        match resolution {
+            InitialResolution::Pending => {}
+            InitialResolution::Denied {
+                reason,
+                resolved_by,
+            } => {
+                row = sqlx::query_as::<_, AccessRequestRow>(
+                    "UPDATE access_requests \
+                     SET state = 'denied', deny_reason = $2, resolved_by = $3, \
+                         resolved_at = now() \
+                     WHERE id = $1 RETURNING *",
+                )
+                .bind(row.id)
+                .bind(reason)
+                .bind(resolved_by)
+                .fetch_one(&mut *tx)
+                .await?;
+                insert_audit(
+                    &mut *tx,
+                    &AuditEvent {
+                        kind: kinds::REQUEST_DENIED,
+                        request_id: Some(row.id),
+                        client_name: Some(req.client_name.clone()),
+                        secret_name: Some(req.secret_name.clone()),
+                        actor: Some((*resolved_by).to_owned()),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            }
+            InitialResolution::Approved { resolved_by, grant } => {
+                row = sqlx::query_as::<_, AccessRequestRow>(
+                    "UPDATE access_requests \
+                     SET state = 'approved', resolved_by = $2, resolved_at = now() \
+                     WHERE id = $1 RETURNING *",
+                )
+                .bind(row.id)
+                .bind(resolved_by)
+                .fetch_one(&mut *tx)
+                .await?;
+                let (pt_ct, pt_nonce, pt_dek, pt_eph) = match &grant.passthrough {
+                    Some(p) => (
+                        Some(&p.ciphertext),
+                        Some(&p.nonce),
+                        Some(&p.wrapped_dek),
+                        p.ephemeral,
+                    ),
+                    None => (None, None, None, false),
+                };
+                let id: Uuid = sqlx::query_scalar(
+                    "INSERT INTO grants \
+                     (request_id, client_name, secret_name, mechanism, constraints, \
+                      not_after, max_uses, passthrough_ciphertext, passthrough_nonce, \
+                      passthrough_wrapped_dek, passthrough_ephemeral) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+                     RETURNING id",
+                )
+                .bind(row.id)
+                .bind(&grant.client_name)
+                .bind(&grant.secret_name)
+                .bind(&grant.mechanism)
+                .bind(&grant.constraints)
+                .bind(grant.not_after)
+                .bind(grant.max_uses)
+                .bind(pt_ct)
+                .bind(pt_nonce)
+                .bind(pt_dek)
+                .bind(pt_eph)
+                .fetch_one(&mut *tx)
+                .await?;
+                insert_audit(
+                    &mut *tx,
+                    &AuditEvent {
+                        kind: kinds::REQUEST_APPROVED,
+                        request_id: Some(row.id),
+                        grant_id: Some(id),
+                        client_name: Some(grant.client_name.clone()),
+                        secret_name: Some(grant.secret_name.clone()),
+                        actor: Some((*resolved_by).to_owned()),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+                grant_id = Some(id);
+            }
+        }
         tx.commit().await?;
-        return Ok(InsertOutcome::Created(row));
+        return Ok(InsertOutcome::Created { row, grant_id });
     }
     tx.rollback().await?;
     let row = sqlx::query_as::<_, AccessRequestRow>(

@@ -291,41 +291,21 @@ pub async fn create(
         context_wrapped_dek: ctx_dek,
         context_kek_id: ctx_kek,
         expires_at,
+        // Cap inherited from the matching standing policy row: the auto-approve
+        // path applies it below, and a later human approval reads it off the row.
+        policy_not_after: evaluation.policy_not_after,
         idem_client: client.name().to_owned(),
         idem_key: req.idempotency_key.clone(),
         idem_mac: idem_mac.to_vec(),
     };
-    // The pending cap is enforced inside the insert transaction, and only for
-    // newly created rows: an idempotent retry of an existing request must
-    // never 429. The `request-created` audit row commits with the insert.
-    let pending_cap = matches!(evaluation.decision, policy::Decision::RequireApproval)
-        .then_some(state.config.limits.max_pending_per_client);
-    let row = match db::api_ext::insert_access_request_with_id(
-        &state.db,
-        request_id,
-        &new_row,
-        pending_cap,
-    )
-    .await?
-    {
-        db::api_ext::InsertOutcome::PendingCapExceeded => return Err(ApiFailure::TooManyPending),
-        db::api_ext::InsertOutcome::Existing(row) => {
-            // Idempotent retry: same MAC returns the existing state; anything
-            // else is a key reuse.
-            if !crypto::ct_eq(&row.idem_mac, &idem_mac) {
-                return Err(ApiFailure::IdempotencyKeyReuse);
-            }
-            let status = status_from_row(&state, &row).await?;
-            return Ok((StatusCode::OK, Json(status)).into_response());
-        }
-        db::api_ext::InsertOutcome::Created(row) => row,
-    };
 
-    match evaluation.decision {
-        policy::Decision::Deny { reason } => {
-            db::resolve_deny(&state.db, row.id, "policy", &reason).await?;
-            Err(ApiFailure::PolicyDenied(reason))
-        }
+    // Decide the outcome BEFORE the insert and hand it to the insert
+    // transaction, so creation and resolution commit together. A partial
+    // failure can then never leave a policy-denied request sitting pending
+    // (where an idempotent retry would report it as pending without
+    // re-evaluating policy, and the sweeper would ask the operator to approve
+    // it).
+    let auto_grant = match evaluation.decision {
         policy::Decision::AutoApprove | policy::Decision::NotifyOnly => {
             // The engine only reaches these when the secret exists.
             let Some(secret) = &secret else {
@@ -333,12 +313,11 @@ pub async fn create(
                     "auto-approve decision without a stored secret"
                 )));
             };
-            let notify_only = matches!(evaluation.decision, policy::Decision::NotifyOnly);
             let mut not_after = now + Duration::seconds(constraints.ttl_seconds as i64);
             if let Some(cap) = evaluation.policy_not_after {
                 not_after = not_after.min(cap);
             }
-            let grant = db::GrantParams {
+            Some(db::GrantParams {
                 client_name: client.name().to_owned(),
                 secret_name: secret.name.clone(),
                 mechanism: req.mechanism.as_str().to_owned(),
@@ -347,12 +326,57 @@ pub async fn create(
                 not_after,
                 max_uses: constraints.max_uses.map(|u| u as i32),
                 passthrough: None,
-            };
-            let grant_id = db::resolve_approve(&state.db, row.id, "policy:auto", &grant)
-                .await?
-                .ok_or_else(|| {
-                    ApiFailure::Internal(anyhow::anyhow!("freshly created request not pending"))
-                })?;
+            })
+        }
+        _ => None,
+    };
+    let resolution = match (&evaluation.decision, &auto_grant) {
+        (policy::Decision::Deny { reason }, _) => db::api_ext::InitialResolution::Denied {
+            reason,
+            resolved_by: "policy",
+        },
+        (_, Some(grant)) => db::api_ext::InitialResolution::Approved {
+            resolved_by: "policy:auto",
+            grant,
+        },
+        _ => db::api_ext::InitialResolution::Pending,
+    };
+    // The pending cap is enforced inside the insert transaction, and only for
+    // newly created rows: an idempotent retry of an existing request must
+    // never 429. The `request-created` audit row commits with the insert.
+    let pending_cap = matches!(evaluation.decision, policy::Decision::RequireApproval)
+        .then_some(state.config.limits.max_pending_per_client);
+    let (row, created_grant_id) = match db::api_ext::insert_access_request_with_id(
+        &state.db,
+        request_id,
+        &new_row,
+        pending_cap,
+        &resolution,
+    )
+    .await?
+    {
+        db::api_ext::InsertOutcome::PendingCapExceeded => return Err(ApiFailure::TooManyPending),
+        db::api_ext::InsertOutcome::Existing(row) => {
+            // Idempotent retry: same MAC returns the existing state (always the
+            // decided state, since resolution committed with creation);
+            // anything else is a key reuse.
+            if !crypto::ct_eq(&row.idem_mac, &idem_mac) {
+                return Err(ApiFailure::IdempotencyKeyReuse);
+            }
+            let status = status_from_row(&state, &row).await?;
+            return Ok((StatusCode::OK, Json(status)).into_response());
+        }
+        db::api_ext::InsertOutcome::Created { row, grant_id } => (row, grant_id),
+    };
+
+    match evaluation.decision {
+        policy::Decision::Deny { reason } => Err(ApiFailure::PolicyDenied(reason)),
+        policy::Decision::AutoApprove | policy::Decision::NotifyOnly => {
+            // Row was created already-approved with its grant (see above).
+            let notify_only = matches!(evaluation.decision, policy::Decision::NotifyOnly);
+            let grant_id = created_grant_id.ok_or_else(|| {
+                ApiFailure::Internal(anyhow::anyhow!("approved request created without a grant"))
+            })?;
             state.resolve_notify.notify_waiters();
             if notify_only && state.notifier.is_real() {
                 // FYI only: the release proceeds regardless of delivery.
@@ -361,7 +385,7 @@ pub async fn create(
                     client.name(),
                     req.mechanism,
                     constraints.ttl_seconds,
-                    Some(secret.name.as_str()),
+                    secret.as_ref().map(|s| s.name.as_str()),
                     row.id,
                 );
                 if let Err(e) = state.notifier.send(&n).await {

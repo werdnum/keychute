@@ -12,6 +12,7 @@
 //!   (addendum #9).
 
 pub mod csrf;
+mod policy_store;
 
 use crate::authn::human::{authenticate_human, Operator};
 use crate::crypto::{AadContext, SecretBytes, EPHEMERAL_KEK_ID};
@@ -790,12 +791,21 @@ async fn approve(
         }
     }
 
+    // DESIGN §5: "A grant issued under a standing policy row also expires no
+    // later than that row does." The request carries the matched policy's
+    // expiry, so a human approval is capped at it just like the auto-approve
+    // path's min(TTL, policy_not_after).
+    let mut not_after = now + Duration::seconds(ttl as i64);
+    if let Some(cap) = row.policy_not_after {
+        not_after = not_after.min(cap);
+    }
+
     let grant = GrantParams {
         client_name: row.client_name.clone(),
         secret_name: row.secret_name.clone(),
         mechanism: row.mechanism.clone(),
         constraints: row.constraints.clone(),
-        not_after: now + Duration::seconds(ttl as i64),
+        not_after,
         max_uses: max_uses.map(|u| u.min(i32::MAX as u64) as i32),
         passthrough,
     };
@@ -1150,24 +1160,9 @@ async fn create_policy(
         not_after,
         created_by: op.subject.clone(),
     };
-    let row = db::insert_policy(&state.db, &policy).await?;
-    crate::audit::insert_audit(
-        &state.db,
-        &crate::audit::AuditEvent {
-            kind: crate::audit::kinds::POLICY_CREATED,
-            client_name: policy.client_name.clone(),
-            secret_name: policy.secret_name.clone(),
-            actor: Some(op.subject.clone()),
-            detail: Some(serde_json::json!({
-                "policy_id": row.id,
-                "mechanism": policy.mechanism,
-                "outcome": policy.outcome,
-            })),
-            ..Default::default()
-        },
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!(e))?;
+    // The policy row and its audit row commit together: a crash between them
+    // would otherwise leave an active authorization rule with no audit record.
+    policy_store::insert_policy_audited(&state.db, &policy, &op.subject).await?;
     Ok(Redirect::to("/ui/policies").into_response())
 }
 
@@ -1186,19 +1181,8 @@ async fn delete_policy(
         &op.subject,
         &form.csrf_token,
     )?;
-    if db::delete_policy(&state.db, id).await? {
-        crate::audit::insert_audit(
-            &state.db,
-            &crate::audit::AuditEvent {
-                kind: crate::audit::kinds::POLICY_DELETED,
-                actor: Some(op.subject.clone()),
-                detail: Some(serde_json::json!({ "policy_id": id })),
-                ..Default::default()
-            },
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!(e))?;
-    }
+    // Deletion and its audit row commit together (same reasoning as creation).
+    policy_store::delete_policy_audited(&state.db, id, &op.subject).await?;
     Ok(Redirect::to("/ui/policies").into_response())
 }
 
