@@ -75,7 +75,13 @@ jobs:
       # cargo test corrupts the shared target dir); it asserts both binaries
       # exist and are newer than their sources. So: build first, then test.
       - name: Prebuild binaries for the e2e suite
-        run: cargo build -p keychute-server -p keychute-cli
+        # `touch` stamps the binaries as corresponding to this source tree.
+        # cargo keys off content, not mtime, so a build that changes nothing
+        # legitimately leaves the old binary in place with an older mtime —
+        # which the harness would otherwise read as stale.
+        run: |
+          cargo build -p keychute-server -p keychute-cli
+          touch target/debug/keychute-server target/debug/keychute
 
       - name: e2e tests
         env:

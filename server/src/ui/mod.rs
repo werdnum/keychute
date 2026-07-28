@@ -419,6 +419,21 @@ async fn request_detail_page(
             },
         ));
     }
+    if policy_cap_elapsed(row.policy_not_after, now) {
+        return Ok(html_page(
+            "Request no longer approvable",
+            html! {
+                h1 { "Request " (row.id) }
+                p {
+                    "The standing policy this request matched has "
+                    b { "expired" }
+                    ", so any grant issued now would already be past its cap. "
+                    "This request can no longer be approved and must be re-submitted \
+                     by the client."
+                }
+            },
+        ));
+    }
     let mechanism = parse_mechanism(&row.mechanism)?;
     let constraints = parse_constraints(&row)?;
     let secret = db::get_secret_by_name(&state.db, &row.secret_name).await?;
@@ -664,6 +679,14 @@ fn take_secret_value(form: &mut ApproveForm) -> Option<SecretBytes> {
     Some(SecretBox::new(boxed))
 }
 
+/// True when the request matched a standing policy whose `not_after` has
+/// already passed, i.e. `min(now + ttl, policy_not_after)` could only produce a
+/// grant that is already expired. Requests with no policy cap are never
+/// elapsed.
+fn policy_cap_elapsed(policy_not_after: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+    matches!(policy_not_after, Some(cap) if cap <= now)
+}
+
 async fn approve(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -687,6 +710,17 @@ async fn approve(
         return Err(UiError::new(
             StatusCode::CONFLICT,
             "request is no longer pending",
+        ));
+    }
+    // DESIGN §5: a grant may not outlive the standing policy row it matched.
+    // If that cap has already elapsed, approving could only mint a grant that
+    // is born expired — refuse instead of handing the client an "approved"
+    // state whose grant id can only ever return `grant-expired`.
+    if policy_cap_elapsed(row.policy_not_after, now) {
+        return Err(UiError::new(
+            StatusCode::CONFLICT,
+            "the standing policy this request matched has expired: the request is \
+             no longer approvable and must be re-submitted",
         ));
     }
     let mechanism = parse_mechanism(&row.mechanism)?;
@@ -1043,6 +1077,27 @@ struct PolicyForm {
     not_after: Option<String>,
 }
 
+/// Parse the policy form's comma/whitespace-separated method list.
+///
+/// Methods are RFC 9110 tokens, not just letters (`M-SEARCH`, `PATCH!` and
+/// friends are legal), so validation defers to the same predicate the API-side
+/// request validation uses. Values are normalized to upper case, matching the
+/// case-insensitive comparison the policy matcher performs.
+fn parse_methods_field(raw: &str) -> UiResult<Vec<String>> {
+    let mut methods: Vec<String> = Vec::new();
+    for m in raw.split(|c: char| c == ',' || c.is_whitespace()) {
+        let m = m.trim();
+        if m.is_empty() {
+            continue;
+        }
+        if !crate::policy::is_valid_http_method(m) {
+            return Err(UiError::bad_request("invalid HTTP method"));
+        }
+        methods.push(m.to_ascii_uppercase());
+    }
+    Ok(methods)
+}
+
 async fn create_policy(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1090,22 +1145,7 @@ async fn create_policy(
             Origin::parse(line).map_err(|e| UiError::bad_request(format!("bad origin: {e}")))?,
         );
     }
-    let mut methods: Vec<String> = Vec::new();
-    for m in form
-        .methods
-        .as_deref()
-        .unwrap_or("")
-        .split(|c: char| c == ',' || c.is_whitespace())
-    {
-        let m = m.trim();
-        if m.is_empty() {
-            continue;
-        }
-        if !m.chars().all(|c| c.is_ascii_alphabetic()) {
-            return Err(UiError::bad_request("invalid HTTP method"));
-        }
-        methods.push(m.to_ascii_uppercase());
-    }
+    let methods = parse_methods_field(form.methods.as_deref().unwrap_or(""))?;
     let mut path_prefixes: Vec<String> = Vec::new();
     for line in form.path_prefixes.as_deref().unwrap_or("").lines() {
         let line = line.trim();
@@ -1486,5 +1526,34 @@ mod tests {
             assert_eq!(tier_from_str(t.as_str()), Some(t));
         }
         assert_eq!(tier_from_str("bogus"), None);
+    }
+
+    #[test]
+    fn policy_cap_elapsed_refuses_only_past_caps() {
+        let now = Utc::now();
+        // No standing policy cap: never elapsed.
+        assert!(!policy_cap_elapsed(None, now));
+        // Cap still in the future: approvable.
+        assert!(!policy_cap_elapsed(Some(now + Duration::seconds(1)), now));
+        // Cap in the past: a grant minted now would be born expired.
+        assert!(policy_cap_elapsed(Some(now - Duration::seconds(1)), now));
+        // Exactly at the cap is elapsed too: not_after == now yields a grant
+        // with zero remaining lifetime.
+        assert!(policy_cap_elapsed(Some(now), now));
+    }
+
+    #[test]
+    fn policy_form_accepts_rfc9110_method_tokens() {
+        assert_eq!(
+            parse_methods_field("get, M-SEARCH\npatch").unwrap(),
+            vec!["GET".to_owned(), "M-SEARCH".to_owned(), "PATCH".to_owned()]
+        );
+        // Empty input yields no constraint.
+        assert!(parse_methods_field("  ,\n ").unwrap().is_empty());
+        // Non-token garbage is still rejected.
+        assert!(parse_methods_field("GET;DROP").is_err());
+        assert!(parse_methods_field("GET(x)").is_err());
+        assert!(parse_methods_field("\"GET\"").is_err());
+        assert!(parse_methods_field("GET/1").is_err());
     }
 }

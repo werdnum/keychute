@@ -190,6 +190,35 @@ pub async fn proxy_path(
     handle(state, id, req).await
 }
 
+/// The proxied suffix of the raw request path — everything the routes
+/// `/v1/grants/{id}/proxy` and `/v1/grants/{id}/proxy/{*path}` leave after the
+/// literal `proxy` segment, normalized to `"/"` for the root route.
+///
+/// Two properties matter here:
+///
+/// * The grant-id segment is consumed verbatim from the URI, never re-rendered
+///   from the parsed `Uuid`. axum accepts non-canonical but valid spellings
+///   (uppercase, unhyphenated); formatting the parsed value back out would
+///   produce a prefix that no longer matches the raw path, turning an owned,
+///   valid grant into a 500.
+/// * The returned suffix is still the RAW, un-decoded path. axum's own `{*path}`
+///   capture (and `RawPathParams`) percent-decodes captures, which would launder
+///   `%2F` and `%2e%2e` past `policy::paths::canonicalize`. Those must keep
+///   reaching the canonicalizer in encoded form so they are rejected.
+fn proxy_suffix(raw_path: &str) -> Option<&str> {
+    // "/v1/grants/" <id> "/" "proxy" <suffix>
+    let after_prefix = raw_path.strip_prefix("/v1/grants/")?;
+    let (_id, rest) = after_prefix.split_once('/')?;
+    let suffix = rest.strip_prefix("proxy")?;
+    match suffix.as_bytes().first() {
+        None => Some("/"),
+        Some(b'/') => Some(suffix),
+        // Not the proxy route at all (e.g. `/proxyfoo`); the router would not
+        // have dispatched here.
+        Some(_) => None,
+    }
+}
+
 async fn handle(state: AppState, grant_id: Uuid, req: Request) -> Result<Response, ApiFailure> {
     let deadline =
         std::time::Duration::from_secs(state.config.limits.proxy_stream_deadline_seconds);
@@ -239,12 +268,8 @@ async fn handle_inner(
     }
 
     // Path: raw request path minus the route prefix, canonicalized.
-    let raw_path = parts.uri.path();
-    let prefix = format!("/v1/grants/{grant_id}/proxy");
-    let rest = raw_path
-        .strip_prefix(&prefix)
+    let rest = proxy_suffix(parts.uri.path())
         .ok_or_else(|| ApiFailure::Internal(anyhow::anyhow!("route prefix mismatch")))?;
-    let rest = if rest.is_empty() { "/" } else { rest };
     let canonical = paths::canonicalize(rest).map_err(ApiFailure::InvalidPath)?;
     if !constraints.path_prefixes.is_empty()
         && !constraints
@@ -517,6 +542,54 @@ mod tests {
         assert_eq!(out.get("content-type").unwrap(), "text/plain");
         // The handler later overrides cache-control; passthrough here is fine.
         assert_eq!(out.get("cache-control").unwrap(), "public, max-age=3600");
+    }
+
+    #[test]
+    fn proxy_suffix_is_raw_and_uuid_spelling_agnostic() {
+        let canonical = "0f2f0a4e-1c3a-4f5b-8a9d-2b7c6e5d4f30";
+        let upper = canonical.to_ascii_uppercase();
+        let unhyphenated = canonical.replace('-', "");
+
+        for id in [canonical.to_owned(), upper, unhyphenated] {
+            assert_eq!(
+                proxy_suffix(&format!("/v1/grants/{id}/proxy")),
+                Some("/"),
+                "root route for {id}"
+            );
+            assert_eq!(
+                proxy_suffix(&format!("/v1/grants/{id}/proxy/v1/echo")),
+                Some("/v1/echo"),
+                "sub-path for {id}"
+            );
+        }
+
+        // The suffix stays percent-encoded so canonicalize() can reject it.
+        assert_eq!(
+            proxy_suffix(&format!("/v1/grants/{canonical}/proxy/v1/a%2Fb")),
+            Some("/v1/a%2Fb")
+        );
+        assert!(paths::canonicalize("/v1/a%2Fb").is_err());
+        assert_eq!(
+            proxy_suffix(&format!("/v1/grants/{canonical}/proxy/v1/%2e%2e/secret")),
+            Some("/v1/%2e%2e/secret")
+        );
+        assert!(paths::canonicalize("/v1/%2e%2e/secret").is_err());
+        assert_eq!(
+            proxy_suffix(&format!("/v1/grants/{canonical}/proxy/v1/../secret")),
+            Some("/v1/../secret")
+        );
+        assert!(paths::canonicalize("/v1/../secret").is_err());
+
+        // Nested `/proxy/` segments in the suffix are not re-split.
+        assert_eq!(
+            proxy_suffix(&format!("/v1/grants/{canonical}/proxy/proxy/x")),
+            Some("/proxy/x")
+        );
+
+        // Shapes the router would never dispatch here.
+        assert_eq!(proxy_suffix("/v1/grants/abc/proxyfoo"), None);
+        assert_eq!(proxy_suffix("/v1/grants/abc"), None);
+        assert_eq!(proxy_suffix("/healthz"), None);
     }
 
     #[test]

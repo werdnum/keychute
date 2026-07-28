@@ -52,8 +52,9 @@ pub fn ensure_built() {
     });
 }
 
-const PREBUILD_HINT: &str =
-    "run `cargo build -p keychute-server -p keychute-cli` before `cargo test -p keychute-e2e`";
+const PREBUILD_HINT: &str = "run `cargo build -p keychute-server -p keychute-cli && \
+     touch target/debug/keychute-server target/debug/keychute` before \
+     `cargo test -p keychute-e2e`";
 
 /// Newest mtime under a source directory (`.rs`, `.sql`, `Cargo.toml`).
 fn newest_source_mtime(dir: &Path, newest: &mut std::time::SystemTime) {

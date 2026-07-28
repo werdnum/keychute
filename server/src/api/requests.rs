@@ -24,6 +24,8 @@ const MAX_REASON_BYTES: usize = 4 * 1024;
 const MAX_STRUCTURED_BYTES: usize = 16 * 1024;
 const MAX_CONSTRAINT_ENTRIES: usize = 32;
 const MAX_TTL_SECONDS: u64 = 30 * 24 * 3600;
+/// `grants.max_uses` is an i32 column; anything above this cannot round-trip.
+const MAX_USES: u32 = i32::MAX as u32;
 
 /// Validate a create-access-request body and return the normalized
 /// constraints to store (canonical path prefixes, uppercased methods,
@@ -61,10 +63,11 @@ pub(crate) fn validate_request(req: &CreateAccessRequest) -> Result<Constraints,
         ));
     }
 
-    // Methods: plausible HTTP tokens, normalized to uppercase.
+    // Methods: RFC 9110 token syntax (so `M-SEARCH` and vendor `X-FOO` verbs
+    // are accepted, not just letters), normalized to uppercase.
     let mut methods = Vec::with_capacity(c.methods.len());
     for m in &c.methods {
-        if m.is_empty() || m.len() > 32 || !m.chars().all(|ch| ch.is_ascii_alphabetic()) {
+        if !policy::is_valid_http_method(m) {
             return Err(ApiFailure::InvalidRequest("invalid method"));
         }
         methods.push(m.to_ascii_uppercase());
@@ -89,7 +92,16 @@ pub(crate) fn validate_request(req: &CreateAccessRequest) -> Result<Constraints,
                 "brokered requests must name at least one method",
             ));
         }
-        c.max_uses
+        // `max_uses` is stored in an i32 column: reject out-of-range values
+        // here rather than letting a cast wrap them negative (which would
+        // exhaust the grant on its first use). Zero is likewise useless.
+        match c.max_uses {
+            Some(0) => return Err(ApiFailure::InvalidRequest("max_uses must be at least 1")),
+            Some(u) if u > MAX_USES => {
+                return Err(ApiFailure::InvalidRequest("max_uses is too large"))
+            }
+            other => other,
+        }
     } else {
         // Releasing tiers: default 1, and no more than 1 in v1.
         match c.max_uses {
@@ -112,18 +124,68 @@ pub(crate) fn validate_request(req: &CreateAccessRequest) -> Result<Constraints,
     })
 }
 
-/// Map store rows into policy-engine inputs. Rows that fail to parse are
-/// skipped (logged); a skipped row can only make the outcome more restrictive
-/// for non-deny rows and is never silently widened.
+/// Would this stored row participate in the decision for `req`? Deliberately
+/// mirrors `policy::is_applicable`, but reads only the raw columns that always
+/// parse (strings and timestamps), so it stays valid for a row whose typed
+/// fields are corrupt.
+///
+/// The mechanism column is compared as text: a value this binary cannot parse
+/// is by construction not the requested mechanism, so such a row can never
+/// govern this request.
+fn row_is_applicable_raw(
+    r: &db::PolicyRow,
+    client_name: &str,
+    req: &policy::RequestedGrant,
+    secret_tags: &[String],
+    now: chrono::DateTime<Utc>,
+) -> bool {
+    if r.mechanism != req.mechanism.as_str() {
+        return false;
+    }
+    if let Some(not_after) = r.not_after {
+        if not_after <= now {
+            return false;
+        }
+    }
+    if let Some(c) = &r.client_name {
+        if c != client_name {
+            return false;
+        }
+    }
+    match (&r.secret_name, &r.secret_tag) {
+        (Some(name), _) => *name == req.secret_name,
+        (None, Some(tag)) => secret_tags.iter().any(|t| t == tag),
+        (None, None) => true,
+    }
+}
+
+/// Map store rows into policy-engine inputs.
+///
+/// Fail closed: a row that is applicable to this request but cannot be parsed
+/// makes the whole policy set untrustworthy for this decision, and the request
+/// is denied. Skipping it would be a security hole — we cannot tell whether it
+/// was a `deny`, and dropping a deny lets a competing auto-approve release the
+/// secret it was meant to protect.
+///
+/// Rows that could not apply to this request (different client, secret,
+/// mechanism, or already expired — all decided from columns that cannot be
+/// malformed) are dropped with a warning, so one broken unrelated row does not
+/// brick every request.
 fn policy_inputs(
     client: &db::ClientRow,
     secret: Option<&db::SecretRow>,
+    secret_tags: &[String],
+    req: &policy::RequestedGrant,
     rows: &[db::PolicyRow],
-) -> (
-    policy::ClientRow,
-    Option<policy::SecretRow>,
-    Vec<policy::PolicyRow>,
-) {
+    now: chrono::DateTime<Utc>,
+) -> Result<
+    (
+        policy::ClientRow,
+        Option<policy::SecretRow>,
+        Vec<policy::PolicyRow>,
+    ),
+    ApiFailure,
+> {
     let client_row = policy::ClientRow {
         name: client.name.clone(),
         enabled: client.enabled,
@@ -141,15 +203,25 @@ fn policy_inputs(
     });
     let mut out = Vec::with_capacity(rows.len());
     for r in rows {
-        let (Some(mechanism), Some(outcome)) = (
-            Mechanism::from_str_opt(&r.mechanism),
-            policy::Outcome::from_str_opt(&r.outcome),
-        ) else {
-            tracing::warn!(policy_id = %r.id, "skipping unparseable policy row");
-            continue;
-        };
-        let Ok(origins) = serde_json::from_value(r.origins.clone()) else {
-            tracing::warn!(policy_id = %r.id, "skipping policy row with malformed origins");
+        let applicable = row_is_applicable_raw(r, &client.name, req, secret_tags, now);
+        let parsed = (|| {
+            let mechanism = Mechanism::from_str_opt(&r.mechanism)?;
+            let outcome = policy::Outcome::from_str_opt(&r.outcome)?;
+            let origins = serde_json::from_value(r.origins.clone()).ok()?;
+            Some((mechanism, outcome, origins))
+        })();
+        let Some((mechanism, outcome, origins)) = parsed else {
+            if applicable {
+                // Generic reason: never echo the malformed content back.
+                tracing::error!(
+                    policy_id = %r.id,
+                    "unparseable policy row applies to this request; failing closed"
+                );
+                return Err(ApiFailure::PolicyDenied(
+                    "policy set contains an unreadable rule".to_owned(),
+                ));
+            }
+            tracing::warn!(policy_id = %r.id, "skipping unparseable policy row (not applicable)");
             continue;
         };
         out.push(policy::PolicyRow {
@@ -168,7 +240,7 @@ fn policy_inputs(
             not_after: r.not_after,
         });
     }
-    (client_row, secret_row, out)
+    Ok((client_row, secret_row, out))
 }
 
 /// Human-friendly TTL for push messages ("1h", "90m", "45s").
@@ -236,19 +308,28 @@ pub async fn create(
         None => Vec::new(),
     };
     let policies = db::list_policies(&state.db).await?;
-    let (pclient, psecret, prows) = policy_inputs(&client.row, secret.as_ref(), &policies);
     let requested = policy::RequestedGrant {
         secret_name: req.secret_name.clone(),
         mechanism: req.mechanism,
         constraints: constraints.clone(),
     };
+    let eval_now = Utc::now();
+    // Fails closed if any row that applies to this request cannot be parsed.
+    let (pclient, psecret, prows) = policy_inputs(
+        &client.row,
+        secret.as_ref(),
+        &secret_tags,
+        &requested,
+        &policies,
+        eval_now,
+    )?;
     let evaluation = policy::evaluate(
         &pclient,
         psecret.as_ref(),
         &secret_tags,
         &requested,
         &prows,
-        Utc::now(),
+        eval_now,
     );
 
     // App-generated id so the encrypted context is AAD-bound to the row.
@@ -324,7 +405,11 @@ pub async fn create(
                 constraints: serde_json::to_value(&constraints)
                     .map_err(|e| ApiFailure::Internal(e.into()))?,
                 not_after,
-                max_uses: constraints.max_uses.map(|u| u as i32),
+                // Validation rejects anything above i32::MAX; saturate anyway
+                // so a future change can never wrap this negative.
+                max_uses: constraints
+                    .max_uses
+                    .map(|u| i32::try_from(u).unwrap_or(i32::MAX)),
                 passthrough: None,
             })
         }
@@ -379,14 +464,20 @@ pub async fn create(
             })?;
             state.resolve_notify.notify_waiters();
             if notify_only && state.notifier.is_real() {
-                // FYI only: the release proceeds regardless of delivery.
-                let n = approval_notification(
-                    &state,
+                // FYI only: the release already happened under a standing
+                // policy, so this must NOT read as an approval prompt — the
+                // operator would be asked to approve something already done
+                // and land on an unactionable resolved request.
+                let secret_label = match secret.as_ref().map(|s| s.name.as_str()) {
+                    Some(name) => format!("'{name}'"),
+                    None => "a not-yet-stored secret".to_owned(),
+                };
+                let n = crate::notify::release_notification(
+                    &state.config.external_url,
+                    row.id,
                     client.name(),
                     req.mechanism,
-                    constraints.ttl_seconds,
-                    secret.as_ref().map(|s| s.name.as_str()),
-                    row.id,
+                    &secret_label,
                 );
                 if let Err(e) = state.notifier.send(&n).await {
                     tracing::warn!(error = %e, "notify-only push failed");
@@ -645,6 +736,165 @@ mod tests {
             code(validate_request(&req).unwrap_err()),
             "request-too-large"
         );
+    }
+
+    #[test]
+    fn method_token_syntax_accepted() {
+        // RFC 9110 tokens, not just letters.
+        let mut req = base_request(Mechanism::Brokered);
+        req.constraints.methods = vec!["m-search".into(), "X-FOO".into()];
+        let c = validate_request(&req).unwrap();
+        assert_eq!(c.methods, vec!["M-SEARCH", "X-FOO"]);
+
+        for bad in ["bad method", "", "GET GET", "GET/1"] {
+            let mut req = base_request(Mechanism::Brokered);
+            req.constraints.methods = vec![bad.into()];
+            assert_eq!(
+                code(validate_request(&req).unwrap_err()),
+                "invalid-request",
+                "expected reject: {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn brokered_max_uses_range_is_enforced() {
+        let mut req = base_request(Mechanism::Brokered);
+        req.constraints.max_uses = Some(u32::MAX);
+        assert_eq!(code(validate_request(&req).unwrap_err()), "invalid-request");
+
+        let mut req = base_request(Mechanism::Brokered);
+        req.constraints.max_uses = Some(MAX_USES + 1);
+        assert_eq!(code(validate_request(&req).unwrap_err()), "invalid-request");
+
+        let mut req = base_request(Mechanism::Brokered);
+        req.constraints.max_uses = Some(0);
+        assert_eq!(code(validate_request(&req).unwrap_err()), "invalid-request");
+
+        // The largest storable value survives the i32 round-trip unchanged.
+        let mut req = base_request(Mechanism::Brokered);
+        req.constraints.max_uses = Some(MAX_USES);
+        let c = validate_request(&req).unwrap();
+        assert_eq!(c.max_uses, Some(MAX_USES));
+        assert_eq!(
+            c.max_uses.map(|u| i32::try_from(u).unwrap_or(i32::MAX)),
+            Some(i32::MAX)
+        );
+    }
+
+    // ---------- policy_inputs: fail closed ----------
+
+    fn db_client() -> db::ClientRow {
+        db::ClientRow {
+            id: Uuid::new_v4(),
+            name: "family-assistant".into(),
+            max_tier: Tier::Direct.as_int(),
+            mechanisms: vec!["brokered".into()],
+            auth_kind: "api-token".into(),
+            api_token_sha256: None,
+            sa_audience: None,
+            sa_subject: None,
+            enabled: true,
+        }
+    }
+
+    fn db_policy_row() -> db::PolicyRow {
+        db::PolicyRow {
+            id: Uuid::new_v4(),
+            client_name: None,
+            secret_name: None,
+            secret_tag: None,
+            mechanism: "brokered".into(),
+            outcome: "deny".into(),
+            priority: 0,
+            origins: serde_json::json!([]),
+            methods: vec![],
+            path_prefixes: vec![],
+            max_ttl_seconds: None,
+            max_uses: None,
+            not_after: None,
+            created_by: "test".into(),
+            created_at: Utc::now(),
+        }
+    }
+
+    fn requested() -> policy::RequestedGrant {
+        let req = base_request(Mechanism::Brokered);
+        policy::RequestedGrant {
+            secret_name: req.secret_name.clone(),
+            mechanism: req.mechanism,
+            constraints: validate_request(&req).unwrap(),
+        }
+    }
+
+    #[test]
+    fn unparseable_applicable_row_fails_closed() {
+        // Malformed origins on a row that applies to this request: the row
+        // could be a deny, so the request must be refused, not silently
+        // evaluated against the remaining (possibly permissive) rows.
+        let mut bad = db_policy_row();
+        bad.origins = serde_json::json!({"not": "an origin list"});
+        let err =
+            policy_inputs(&db_client(), None, &[], &requested(), &[bad], Utc::now()).unwrap_err();
+        assert!(
+            matches!(err, ApiFailure::PolicyDenied(_)),
+            "expected PolicyDenied, got {err:?}"
+        );
+
+        // Same for an unreadable outcome.
+        let mut bad = db_policy_row();
+        bad.outcome = "auto-aprove".into();
+        assert!(matches!(
+            policy_inputs(&db_client(), None, &[], &requested(), &[bad], Utc::now()).unwrap_err(),
+            ApiFailure::PolicyDenied(_)
+        ));
+    }
+
+    #[test]
+    fn unparseable_inapplicable_row_is_skipped() {
+        let good = db_policy_row();
+        let good_id = good.id;
+
+        // Broken rows that cannot govern this request: other client, other
+        // secret, other mechanism, already expired.
+        let mut other_client = db_policy_row();
+        other_client.client_name = Some("someone-else".into());
+        other_client.origins = serde_json::json!(42);
+
+        let mut other_secret = db_policy_row();
+        other_secret.secret_name = Some("other-secret".into());
+        other_secret.origins = serde_json::json!(42);
+
+        let mut other_tag = db_policy_row();
+        other_tag.secret_tag = Some("untagged".into());
+        other_tag.origins = serde_json::json!(42);
+
+        let mut other_mech = db_policy_row();
+        other_mech.mechanism = "mechanism-from-the-future".into();
+        other_mech.origins = serde_json::json!(42);
+
+        let mut expired = db_policy_row();
+        expired.not_after = Some(Utc::now() - Duration::hours(1));
+        expired.origins = serde_json::json!(42);
+
+        let (_, _, rows) = policy_inputs(
+            &db_client(),
+            None,
+            &[],
+            &requested(),
+            &[
+                other_client,
+                other_secret,
+                other_tag,
+                other_mech,
+                expired,
+                good,
+            ],
+            Utc::now(),
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, good_id);
     }
 
     #[test]

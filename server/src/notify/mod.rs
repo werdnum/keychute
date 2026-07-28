@@ -57,13 +57,34 @@ pub struct PushoverNotifier {
     http: reqwest::Client,
 }
 
+/// TCP+TLS handshake bound. Pushover is a public HTTPS endpoint; anything
+/// slower than this is a network fault, not a slow server.
+const PUSH_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Whole-request bound (connect + send + response headers + body). The push is
+/// sent INLINE from the single background sweeper, so an unbounded request
+/// would stall push retries, request expiry AND the ciphertext purge lifecycle.
+/// A push that misses this window is retried on the next sweep anyway.
+const PUSH_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// Belt-and-braces bound applied by the sweeper around `Notifier::send`, so a
+/// notifier implementation that ignores or lacks its own timeout still cannot
+/// wedge the sweep. Slightly above `PUSH_REQUEST_TIMEOUT` so the client's own
+/// (more informative) timeout normally wins.
+const PUSH_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
 impl PushoverNotifier {
     pub fn new(base_url: String, token: String, user_key: String) -> PushoverNotifier {
+        let http = reqwest::Client::builder()
+            .connect_timeout(PUSH_CONNECT_TIMEOUT)
+            .timeout(PUSH_REQUEST_TIMEOUT)
+            .build()
+            // Same failure mode as `reqwest::Client::new()`: only a broken TLS
+            // backend can get here, and that is not a recoverable runtime state.
+            .expect("build pushover http client");
         PushoverNotifier {
             base_url,
             token,
             user_key,
-            http: reqwest::Client::new(),
+            http,
         }
     }
 }
@@ -160,6 +181,38 @@ pub fn request_notification(
     }
 }
 
+/// Compose the FYI push for a request released automatically by a standing
+/// `notify-only` policy (DESIGN §4 release engine). Nothing is pending: the
+/// request is already approved and the grant already minted, so the wording
+/// reports what happened and the link is labelled "View request" rather than
+/// prompting the operator to approve something that is already resolved.
+///
+/// Same server-vocabulary discipline as [`request_notification`] (DESIGN §2/§6):
+/// client name, mechanism, tier label, and the secret label — which must be
+/// `"a not-yet-stored secret"` when the name does not match a stored secret
+/// (addendum #5). Never client-supplied context.
+pub fn release_notification(
+    external_url: &str,
+    request_id: Uuid,
+    client_name: &str,
+    mechanism: Mechanism,
+    secret_label: &str,
+) -> Notification {
+    Notification {
+        title: "Keychute access released".to_owned(),
+        message: format!(
+            "{client_name} was granted {} access to {secret_label} — {} — automatically under a standing notify-only policy. No approval is needed.",
+            mechanism.as_str(),
+            mechanism.tier().human_label(),
+        ),
+        url: Some(format!(
+            "{}/ui/requests/{request_id}",
+            external_url.trim_end_matches('/')
+        )),
+        url_title: Some("View request".to_owned()),
+    }
+}
+
 /// The push label for a request's secret: its name when stored, else the
 /// generic label (addendum #5).
 pub async fn secret_push_label(db: &sqlx::PgPool, secret_name: &str) -> anyhow::Result<String> {
@@ -192,65 +245,109 @@ pub fn spawn_sweeper(state: AppState) {
 }
 
 async fn sweep_once(state: &AppState) -> anyhow::Result<()> {
+    use anyhow::Context;
+
     let now = Utc::now();
 
-    // (a) Expire pending requests past their deadline; waiting clients must
-    // observe the transition.
+    // The phases are independent and EVERY phase runs on every sweep. A slow
+    // or failing push must never skip the purge lifecycle — that is what
+    // actually deletes passthrough ciphertext and stale replay rows — so the
+    // results are collected first and only reported afterwards.
+    let expiry = expire_phase(state, now).await;
+    let push = push_phase(state, now).await;
+    let purge = purge_phase(state, now).await;
+
+    expiry.context("expiry phase")?;
+    push.context("push phase")?;
+    purge.context("purge phase")?;
+    Ok(())
+}
+
+/// (a) Expire pending requests past their deadline; waiting clients must
+/// observe the transition.
+async fn expire_phase(state: &AppState, now: chrono::DateTime<Utc>) -> anyhow::Result<()> {
     let expired = db::expire_stale(&state.db, now).await?;
     if expired > 0 {
         tracing::info!(count = expired, "expired stale access requests");
         state.resolve_notify.notify_waiters();
     }
+    Ok(())
+}
 
-    // (b) Push retry. Every pending request without a recorded delivery is
-    // retried each sweep (attempts counter is telemetry only). With no real
-    // notifier nothing can be delivered: skip the loop entirely rather than
-    // spinning on rows that will never be marked delivered.
-    let pending = if state.notifier.is_real() {
-        db::list_pending_needing_push(&state.db, i32::MAX).await?
-    } else {
-        Vec::new()
-    };
+/// (b) Push retry. Every pending request without a recorded delivery is
+/// retried each sweep (attempts counter is telemetry only). With no real
+/// notifier nothing can be delivered: skip the loop entirely rather than
+/// spinning on rows that will never be marked delivered.
+async fn push_phase(state: &AppState, now: chrono::DateTime<Utc>) -> anyhow::Result<()> {
+    if !state.notifier.is_real() {
+        return Ok(());
+    }
+    let pending = db::list_pending_needing_push(&state.db, i32::MAX).await?;
     for row in pending {
-        // Same serialization as the create path (state.push_lock): the sweep
-        // must not race a concurrent create's dedup-check + send.
-        let _push_guard = state.push_lock.lock().await;
-        let dedup = db::ui_ext::recent_duplicate_push(
-            &state.db,
-            &row,
-            now - Duration::seconds(PUSH_DEDUP_WINDOW_SECONDS),
-        )
-        .await?;
-        if dedup {
-            // The operator was just told about an identical pending request,
-            // so this one is covered. Record it as delivered (same as the
-            // create path) — leaving it undelivered would re-select the row
-            // every sweep and fire a duplicate push once the window ages out.
-            db::mark_push_delivered(&state.db, row.id).await?;
-            continue;
-        }
-        let Some(mechanism) = Mechanism::from_str_opt(&row.mechanism) else {
-            tracing::warn!(request_id = %row.id, "unknown mechanism on request row");
-            continue;
-        };
-        let label = secret_push_label(&state.db, &row.secret_name).await?;
-        let n = request_notification(
-            &state.config.external_url,
-            row.id,
-            &row.client_name,
-            mechanism,
-            &label,
-        );
-        db::increment_push_attempts(&state.db, row.id).await?;
-        match state.notifier.send(&n).await {
-            Ok(()) => db::mark_push_delivered(&state.db, row.id).await?,
-            Err(err) => {
-                tracing::warn!(request_id = %row.id, error = %err, "push delivery failed");
-            }
+        // One bad row must not abandon the rest of the queue.
+        if let Err(err) = push_one(state, now, &row).await {
+            tracing::warn!(request_id = %row.id, error = %err, "push retry failed");
         }
     }
+    Ok(())
+}
 
-    // (c) Purge lifecycle (addendum #11).
+async fn push_one(
+    state: &AppState,
+    now: chrono::DateTime<Utc>,
+    row: &db::AccessRequestRow,
+) -> anyhow::Result<()> {
+    // Same serialization as the create path (state.push_lock): the sweep
+    // must not race a concurrent create's dedup-check + send. The send below
+    // is timeout-bounded, so the lock is held for a bounded time.
+    let _push_guard = state.push_lock.lock().await;
+    let dedup = db::ui_ext::recent_duplicate_push(
+        &state.db,
+        row,
+        now - Duration::seconds(PUSH_DEDUP_WINDOW_SECONDS),
+    )
+    .await?;
+    if dedup {
+        // The operator was just told about an identical pending request,
+        // so this one is covered. Record it as delivered (same as the
+        // create path) — leaving it undelivered would re-select the row
+        // every sweep and fire a duplicate push once the window ages out.
+        db::mark_push_delivered(&state.db, row.id).await?;
+        return Ok(());
+    }
+    let Some(mechanism) = Mechanism::from_str_opt(&row.mechanism) else {
+        tracing::warn!(request_id = %row.id, "unknown mechanism on request row");
+        return Ok(());
+    };
+    let label = secret_push_label(&state.db, &row.secret_name).await?;
+    let n = request_notification(
+        &state.config.external_url,
+        row.id,
+        &row.client_name,
+        mechanism,
+        &label,
+    );
+    db::increment_push_attempts(&state.db, row.id).await?;
+    match tokio::time::timeout(PUSH_SEND_TIMEOUT, state.notifier.send(&n)).await {
+        Ok(Ok(())) => db::mark_push_delivered(&state.db, row.id).await?,
+        Ok(Err(err)) => {
+            tracing::warn!(request_id = %row.id, error = %err, "push delivery failed");
+        }
+        // A timed-out push is a FAILED delivery: the row stays undelivered
+        // (attempts already incremented) and is retried next sweep.
+        Err(_) => {
+            tracing::warn!(
+                request_id = %row.id,
+                timeout_seconds = PUSH_SEND_TIMEOUT.as_secs(),
+                "push delivery timed out"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// (c) Purge lifecycle (addendum #11).
+async fn purge_phase(state: &AppState, now: chrono::DateTime<Utc>) -> anyhow::Result<()> {
     let replay_window = state.config.limits.replay_window_seconds;
     db::sweep_purge_passthroughs(&state.db, now, replay_window).await?;
     db::purge_request_context(&state.db, now - Duration::hours(CONTEXT_RETENTION_HOURS)).await?;
@@ -313,6 +410,63 @@ mod tests {
             Some(format!("https://keychute.example.dev/ui/requests/{id}").as_str())
         );
         assert_eq!(n.url_title.as_deref(), Some("Review request"));
+    }
+
+    #[test]
+    fn release_notification_is_informational() {
+        let id = Uuid::from_u128(9);
+        let n = release_notification(
+            "https://keychute.example.dev/",
+            id,
+            "family-assistant",
+            Mechanism::Brokered,
+            "github-pat",
+        );
+        // Never prompts for an approval that already happened.
+        assert!(!n.title.to_lowercase().contains("approval"));
+        assert!(!n.message.to_lowercase().contains("requests"));
+        assert_eq!(n.title, "Keychute access released");
+        assert!(n.message.contains("family-assistant"));
+        assert!(n.message.contains("brokered"));
+        assert!(n.message.contains("github-pat"));
+        assert!(n.message.contains("tier 0"));
+        assert!(n.message.contains("notify-only"));
+        assert_eq!(
+            n.url.as_deref(),
+            Some(format!("https://keychute.example.dev/ui/requests/{id}").as_str())
+        );
+        assert_eq!(n.url_title.as_deref(), Some("View request"));
+    }
+
+    /// A peer that completes the TCP handshake and then never writes a byte —
+    /// the exact shape that used to hang the sweeper forever.
+    #[tokio::test]
+    async fn pushover_send_times_out_against_a_silent_peer() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                // Accept and hold the socket open without ever responding.
+                held.push(sock);
+            }
+        });
+
+        let notifier = PushoverNotifier::new(format!("http://{addr}"), "t".into(), "u".into());
+        // Generous ceiling: a regression fails the test instead of hanging CI.
+        let ceiling = PUSH_REQUEST_TIMEOUT + std::time::Duration::from_secs(20);
+        let outcome = tokio::time::timeout(
+            ceiling,
+            notifier.send(&Notification {
+                title: "t".into(),
+                message: "m".into(),
+                url: None,
+                url_title: None,
+            }),
+        )
+        .await
+        .expect("send must return within its own timeout, not hang");
+        assert!(outcome.is_err(), "silent peer must surface as an error");
     }
 
     #[tokio::test]

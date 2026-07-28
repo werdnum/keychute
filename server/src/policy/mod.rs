@@ -10,6 +10,31 @@ use chrono::{DateTime, Utc};
 use keychute_types::{Constraints, Mechanism, Origin, Tier};
 use uuid::Uuid;
 
+/// Longest method token we accept. RFC 9110 sets no limit; this is a sanity
+/// bound so a policy row or request cannot carry an unbounded "method".
+pub const MAX_HTTP_METHOD_LEN: usize = 64;
+
+/// True when `s` is a syntactically valid HTTP method: a non-empty RFC 9110
+/// `token` of reasonable length.
+///
+/// `token = 1*tchar`, `tchar = "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" /
+/// "-" / "." / "^" / "_" / "`" / "|" / "~" / DIGIT / ALPHA`. This admits real
+/// non-alphabetic methods such as `M-SEARCH` (SSDP) and vendor `X-FOO` verbs,
+/// which an alphabetic-only check wrongly rejected, while still excluding
+/// whitespace, separators and control characters.
+pub fn is_valid_http_method(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= MAX_HTTP_METHOD_LEN
+        && s.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'!' | b'#'
+                        ..=b'\'' | b'*' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
+                )
+        })
+}
+
 /// Policy outcome stored on a row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -381,6 +406,38 @@ mod tests {
     use super::paths::{canonicalize, encode_for_forwarding, prefix_matches};
     use super::*;
     use chrono::Duration;
+
+    // ---------- method tokens ----------
+
+    #[test]
+    fn http_method_token_syntax() {
+        for good in [
+            "GET",
+            "get",
+            "PATCH",
+            "M-SEARCH",
+            "X-FOO",
+            "NOTIFY",
+            "a1!#$%&'*+-.^_`|~",
+        ] {
+            assert!(is_valid_http_method(good), "expected accept: {good:?}");
+        }
+        for bad in [
+            "",
+            "bad method",
+            "GET GET",
+            "GE\tT",
+            "GET\n",
+            "GET/1",
+            "(GET)",
+            "GET,POST",
+            "\u{e9}",
+        ] {
+            assert!(!is_valid_http_method(bad), "expected reject: {bad:?}");
+        }
+        assert!(is_valid_http_method(&"A".repeat(MAX_HTTP_METHOD_LEN)));
+        assert!(!is_valid_http_method(&"A".repeat(MAX_HTTP_METHOD_LEN + 1)));
+    }
 
     // ---------- canonicalize ----------
 
