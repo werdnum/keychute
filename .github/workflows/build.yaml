@@ -61,6 +61,16 @@ jobs:
 
           if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
              if [ -n "${INPUT_TAG}" ]; then
+               # Dispatcher-supplied: validate against Docker tag syntax
+               # BEFORE it reaches $GITHUB_OUTPUT — an embedded newline in a
+               # plain key=value write would let the rest of the input define
+               # arbitrary extra outputs (e.g. overriding image-path) for the
+               # privileged steps downstream. Bash [[ =~ ]] is unanchored to
+               # lines: a multi-line value fails this match.
+               if [[ ! "${INPUT_TAG}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+                 echo "invalid tag input: must match Docker tag syntax" >&2
+                 exit 1
+               fi
                TAG="${INPUT_TAG}"
              else
                TAG="$(date +%Y%m%d_%H%M%S)-${SHORT_SHA}"

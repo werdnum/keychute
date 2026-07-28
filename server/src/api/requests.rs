@@ -369,7 +369,11 @@ pub async fn create(
         Box::new(move || keyset.seal(&plaintext, AadContext::RequestContext { request_id }))
     });
 
-    let now = Utc::now();
+    // Deadlines persisted from this base (request expiry, auto-grant
+    // not_after) are enforced by SQL `now()` predicates, so derive them from
+    // the database clock: a fast server clock must not stretch a TTL as the
+    // database measures it.
+    let now = db::db_now(&state.db).await?;
     let expires_at = now + Duration::seconds(state.config.limits.request_expiry_seconds);
     let new_row = db::NewAccessRequest {
         client_name: client.name().to_owned(),

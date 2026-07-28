@@ -324,6 +324,35 @@ impl Config {
         if l.max_proxy_streams_per_client == 0 {
             bail!("limits.max_proxy_streams_per_client must be positive");
         }
+        // TokenReview posts the caller's service-account token (and, when
+        // configured, the reviewer credential) to this URL: plaintext to a
+        // non-loopback host exposes both. Same rule as the listen side, and
+        // the same explicit override.
+        if let Some(url) = &self.tokenreview_url {
+            let insecure_ok = self.allow_insecure_http_non_loopback;
+            if let Some(rest) = url.strip_prefix("http://") {
+                let hostport = rest.split(['/', '?', '#']).next().unwrap_or("");
+                // Bracketed IPv6 first; else strip any :port.
+                let host = match hostport.strip_prefix('[') {
+                    Some(v6) => v6.split(']').next().unwrap_or(""),
+                    None => hostport.split(':').next().unwrap_or(""),
+                };
+                let loopback = host.eq_ignore_ascii_case("localhost")
+                    || host
+                        .parse::<std::net::IpAddr>()
+                        .map(|ip| ip.is_loopback())
+                        .unwrap_or(false);
+                if !loopback && !insecure_ok {
+                    bail!(
+                        "tokenreview_url {} is plaintext HTTP to a non-loopback host: \
+                         use https://, or set allow_insecure_http_non_loopback: true",
+                        url
+                    );
+                }
+            } else if !url.starts_with("https://") {
+                bail!("tokenreview_url {} must be an http(s):// URL", url);
+            }
+        }
         // Zero here is never a usable configuration, only a quiet outage:
         // waits that return immediately, a body cap every nonempty payload
         // trips, and a proxy deadline that has elapsed before the upstream
@@ -456,6 +485,34 @@ clients:
         let mut cfg: Config = serde_yaml::from_str(BASE_YAML).unwrap();
         cfg.normalize();
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn tokenreview_url_plaintext_rules() {
+        let check = |url: &str, insecure_ok: bool, want_ok: bool| {
+            let mut cfg: Config = serde_yaml::from_str(BASE_YAML).unwrap();
+            cfg.tokenreview_url = Some(url.into());
+            cfg.allow_insecure_http_non_loopback = insecure_ok;
+            cfg.normalize();
+            assert_eq!(
+                cfg.validate().is_ok(),
+                want_ok,
+                "{url} insecure={insecure_ok}"
+            );
+        };
+        check(
+            "https://kubernetes.default.svc/apis/authentication.k8s.io/v1/tokenreviews",
+            false,
+            true,
+        );
+        check("http://127.0.0.1:8001/tokenreviews", false, true);
+        check("http://localhost:8001/tokenreviews", false, true);
+        check("http://[::1]:8001/tokenreviews", false, true);
+        // The SA token and reviewer credential would cross the wire plaintext.
+        check("http://kubernetes.default.svc/tokenreviews", false, false);
+        check("http://10.0.0.5:8001/tokenreviews", false, false);
+        check("http://10.0.0.5:8001/tokenreviews", true, true);
+        check("ftp://kubernetes.default.svc/tokenreviews", false, false);
     }
 
     #[test]

@@ -564,24 +564,48 @@ async fn wait_for_resolution(
                 continue;
             }
         };
-        network_errors = 0;
         let status = resp.status();
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| fail(EXIT_OTHER, format!("failed reading wait response: {e}")))?;
+        // Body read and parse failures are the same transient class as a
+        // failed send (connection dropped mid-response, truncated body): they
+        // share the retry budget instead of abandoning a still-pending
+        // request. Only a fully read response resets the counter.
+        let text = match resp.text().await {
+            Ok(t) => t,
+            Err(e) => {
+                network_errors += 1;
+                if network_errors >= MAX_WAIT_NETWORK_ERRORS {
+                    return Err(fail(
+                        EXIT_OTHER,
+                        format!("wait failed repeatedly: failed reading wait response: {e}"),
+                    ));
+                }
+                eprintln!("keychute: transient error while waiting, retrying: {e}");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+        };
         if !status.is_success() {
             return Err(fail(
                 EXIT_OTHER,
                 format!("wait failed: {}", api_error_message(status, &text)),
             ));
         }
-        let st: StatusResponse = serde_json::from_str(&text).map_err(|e| {
-            fail(
-                EXIT_OTHER,
-                format!("unexpected wait response from server: {e}"),
-            )
-        })?;
+        let st: StatusResponse = match serde_json::from_str(&text) {
+            Ok(st) => st,
+            Err(e) => {
+                network_errors += 1;
+                if network_errors >= MAX_WAIT_NETWORK_ERRORS {
+                    return Err(fail(
+                        EXIT_OTHER,
+                        format!("wait failed repeatedly: unexpected wait response: {e}"),
+                    ));
+                }
+                eprintln!("keychute: unexpected wait response, retrying: {e}");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+        };
+        network_errors = 0;
         if st.state != RequestState::Pending {
             return Ok(st);
         }

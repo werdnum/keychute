@@ -789,7 +789,9 @@ async fn approve(
     let row = db::get_request(&state.db, id)
         .await?
         .ok_or_else(|| UiError::new(StatusCode::NOT_FOUND, "no such request"))?;
-    let now = Utc::now();
+    // Database clock: the grant deadline computed below is enforced by SQL
+    // `now()` predicates, so its base must be the clock that enforces it.
+    let now = db::db_now(&state.db).await?;
     if row.state != "pending" || row.expires_at <= now {
         return Err(UiError::new(
             StatusCode::CONFLICT,

@@ -42,7 +42,12 @@ spec:
       # Must exceed limits.drainSeconds so the drain completes before the
       # kubelet SIGKILLs the pod: an in-flight passthrough read cut off here is
       # unrecoverable, since its payload is wrapped under the process-local
-      # ephemeral KEK (DESIGN §5).
+      # ephemeral KEK (DESIGN §5). Enforced at render time — a values override
+      # that violates it would otherwise deploy cleanly and only lose data
+      # during a later rollout.
+      {{- if le (int64 .Values.terminationGracePeriodSeconds) (int64 .Values.limits.drainSeconds) }}
+      {{- fail (printf "terminationGracePeriodSeconds (%v) must exceed limits.drainSeconds (%v): the kubelet would SIGKILL the pod before the drain finishes, losing in-flight passthrough reads" .Values.terminationGracePeriodSeconds .Values.limits.drainSeconds) }}
+      {{- end }}
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       serviceAccountName: {{ include "keychute.serviceAccountName" . }}
       {{- with .Values.imagePullSecrets }}

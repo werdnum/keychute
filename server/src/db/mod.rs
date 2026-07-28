@@ -69,6 +69,15 @@ pub async fn verify_no_references(db: &sqlx::PgPool, kek_id: &str) -> anyhow::Re
     Ok(count == 0)
 }
 
+/// The database clock. Persisted deadlines (request expiry, grant
+/// `not_after`) are derived from this rather than the process clock: every
+/// predicate that later enforces them runs on SQL `now()`, so a skewed server
+/// clock must not be able to lengthen (or shorten) a TTL as the database
+/// measures it.
+pub async fn db_now(db: &sqlx::PgPool) -> anyhow::Result<chrono::DateTime<chrono::Utc>> {
+    Ok(sqlx::query_scalar("SELECT now()").fetch_one(db).await?)
+}
+
 pub use clients::{get_client_by_name, list_clients, reconcile_clients, ClientRow};
 pub use grants::{
     begin_grant_use, get_grant, list_grants, purge_passthrough, revoke_grant,
