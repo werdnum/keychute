@@ -302,6 +302,11 @@ k8s-agent image).
   of those rows are crypto-erased by construction, and a Keychute restart loses
   live passthrough payloads, which fails closed: the grant read returns a clear
   "payload lost — re-request" error and the client starts a fresh approval.
+  Because the key is per-process, Keychute runs as a **single replica**
+  (`replicas: 1`, `Recreate` update strategy — §7): a second pod could not
+  unwrap payloads the first encrypted, and a rolling update would route reads
+  to a pod that never held the key. HA is a non-goal for this cluster, so
+  single-replica is the accepted cost of backup unrecoverability.
   Acceptable, because passthrough payloads are minutes-lived by design; durable
   secrets belong in the store.
 
@@ -531,6 +536,11 @@ cluster wiring lives in kube-config.
 In `werdnum/keychute`:
 
 - Rust workspace: `server/`, `cli/`, shared `types/` crate; `charts/keychute/`.
+  The chart pins `replicas: 1` with a `Recreate` update strategy and does not
+  expose a replica-count value — the process-local ephemeral KEK for
+  passthrough payloads (§ crypto) is not shared across pods, so a second
+  replica or a rolling update would serve "payload lost" errors for grants
+  the other pod approved.
 - GitHub Actions: build `linux/arm64` image → `ghcr.io/werdnum/keychute`
   (multi-stage Dockerfile, static-ish binary on `debian-slim`/`distroless`,
   non-root), push by digest, bump the chart's default image digest — mirroring the
