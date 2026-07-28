@@ -115,10 +115,12 @@ and is agent-influenceable. The approval UI therefore renders tier-2 context as
 3. Keychute records the release with the client-supplied context (page URL, field);
    policy can constrain releases to matching origins (e.g. only when the page
    origin is `hellofresh.com`). The origin the client checks and reports is the
-   **target element's frame origin, derived immediately before `fill()`** — not
-   the top-level page URL from earlier in the flow — so a cross-origin iframe or
-   a navigation between snapshot and fill cannot redirect the credential into a
-   frame the grant doesn't cover.
+   **target element's frame origin** — not the top-level page URL from earlier
+   in the flow — verified against a held element handle whose owner frame is
+   inspected in the same step as the `fill()`. Element handles detach on
+   navigation, so a navigation between check and fill aborts the fill with an
+   error rather than retargeting the credential into a document the grant never
+   covered; the client never re-resolves a selector between check and fill.
 
 This is "Secure Agentic Autofill" like 1Password's, but without granting an agent
 platform access to the real password-manager account.
@@ -189,7 +191,11 @@ One binary, several logical components:
   context) → `auto-approve` / `notify-only` / `require-approval` / `deny`.
 - **Notifier**: Pushover, using the cluster's existing convention (secret with
   `token` + `user_key`, same as alertmanager and sudo-service). Pluggable trait so
-  ntfy/webhook can be added later.
+  ntfy/webhook can be added later. Delivery is recorded on the request row, and a
+  retry loop plus a startup sweep re-send pushes for pending requests without a
+  recorded delivery — the request row *is* the outbox, no separate queue — while
+  dedup applies only to recorded deliveries, so a failed push cannot leave a
+  pending request the operator never hears about.
 - **Release engine**: serves grant access — brokered proxying with constraint
   checks, or plaintext reads with TTL/use-count enforcement (single-use by default
   for releasing tiers). Proxy validation operates on the canonical decoded path —
@@ -201,7 +207,14 @@ One binary, several logical components:
   Inbound authentication — the caller's Keychute API token or SA token — and any
   gateway cookies are consumed at the API boundary and never copied into the
   outbound request, so the upstream service never sees credentials that could
-  impersonate the client back to Keychute.
+  impersonate the client back to Keychute. Remaining caller headers are forwarded
+  minus a strip-list covering the routing-override family
+  (`X-HTTP-Method-Override`, `X-Original-URL`, `X-Rewrite-URL` and kin) and any
+  header colliding with the injection template; an upstream that honors some
+  other bespoke routing header is beyond what a proxy can police — tier-0
+  constraints assume the upstream routes by method and URL. Path-prefix
+  constraints match only at `/` segment boundaries: `/v1/account` covers
+  `/v1/account` and `/v1/account/…`, never `/v1/account-delete`.
 - **Crypto**: envelope encryption (§5).
 - **Audit log**: append-only record of every request, decision, and release/use.
 
@@ -336,9 +349,12 @@ the ciphertext-only design removes the main reason to isolate.
   constraint verbatim in the approval UI. Creation is idempotent: the client
   supplies a creation idempotency key, and a retry after a lost response
   returns the original request id instead of minting a second pending request
-  (and a second push). The key is bound to the authenticated client and a hash
-  of the normalized request payload; reuse with a different payload is rejected
-  rather than silently returning some other request's id.
+  (and a second push). The key is bound to the authenticated client and a
+  domain-separated keyed MAC of the normalized request payload (MAC key held in
+  the KEK file, never in Postgres — a plain hash would hand a database reader an
+  offline guessing oracle for low-entropy values embedded in context); reuse
+  with a different payload is rejected rather than silently returning some
+  other request's id.
 - `grants` — issued capability: request_id, constraints, TTL, max_uses, use_count,
   revoked. (One-shot releases are grants with max_uses = 1.) A passthrough secret
   entered at approval time but not stored is encrypted and attached to its grant,
@@ -608,7 +624,11 @@ calendar estimates.
   grant TTL/max-use/revocation, notify-only pushes.
 - **M3 — CUJ 1 brokered proxy + FA integration.** Grant proxy endpoint with
   host/method/path constraint enforcement and per-call audit; FA `KeychuteClient`
-  + brokered HTTP tool; script-source context attachment.
+  + brokered HTTP tool; script-source context attachment. Ships with the
+  proxy-side abuse bounds (per-client concurrent proxy streams, body size
+  limits, stream deadlines, disconnect cleanup — the M1 wait-cap logic applied
+  to the proxy path), since an auto-approved client could otherwise hold
+  unbounded slow streams open.
 - **M4 — CUJ 3 secure autofill.** `autofill` mechanism + origin constraints
   server-side; FA `browser_fill_credential` with the masking/containment work in
   the browser tools.
