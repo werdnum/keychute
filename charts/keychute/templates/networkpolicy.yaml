@@ -1,0 +1,40 @@
+{{- if .Values.networkPolicy.enabled }}
+# Defence in depth only. The load-bearing authentication is upstack: OIDC at
+# the gateway plus Keychute's own JWT validation and operator allowlist for
+# humans, static API tokens or audience-bound TokenReview for machine clients.
+# Network reachability is never authorization.
+#
+# kubelet probes dial the pod IP from the node netns and bypass NetworkPolicy,
+# so /healthz needs no rule here.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "keychute.fullname" . }}-ingress
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "keychute.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "keychute.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    # Gateway (human approval UI) and in-cluster machine clients, both on the
+    # single TLS listener.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.ingressNamespace }}
+        {{- range .Values.networkPolicy.clientNamespaces }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . }}
+        {{- end }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.monitoringNamespace }}
+      ports:
+        - port: 8443
+          protocol: TCP
+{{- end }}

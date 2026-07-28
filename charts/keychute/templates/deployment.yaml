@@ -1,0 +1,168 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "keychute.fullname" . }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "keychute.labels" . | nindent 4 }}
+spec:
+  # Pinned to a single replica with a Recreate strategy, and deliberately NOT
+  # configurable (DESIGN.md §5/§7): passthrough payload DEKs are wrapped under
+  # a process-local ephemeral KEK that exists only in this process's memory.
+  # A second replica could not unwrap payloads the first encrypted, and a
+  # rolling update would route grant reads to a pod that never held the key —
+  # both produce spurious "payload lost" errors. HA is a non-goal here.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "keychute.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "keychute.selectorLabels" . | nindent 8 }}
+      annotations:
+        # Roll the pod when the rendered server config changes.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "keychute.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: keychute
+          # Image digest is rewritten by .github/workflows/build.yaml on each
+          # push to main.
+          image: {{ include "keychute.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: KEYCHUTE_CONFIG
+              value: /etc/keychute/config/config.yaml
+            {{- if .Values.database.urlSecret }}
+            # Verbatim connection URL from a Secret (escape hatch for
+            # passwords needing percent-encoding).
+            - name: KEYCHUTE_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.urlSecret }}
+                  key: {{ .Values.database.urlKey }}
+            {{- else }}
+            # Assembled from the storage-cluster operator's credentials Secret
+            # using Kubernetes' $(VAR) env expansion, so the password is never
+            # rendered into the ConfigMap. KEYCHUTE_DATABASE_URL overrides
+            # `database_url` in the config file (server/src/config.rs).
+            - name: KEYCHUTE_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.existingSecret }}
+                  key: {{ .Values.database.passwordKey }}
+            - name: KEYCHUTE_DATABASE_URL
+              value: "postgres://{{ .Values.database.user }}:$(KEYCHUTE_DB_PASSWORD)@{{ .Values.database.host }}:{{ .Values.database.port | int64 }}/{{ .Values.database.name }}?sslmode={{ .Values.database.sslMode }}"
+            {{- end }}
+          ports:
+            - name: https
+              containerPort: 8443
+              protocol: TCP
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: https
+              scheme: HTTPS
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: https
+              scheme: HTTPS
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: config
+              mountPath: /etc/keychute/config
+              readOnly: true
+            # The KEK keyset. Read-only, and never reachable from Postgres.
+            - name: kek
+              mountPath: /etc/keychute/kek
+              readOnly: true
+            - name: tls
+              mountPath: /etc/keychute/tls
+              readOnly: true
+            {{- if .Values.pushover.enabled }}
+            - name: pushover
+              mountPath: /etc/keychute/pushover
+              readOnly: true
+            {{- end }}
+            {{- if .Values.upstreamCA.secretName }}
+            - name: upstream-ca
+              mountPath: /etc/keychute/upstream-ca
+              readOnly: true
+            {{- end }}
+            # readOnlyRootFilesystem: true — give the process somewhere to put
+            # transient files.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "keychute.fullname" . }}-config
+            items:
+              - key: config.yaml
+                path: config.yaml
+        - name: kek
+          secret:
+            secretName: {{ .Values.kek.secretName }}
+            defaultMode: 0400
+        - name: tls
+          secret:
+            secretName: {{ .Values.tls.secretName }}
+            defaultMode: 0400
+        {{- if .Values.pushover.enabled }}
+        - name: pushover
+          secret:
+            secretName: {{ .Values.pushover.secretName }}
+            defaultMode: 0400
+            items:
+              - key: token
+                path: token
+              - key: user_key
+                path: user_key
+        {{- end }}
+        {{- if .Values.upstreamCA.secretName }}
+        - name: upstream-ca
+          secret:
+            secretName: {{ .Values.upstreamCA.secretName }}
+        {{- end }}
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

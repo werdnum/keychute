@@ -1,0 +1,44 @@
+{{- if .Values.ingress.enabled }}
+# Public entrypoint for the human approval UI. In this cluster Ingresses are
+# materialized as Envoy Gateway HTTPRoutes (generated name
+# `<ingress>-<host-with-dashes>`); the OIDC SecurityPolicy in
+# templates/securitypolicy.yaml targets that route, and the BackendTLSPolicy
+# secures the gateway-to-Service hop.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "keychute.fullname" . }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "keychute.labels" . | nindent 4 }}
+  annotations:
+    cert-manager.io/cluster-issuer: {{ .Values.ingress.clusterIssuer }}
+    # The backend refuses plaintext; nginx must originate TLS upstream.
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+    {{- if and .Values.ingress.cloudflareTunnel.enabled .Values.ingress.cloudflareTunnel.target }}
+    # Routes through Cloudflare Tunnel so Pushover approval links work away
+    # from home. The cloudflared ConfigMap also needs this host in its ingress
+    # list. See values.yaml for the full trust caveat: the tunnel makes
+    # Cloudflare a TLS-terminating party for all approval traffic — session
+    # cookie, CSRF token and decrypted client context included — and therefore
+    # a party that could in principle forge or modify an approval.
+    external-dns.alpha.kubernetes.io/target: {{ .Values.ingress.cloudflareTunnel.target }}
+    {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  tls:
+    - hosts:
+        - {{ .Values.ingress.host }}
+      secretName: {{ .Values.ingress.tlsSecretName }}
+  rules:
+    - host: {{ .Values.ingress.host }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "keychute.fullname" . }}
+                port:
+                  number: 443
+{{- end }}

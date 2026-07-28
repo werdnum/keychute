@@ -1,0 +1,24 @@
+{{- if .Values.tokenreview.enabled }}
+# Binds the Keychute ServiceAccount to the built-in `system:auth-delegator`
+# ClusterRole so the server may create TokenReviews and thereby authenticate
+# audience-bound projected service-account tokens from in-cluster clients
+# (k8s-agent et al). DESIGN.md §7: without this binding *every* SA-token authn
+# attempt is rejected by the API server.
+#
+# Keep this binding's roleRef stable — roleRef is immutable, so changing it
+# would fail Helm upgrades rather than being rewritten in place.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "keychute.fullname" . }}-tokenreview
+  labels:
+    {{- include "keychute.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "keychute.serviceAccountName" . }}
+    namespace: {{ .Values.namespace }}
+{{- end }}

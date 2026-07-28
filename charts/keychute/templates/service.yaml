@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "keychute.fullname" . }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "keychute.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "keychute.selectorLabels" . | nindent 4 }}
+  ports:
+    # Single TLS listener. Plaintext HTTP is not offered: static API tokens and
+    # tier-1/2 plaintext reads transit this hop and the cluster network is not
+    # in the trusted base (DESIGN.md §7). In-cluster clients dial
+    # https://{{ include "keychute.serviceFQDN" . }} and verify against the
+    # internal CA bundle; the gateway needs a BackendTLSPolicy for the same
+    # reason.
+    - name: https
+      port: 443
+      targetPort: https
+      protocol: TCP

@@ -1,0 +1,84 @@
+{{/*
+Renders the server config YAML (shape pinned by server/src/config.rs and
+docs/IMPLEMENTATION.md "Config file"). Consumed via KEYCHUTE_CONFIG.
+
+Deliberately absent:
+  * `database_url` — supplied at runtime via KEYCHUTE_DATABASE_URL from the
+    Postgres credentials Secret, so the password never lands in a ConfigMap.
+  * `allow_insecure_http` / `allow_insecure_http_non_loopback` — dev-only
+    escape hatches (IMPLEMENTATION addendum #7). Production configures TLS.
+  * `human_auth.static` — the chart only ever emits OIDC mode.
+  * Pushover token/user_key literals — mounted as files and referenced by path.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "keychute.fullname" . }}-config
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "keychute.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    # Rendered by the keychute Helm chart. Do not edit in place.
+    listen_addr: "0.0.0.0:8443"
+    external_url: {{ .Values.externalUrl | quote }}
+    tls:
+      cert_path: /etc/keychute/tls/tls.crt
+      key_path: /etc/keychute/tls/tls.key
+    kek_file: /etc/keychute/kek/{{ .Values.kek.key }}
+    human_auth:
+      mode: oidc
+      oidc:
+        issuer: {{ .Values.oidc.issuer | quote }}
+        audience: {{ .Values.oidc.audience | quote }}
+        jwks_url: {{ .Values.oidc.jwksUrl | quote }}
+        {{- with .Values.oidc.allowedGroup }}
+        allowed_group: {{ . | quote }}
+        {{- end }}
+        group_claim: {{ .Values.oidc.groupClaim | quote }}
+        # Flow style so an empty list renders as `[]`, not a null the server
+        # would reject when deserializing Vec<String>.
+        allowed_subjects: {{ .Values.oidc.allowedSubjects | default list | toJson }}
+        clock_skew_seconds: {{ .Values.oidc.clockSkewSeconds | int64 }}
+    clients:{{ if not .Values.clients }} []{{ end }}
+      {{- range .Values.clients }}
+      - name: {{ .name | quote }}
+        max_tier: {{ .maxTier | quote }}
+        mechanisms:
+          {{- range .mechanisms }}
+          - {{ . | quote }}
+          {{- end }}
+        auth:
+          {{- with .auth.apiTokenSha256 }}
+          api_token_sha256: {{ . | lower | quote }}
+          {{- end }}
+          {{- with .auth.serviceAccount }}
+          service_account:
+            audience: {{ .audience | quote }}
+            subject: {{ .subject | quote }}
+          {{- end }}
+      {{- end }}
+    {{- if .Values.tokenreview.enabled }}
+    tokenreview_url: {{ .Values.tokenreview.url | quote }}
+    tokenreview_token_path: {{ .Values.tokenreview.tokenPath | quote }}
+    tokenreview_ca_path: {{ .Values.tokenreview.caPath | quote }}
+    {{- end }}
+    {{- if .Values.upstreamCA.secretName }}
+    upstream_ca_path: /etc/keychute/upstream-ca/{{ .Values.upstreamCA.key }}
+    {{- end }}
+    {{- if .Values.pushover.enabled }}
+    pushover:
+      base_url: {{ .Values.pushover.baseURL | quote }}
+      # Credentials come from the mounted Secret, never from this ConfigMap.
+      token_path: /etc/keychute/pushover/token
+      user_key_path: /etc/keychute/pushover/user_key
+    {{- end }}
+    limits:
+      max_pending_per_client: {{ .Values.limits.maxPendingPerClient | int64 }}
+      max_waits_per_client: {{ .Values.limits.maxWaitsPerClient | int64 }}
+      wait_max_seconds: {{ .Values.limits.waitMaxSeconds | int64 }}
+      request_expiry_seconds: {{ .Values.limits.requestExpirySeconds | int64 }}
+      proxy_max_body_bytes: {{ .Values.limits.proxyMaxBodyBytes | int64 }}
+      proxy_stream_deadline_seconds: {{ .Values.limits.proxyStreamDeadlineSeconds | int64 }}
+      replay_window_seconds: {{ .Values.limits.replayWindowSeconds | int64 }}
+      max_proxy_streams_per_client: {{ .Values.limits.maxProxyStreamsPerClient | int64 }}

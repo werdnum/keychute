@@ -1,0 +1,34 @@
+# Internal serving certificate, issued by a *cluster-internal* cert-manager CA
+# issuer. Public CAs cannot issue for `*.svc.cluster.local`, so the internal
+# hop cannot reuse the letsencrypt-prod issuer the Ingress uses (DESIGN.md §7).
+# The public material of this CA is fanned out to client namespaces with the
+# reflector pattern and referenced explicitly by clients (family-assistant
+# config, the CLI's --ca-bundle) and by the BackendTLSPolicy.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "keychute.fullname" . }}-internal-tls
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "keychute.labels" . | nindent 4 }}
+spec:
+  secretName: {{ .Values.tls.secretName }}
+  duration: {{ .Values.tls.duration }}
+  renewBefore: {{ .Values.tls.renewBefore }}
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  issuerRef:
+    name: {{ .Values.tls.issuerRef.name }}
+    kind: {{ .Values.tls.issuerRef.kind }}
+    group: {{ .Values.tls.issuerRef.group }}
+  commonName: {{ include "keychute.serviceFQDN" . }}
+  dnsNames:
+    - {{ include "keychute.serviceFQDN" . }}
+    - {{ include "keychute.fullname" . }}.{{ .Values.namespace }}.svc
+    - {{ include "keychute.fullname" . }}.{{ .Values.namespace }}
+    - {{ include "keychute.fullname" . }}
+    {{- range .Values.tls.dnsNames }}
+    - {{ . | quote }}
+    {{- end }}
