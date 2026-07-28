@@ -66,11 +66,13 @@ and is agent-influenceable. The approval UI therefore renders tier-2 context as
    grant cannot be exercised against `http://` or an alternate service on the
    same host.
 2. Keychute matches this against policy. No standing grant → it sends a Pushover
-   notification: *"family-assistant requests 1 h of brokered access to
-   api.example.com using 'Example API token'."* Pushes carry only
-   server-controlled metadata (client, secret name, tier, target) plus the link
-   to the approval page (OIDC-protected) — client-supplied context may contain
-   credential bytes and is shown only there.
+   notification: *"family-assistant requests 1 h of brokered access using
+   'Example API token'."* Pushes carry only server-vocabulary metadata — client
+   name, secret name, tier — plus the link to the approval page
+   (OIDC-protected). The requested target is client-supplied, so it appears
+   only on the approval page alongside the rest of the client-asserted input; a
+   prompt-injected client must not be able to exfiltrate anything through a
+   pre-approval push.
 3. I approve, which stores a durable grant. FA's wait resolves with the `grant_id`
    (never the credential).
 4. FA makes requests through `POST /v1/grants/{grant_id}/proxy`. Keychute validates
