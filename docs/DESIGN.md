@@ -43,6 +43,15 @@ language: *"family-assistant will make HTTPS requests to api.hellofresh.com usin
 key; it will not see the key"* vs. *"the k8s-agent CLI will print this secret to
 stdout inside the agent's container; the agent can read it"*.
 
+Tier 2 deserves a caveat the UI makes explicit: it is, in a real sense, a
+pinky-promise by the agent. The server can verify that the request came from the
+authenticated `keychute` CLI under a given identity, and the CLI can best-effort
+capture the invoking shell pipeline (walking parent-process cmdlines) to show what
+the output is being piped into — but that capture runs inside the agent's container
+and is agent-influenceable. The approval UI therefore renders tier-2 context as
+*"tagged as coming from the keychute CLI; pipeline (agent-asserted):
+`keychute request … | kubeseal …`"* rather than presenting it as verified fact.
+
 ---
 
 ## 2. Critical user journeys
@@ -73,7 +82,7 @@ stdout inside the agent's container; the agent can read it"*.
 3. I get a Pushover push. The approval page shows the requester identity, the reason,
    the tier warning ("the agent can read this from stdout"), and — if the secret is
    **not** yet stored — an input field where I type/paste the secret, with an
-   "also store this in Keychute" checkbox. Approval-time entry doubles as the
+   "also store this in Keychute" checkbox (default off). Approval-time entry doubles as the
    ingestion path, so credentials never have to transit an LLM chat to get into the
    system.
 4. Approval writes a durable single-use grant. The CLI's wait returns, it fetches
@@ -126,8 +135,12 @@ platform access to the real password-manager account.
   screenshotting a password it just autofilled before the page masks it). Client
   integrations must document their containment story; see §8.
 - Verifying that client code actually *is* the deterministic code it claims to be.
-  Client trust levels are an operator judgement about a deployment, not an
-  attestation scheme (see §6, "mechanism honesty").
+  The client-authn credential is the binding: the operator issues a shared secret
+  (API token or SA identity) to a specific deployment and records "this credential
+  is client `family-assistant`, tier X". Keychute's responsibility ends at
+  authenticating that credential; that it really lives only in the intended
+  deployment is operator configuration, not something Keychute can check (see §6,
+  "mechanism honesty").
 
 ---
 
@@ -267,7 +280,8 @@ timeout after which the request expires — sudo-service uses 1 h), `notify-only
 clearly labelled as *client-asserted, unverified*) in the approval UI: a freeform
 "reason", plus structured fields the integration fills in — for FA, the conversation
 snippet or the `execute_script` source that triggered the need; for the CLI, the
-`--reason` flag and the requesting pod identity. Rendering the actual script that
+`--reason` flag, the requesting identity, and the best-effort shell-pipeline
+capture (§1, tier-2 caveat). Rendering the actual script that
 will consume the secret is a first-class goal of the UI.
 
 ### Where enforcement lives — server, client, or both?
@@ -289,14 +303,22 @@ will consume the secret is a first-class goal of the UI.
 
 ### Authentication
 
-- **In-cluster clients** (k8s-agent, family-assistant): audience-bound projected
-  service-account tokens (`audience: keychute.andrewgarrett.dev`) validated via
-  TokenReview — proven pattern from sudo-service, no shared secrets to manage, and
-  the pod identity in the token becomes the request's verified requester identity.
-- **Humans** (approval UI): Envoy Gateway `SecurityPolicy` OIDC against Keycloak,
-  with the cluster-internal client API on skip-auth routes (again the sudo-service
-  shape: internal service URL for machines, OIDC-fronted external URL for me).
-- Non-cluster clients later, if ever: hashed static API keys bound to a client row.
+- **Machine clients** authenticate with one of two equivalent, pluggable methods,
+  either way resolving to a `clients` row carrying the name and tier:
+  - **Static API tokens** (hash stored server-side): the operator generates a
+    token, drops it into the client's environment (e.g. family-assistant's
+    config), and records "this token is client `family-assistant`, tier 1". Works
+    anywhere; no Kubernetes dependency.
+  - **Audience-bound projected service-account tokens**
+    (`audience: keychute.andrewgarrett.dev`) validated via TokenReview —
+    convenient for in-cluster clients like k8s-agent (no secret distribution; the
+    pod identity comes with the token), following sudo-service.
+- **Humans** (approval UI): Envoy Gateway `SecurityPolicy` OIDC against Keycloak
+  with `forwardAccessToken` enabled, so Keychute receives the JWT and validates it
+  itself (issuer, audience, signature) rather than trusting proxy headers; the
+  validated identity is what the audit log records as the approver. Cluster-
+  internal client API routes bypass OIDC (the sudo-service shape: internal service
+  URL for machines, OIDC-fronted external URL for me).
 
 ---
 
@@ -352,7 +374,7 @@ Research findings that shape this (all verified against the current tree):
   target, or a standalone `authenticated_http_request` tool that manages
   grant acquisition + proxying. Decision deferred to the FA-side design.
 - FA has **no generic secrets abstraction** — Keychute's client becomes the first,
-  a small `KeychuteClient` service class (SA token from a projected volume,
+  a small `KeychuteClient` service class (static API token from FA's config/env,
   in-cluster URL).
 - Autofill: today `browser_fill` takes its text from LLM-generated arguments.
   CUJ 3 needs a new deterministic path — `browser_fill_credential(ref,
@@ -382,7 +404,7 @@ calendar estimates.
 - **M1 — CUJ 2 end-to-end (CLI + approval).** Access requests, wait endpoint,
   Pushover notifier, approval UI with OIDC, approval-time secret entry
   (store-or-passthrough), durable grants with a single-use read endpoint, audit
-  log, TokenReview authn, `keychute` CLI. Deployed to the
+  log, client authn (API tokens + TokenReview), `keychute` CLI. Deployed to the
   cluster; k8s-agent image gains the CLI. *This is the first real value: agents stop
   needing credentials pasted into transcripts.*
 - **M2 — Policy engine & standing grants.** Policy rows, outcomes
@@ -402,23 +424,17 @@ calendar estimates.
 
 ## 10. Open questions for review
 
-1. **Approval-time secret entry retention** (CUJ 2): default the "store this
-   secret" checkbox on or off? Off is safer-by-default; on matches the likely
-   workflow (you'll be asked again).
-2. **FA request UX for tier-0 grants**: grants being durable, both styles are cheap
+1. **FA request UX for tier-0 grants**: grants being durable, both styles are cheap
    on the Keychute side — the FA tool call can block on the wait endpoint with a
    generous timeout, or return "pending" and re-check the request later. I lean
    *blocking* for v1, with pending/re-check in M3 if it chafes.
-3. **Tier names**: `brokered` / `trusted-client` / `cooperating-client` / `direct`
-   — happy with these? They appear in UI copy and policy config, so worth settling
-   early.
-4. **Notify-only for autofill**: should every standing-grant autofill release ping
+2. **Notify-only for autofill**: should every standing-grant autofill release ping
    Pushover (auditable but noisy), or only log? Proposed default: notify-only for
    the first release per grant per day.
-5. **Proxy response handling** (CUJ 1): responses stream back to FA unmodified.
+3. **Proxy response handling** (CUJ 1): responses stream back to FA unmodified.
    Some APIs echo credentials in responses (rare). Do we want optional response
    redaction rules per secret, or accept as residual risk for v1? Proposed: accept
    and document.
-6. **Cloudflare tunnel exposure**: approval pages need to be reachable when I'm
+4. **Cloudflare tunnel exposure**: approval pages need to be reachable when I'm
    away for Pushover links to be useful. Standard tunnel + Cloudflare Access +
    Keycloak OIDC stacking, same as sudo-service — confirm that's the intent.
