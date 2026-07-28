@@ -65,11 +65,12 @@ const PUSH_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// would stall push retries, request expiry AND the ciphertext purge lifecycle.
 /// A push that misses this window is retried on the next sweep anyway.
 const PUSH_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-/// Belt-and-braces bound applied by the sweeper around `Notifier::send`, so a
-/// notifier implementation that ignores or lacks its own timeout still cannot
-/// wedge the sweep. Slightly above `PUSH_REQUEST_TIMEOUT` so the client's own
-/// (more informative) timeout normally wins.
-const PUSH_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+/// Belt-and-braces bound applied around every `Notifier::send`, so a notifier
+/// implementation that ignores or lacks its own timeout still cannot wedge the
+/// sweep — nor, on the create path, the `push_lock` that serializes every
+/// approval-requiring create. Slightly above `PUSH_REQUEST_TIMEOUT` so the
+/// client's own (more informative) timeout normally wins.
+pub(crate) const PUSH_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 impl PushoverNotifier {
     pub fn new(base_url: String, token: String, user_key: String) -> PushoverNotifier {
@@ -356,7 +357,15 @@ async fn push_one(state: &AppState, row: &db::AccessRequestRow) -> anyhow::Resul
         mechanism,
         &label,
     );
-    db::increment_push_attempts(&state.db, row.id).await?;
+    // Conditional claim. The row was selected at the top of the phase, and the
+    // dedup + label lookups above are round trips: the operator may have
+    // approved, denied or let the request expire in that window. Bump the
+    // attempts counter ONLY while the row is still pushable, and treat "no row"
+    // as "resolved concurrently" — sending here would push an unactionable
+    // "approval needed" prompt for an already-decided request.
+    if !claim_for_push(&state.db, row.id).await? {
+        return Ok(());
+    }
     match tokio::time::timeout(PUSH_SEND_TIMEOUT, state.notifier.send(&n)).await {
         Ok(Ok(())) => db::mark_push_delivered(&state.db, row.id).await?,
         Ok(Err(err)) => {
@@ -375,13 +384,29 @@ async fn push_one(state: &AppState, row: &db::AccessRequestRow) -> anyhow::Resul
     Ok(())
 }
 
+/// Increment `push_attempts` iff the request is still pending, unexpired and
+/// undelivered — the same predicate `list_pending_needing_push` selects on.
+/// False means the row is no longer pushable and the caller must not send.
+async fn claim_for_push(db: &sqlx::PgPool, request_id: Uuid) -> anyhow::Result<bool> {
+    let claimed: Option<(Uuid,)> = sqlx::query_as(
+        "UPDATE access_requests SET push_attempts = push_attempts + 1 \
+         WHERE id = $1 AND state = 'pending' AND push_delivered_at IS NULL \
+           AND expires_at > now() \
+         RETURNING id",
+    )
+    .bind(request_id)
+    .fetch_optional(db)
+    .await?;
+    Ok(claimed.is_some())
+}
+
 /// (b) Purge lifecycle (addendum #11). Runs before the push phase so network
 /// trouble at the notifier can never delay ciphertext deletion.
 async fn purge_phase(state: &AppState, now: chrono::DateTime<Utc>) -> anyhow::Result<()> {
     let replay_window = state.config.limits.replay_window_seconds;
     db::sweep_purge_passthroughs(&state.db, now, replay_window).await?;
     db::purge_request_context(&state.db, now - Duration::hours(CONTEXT_RETENTION_HOURS)).await?;
-    db::ui_ext::delete_stale_grant_reads(&state.db, now - Duration::seconds(replay_window)).await?;
+    db::ui_ext::unpin_stale_grant_reads(&state.db, now - Duration::seconds(replay_window)).await?;
     Ok(())
 }
 

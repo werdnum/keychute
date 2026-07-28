@@ -136,8 +136,11 @@ pub async fn begin_grant_use(
                 });
             }
             // Key seen before but the replay window has closed: it can no
-            // longer be replayed, and (grant_id, idem_key) is unique, so it
-            // cannot become a fresh use either.
+            // longer be replayed, and it can never become a fresh use either —
+            // (grant_id, idem_key) is unique and the sweeper only clears a
+            // stale row's version pin (`ui_ext::unpin_stale_grant_reads`),
+            // never deletes it, so the burned key stays burned for the life of
+            // the grant.
             return Ok(GrantUse::Exhausted);
         }
     }

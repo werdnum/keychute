@@ -217,6 +217,16 @@ fn outbound_url(
     Ok(url)
 }
 
+/// The method actually sent upstream: the normalized (uppercase) form that
+/// the grant check authorized and the audit rows record. HTTP methods are
+/// case-sensitive on the wire, so forwarding the caller's original casing
+/// (e.g. `delete` under a grant permitting `DELETE`) could reach a different
+/// upstream operation than the one approved.
+fn outbound_method(normalized: &str) -> Result<axum::http::Method, ApiFailure> {
+    axum::http::Method::from_bytes(normalized.as_bytes())
+        .map_err(|_| ApiFailure::InvalidRequest("invalid HTTP method"))
+}
+
 /// ANY /v1/grants/{id}/proxy — root path.
 pub async fn proxy_root(
     State(state): State<AppState>,
@@ -265,9 +275,15 @@ fn proxy_suffix(raw_path: &str) -> Option<&str> {
 }
 
 async fn handle(state: AppState, grant_id: Uuid, req: Request) -> Result<Response, ApiFailure> {
-    let deadline =
-        std::time::Duration::from_secs(state.config.limits.proxy_stream_deadline_seconds);
-    match tokio::time::timeout(deadline, handle_inner(&state, grant_id, req, deadline)).await {
+    // ONE deadline covers the whole proxied lifetime: request handling, the
+    // upstream exchange, and streaming the response body back to the caller.
+    // `timeout_at` governs everything up to returning the response; `forward`
+    // sets the reqwest timeout to the time REMAINING at send, which reqwest
+    // applies through the end of response-body streaming — so the body stream
+    // (which outlives this function) cannot extend the total past the limit.
+    let limit = std::time::Duration::from_secs(state.config.limits.proxy_stream_deadline_seconds);
+    let deadline = tokio::time::Instant::now() + limit;
+    match tokio::time::timeout_at(deadline, handle_inner(&state, grant_id, req, deadline)).await {
         Ok(result) => result,
         Err(_) => Err(ApiFailure::UpstreamTimeout),
     }
@@ -277,7 +293,7 @@ async fn handle_inner(
     state: &AppState,
     grant_id: Uuid,
     req: Request,
-    deadline: std::time::Duration,
+    deadline: tokio::time::Instant,
 ) -> Result<Response, ApiFailure> {
     let (parts, body) = req.into_parts();
     let client = authenticate_client(state, &parts.headers).await?;
@@ -337,9 +353,19 @@ async fn handle_inner(
 
     // Buffer and size-check the request body BEFORE use-accounting: a 413 must
     // not burn a use of a finite-max_uses grant (it never reaches upstream).
-    let body_bytes = axum::body::to_bytes(body, state.config.limits.proxy_max_body_bytes)
-        .await
-        .map_err(|_| ApiFailure::BodyTooLarge)?;
+    // Read manually rather than via `to_bytes` with a limit so a genuine
+    // size-cap hit (413) is distinguishable from other read failures (400).
+    let max_body = state.config.limits.proxy_max_body_bytes;
+    let mut body_stream = body.into_data_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = body_stream.next().await {
+        let chunk = chunk.map_err(|_| ApiFailure::InvalidRequest("request body read failed"))?;
+        if buf.len().saturating_add(chunk.len()) > max_body {
+            return Err(ApiFailure::BodyTooLarge);
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    let body_bytes = axum::body::Bytes::from(buf);
 
     // Resolve the credential version BEFORE use-accounting (pins the audit).
     let version = db::get_secret_version(&state.db, secret.id, secret.current_version)
@@ -347,11 +373,18 @@ async fn handle_inner(
         .ok_or(ApiFailure::PayloadLost)?;
 
     // The write-ahead attempt row records where the credential is about to be
-    // sent (method/origin/path), before anything leaves the process.
+    // sent (method/origin/path), before anything leaves the process. The
+    // caller's query string is forwarded verbatim, so it is part of "where":
+    // it is recorded alongside the path — otherwise `?limit=10` and
+    // `?transfer_to=attacker` would produce identical audit rows.
+    let audited_path = match parts.uri.query() {
+        Some(q) => format!("{canonical}?{q}"),
+        None => canonical.clone(),
+    };
     let target = db::AuditTarget {
         method: method.clone(),
         origin: origin.to_display(),
-        path: canonical.clone(),
+        path: audited_path.clone(),
     };
     match db::begin_grant_use(
         &state.db,
@@ -404,11 +437,14 @@ async fn handle_inner(
         "basic" | "basic-password" => {
             // The username lives in `injection_username` (migration 0003); the
             // UI's create path stores it in `injection_header` for `basic`, so
-            // fall back to that.
+            // fall back to that. A row with neither fails CLOSED (like the
+            // `header` kind above): defaulting to "" would ship
+            // `Basic base64(":" + secret)` upstream, leaking the secret into
+            // the upstream's auth-failure log and burning a grant use.
             basic_username = db::api_ext::get_injection_username(&state.db, secret.id)
                 .await?
                 .or_else(|| secret.injection_header.clone())
-                .unwrap_or_default();
+                .ok_or(ApiFailure::BadCredentialEncoding)?;
             InjectionSpec::BasicPassword {
                 username: &basic_username,
             }
@@ -419,7 +455,17 @@ async fn handle_inner(
     let mut outbound = build_outbound_headers(&parts.headers, &header_name);
     outbound.insert(header_name, header_value);
     forward(
-        state, parts, body_bytes, grant, version.id, origin, &canonical, &method, outbound, slot,
+        state,
+        parts,
+        body_bytes,
+        grant,
+        version.id,
+        origin,
+        &canonical,
+        &audited_path,
+        &method,
+        outbound,
+        slot,
         deadline,
     )
     .await
@@ -435,21 +481,26 @@ async fn forward(
     secret_version_id: Uuid,
     origin: &Origin,
     canonical_path: &str,
+    // `canonical_path` plus the caller's verbatim query string, for audit.
+    audited_path: &str,
     method: &str,
     outbound_headers: HeaderMap,
     slot: crate::state::SlotGuard,
-    deadline: std::time::Duration,
+    deadline: tokio::time::Instant,
 ) -> Result<Response, ApiFailure> {
     let url = outbound_url(&origin.to_display(), canonical_path, parts.uri.query())
         .map_err(|e| ApiFailure::Internal(anyhow::anyhow!("origin parse: {e}")))?;
 
     let upstream = state
         .upstream
-        .request(parts.method.clone(), url)
+        // The NORMALIZED method — the one the grant check authorized and the
+        // audit rows record — never the caller's original casing.
+        .request(outbound_method(method)?, url)
         .headers(outbound_headers)
         .body(body_bytes)
-        // Covers the whole upstream exchange including body streaming.
-        .timeout(deadline)
+        // Covers the rest of the upstream exchange including response-body
+        // streaming: the remaining share of the single stream deadline.
+        .timeout(deadline.saturating_duration_since(tokio::time::Instant::now()))
         .send()
         .await
         .map_err(|e| {
@@ -463,7 +514,12 @@ async fn forward(
     let status = upstream.status();
 
     // proxy-completed audit row: method/origin/path/status, never bodies.
-    insert_audit(
+    // The upstream side effect has already committed, so an audit-insert
+    // failure here must NOT become a 500: the caller would retry and
+    // duplicate the side effect (or find a finite-use grant already burned).
+    // The design allows an attempt row without a completion row after a
+    // mid-release failure; log loudly and return the upstream response.
+    if let Err(e) = insert_audit(
         &state.db,
         &AuditEvent {
             kind: kinds::PROXY_COMPLETED,
@@ -474,22 +530,42 @@ async fn forward(
             secret_version_id: Some(secret_version_id),
             method: Some(method.to_owned()),
             origin: Some(origin.to_display()),
-            path: Some(canonical_path.to_owned()),
+            path: Some(audited_path.to_owned()),
             status: Some(status.as_u16() as i32),
             ..Default::default()
         },
     )
     .await
-    .map_err(|e| ApiFailure::Internal(e.into()))?;
+    {
+        tracing::error!(
+            error = %e,
+            grant_id = %grant.id,
+            client_name = %grant.client_name,
+            "proxy-completed audit insert failed; returning upstream response \
+             (attempt row exists, completion row is missing)"
+        );
+    }
 
     let mut headers = build_response_headers(upstream.headers());
     // Addendum #14: override upstream's cache policy on every proxied response.
     headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
 
     // Stream the body back; the slot guard rides along until the stream drops.
+    // The response body is capped at the same limit as the request body
+    // (values.yaml documents `proxyMaxBodyBytes` as covering both); crossing
+    // it errors the stream, which terminates the caller's connection.
+    let max_body = state.config.limits.proxy_max_body_bytes;
+    let mut total: usize = 0;
     let stream = upstream.bytes_stream().map(move |chunk| {
         let _slot = &slot;
-        chunk.map_err(std::io::Error::other)
+        let bytes = chunk.map_err(std::io::Error::other)?;
+        total = total.saturating_add(bytes.len());
+        if total > max_body {
+            return Err(std::io::Error::other(
+                "upstream response body exceeds the proxy limit",
+            ));
+        }
+        Ok(bytes)
     });
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = status;
@@ -697,11 +773,14 @@ mod tests {
             "/a\\b",   // raw '\'
             "/a/../b", // dot segment
             "/a/%2e%2e/b",
-            "/a//b",  // duplicate slash
-            "/a%00b", // control character
-            "/a%FFb", // invalid UTF-8
-            "/a%2",   // truncated escape
-            "/a%zz",  // invalid escape
+            "/a/..;b/c",                // dot-dot behind a path parameter
+            "/v1/account/..;/v1/admin", // servlet-style prefix escape
+            "/a/..%3b/b",               // encoded ';' spelling
+            "/a//b",                    // duplicate slash
+            "/a%00b",                   // control character
+            "/a%FFb",                   // invalid UTF-8
+            "/a%2",                     // truncated escape
+            "/a%zz",                    // invalid escape
         ] {
             assert!(paths::canonicalize(bad).is_err(), "should reject {bad}");
         }
@@ -712,6 +791,28 @@ mod tests {
         // Origin host/port/scheme are never influenced by the path.
         let url = outbound_url("https://up.example.com:8443", "/v1/echo", None).unwrap();
         assert_eq!(url.as_str(), "https://up.example.com:8443/v1/echo");
+    }
+
+    #[test]
+    fn outbound_method_is_the_normalized_uppercase_form() {
+        // handle_inner uppercases the caller's method before the grant check;
+        // forward sends exactly that normalized form upstream, so what is
+        // authorized, what is sent, and what is audited all agree even when
+        // the caller spells the method in lowercase.
+        for raw in ["delete", "Delete", "DELETE"] {
+            let normalized = raw.to_ascii_uppercase();
+            let m = outbound_method(&normalized).unwrap();
+            assert_eq!(m, axum::http::Method::DELETE);
+            assert_eq!(m.as_str(), "DELETE");
+        }
+        // Extension methods survive normalization too.
+        let m = outbound_method(&"m-search".to_ascii_uppercase()).unwrap();
+        assert_eq!(m.as_str(), "M-SEARCH");
+        // Non-token bytes fail rather than being forwarded.
+        assert!(matches!(
+            outbound_method("GE T"),
+            Err(ApiFailure::InvalidRequest(_))
+        ));
     }
 
     #[test]

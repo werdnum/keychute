@@ -10,6 +10,16 @@ Deliberately absent:
   * `human_auth.static` — the chart only ever emits OIDC mode.
   * Pushover token/user_key literals — mounted as files and referenced by path.
 */}}
+{{/*
+Authorization allowlist guard. server/src/config.rs rejects an OIDC config with
+neither `allowed_subjects` nor `allowed_group` ("oidc human auth requires
+allowed_subjects or allowed_group"), but that only fires once the pod starts —
+`helm lint`/`helm template`/`helm upgrade` would all pass and the failure would
+surface as a CrashLoopBackOff. Fail at render time instead.
+*/}}
+{{- if and (empty .Values.oidc.allowedSubjects) (empty .Values.oidc.allowedGroup) }}
+{{- fail "keychute: the OIDC authorization allowlist is empty. Set oidc.allowedSubjects (a list of `sub` claims) and/or oidc.allowedGroup (a group name matched against oidc.groupClaim). The server refuses to start without at least one of them." }}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:

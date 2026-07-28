@@ -63,7 +63,12 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
         .get(axum::http::header::AUTHORIZATION)?
         .to_str()
         .ok()?;
-    let token = value.strip_prefix("Bearer ")?.trim();
+    // Case-insensitive scheme match (RFC 9110 §11.1), same as human.rs.
+    let (scheme, token) = value.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let token = token.trim();
     if token.is_empty() {
         return None;
     }
@@ -105,9 +110,13 @@ fn tokenreview_http(state: &AppState) -> Result<&'static reqwest::Client, ApiFai
     if let Some(ca_path) = &state.config.tokenreview_ca_path {
         let pem = std::fs::read(ca_path)
             .map_err(|e| ApiFailure::Internal(anyhow::anyhow!("reading tokenreview CA: {e}")))?;
-        let cert = reqwest::Certificate::from_pem(&pem)
+        // Whole bundle, not just the first cert: during API-server CA
+        // rotation `ca.crt` legitimately carries two certificates.
+        let certs = reqwest::Certificate::from_pem_bundle(&pem)
             .map_err(|e| ApiFailure::Internal(anyhow::anyhow!("parsing tokenreview CA: {e}")))?;
-        builder = builder.add_root_certificate(cert);
+        for cert in certs {
+            builder = builder.add_root_certificate(cert);
+        }
     }
     let client = builder
         .build()
@@ -187,5 +196,27 @@ async fn tokenreview_authenticate(
             row: candidates.into_iter().next().expect("len checked"),
         }),
         _ => Err(ApiFailure::Unauthenticated),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::header::AUTHORIZATION;
+
+    #[test]
+    fn bearer_extraction_is_scheme_case_insensitive() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(bearer_token(&headers), None);
+        headers.insert(AUTHORIZATION, "Bearer abc".parse().unwrap());
+        assert_eq!(bearer_token(&headers), Some("abc"));
+        headers.insert(AUTHORIZATION, "bearer abc".parse().unwrap());
+        assert_eq!(bearer_token(&headers), Some("abc"));
+        headers.insert(AUTHORIZATION, "BEARER abc".parse().unwrap());
+        assert_eq!(bearer_token(&headers), Some("abc"));
+        headers.insert(AUTHORIZATION, "Basic abc".parse().unwrap());
+        assert_eq!(bearer_token(&headers), None);
+        headers.insert(AUTHORIZATION, "Bearer ".parse().unwrap());
+        assert_eq!(bearer_token(&headers), None);
     }
 }

@@ -71,7 +71,14 @@ pub async fn insert_access_request_with_id(
     resolution: &InitialResolution<'_>,
 ) -> anyhow::Result<InsertOutcome> {
     let mut tx = db.begin().await?;
-    if req.context_wrapped_dek.is_some() {
+    // Same pattern as `ui_ext::approve_request`: the lock must cover EVERY
+    // wrapped-DEK insert in this transaction — the sealed request context AND
+    // an auto-approve grant's passthrough payload (currently always None from
+    // the API path, but the store layer must not depend on that).
+    let inserts_wrapped_dek = req.context_wrapped_dek.is_some()
+        || matches!(resolution,
+            InitialResolution::Approved { grant, .. } if grant.passthrough.is_some());
+    if inserts_wrapped_dek {
         super::take_kek_shared_lock(&mut tx).await?;
     }
     if pending_cap.is_some() {
@@ -109,9 +116,13 @@ pub async fn insert_access_request_with_id(
     .await?;
     if let Some(mut row) = inserted {
         if let Some(cap) = pending_cap {
+            // Expired-but-unswept rows must not count toward the cap: during a
+            // stalled sweep a client whose pending requests have all expired
+            // would otherwise stay 429'd. Expiry on the DB clock, matching the
+            // approve/deny/expire predicates.
             let pending: i64 = sqlx::query_scalar(
                 "SELECT count(*) FROM access_requests \
-                 WHERE client_name = $1 AND state = 'pending'",
+                 WHERE client_name = $1 AND state = 'pending' AND now() < expires_at",
             )
             .bind(&req.client_name)
             .fetch_one(&mut *tx)

@@ -37,30 +37,41 @@ jobs:
     steps:
       - name: Generate tags and determine build strategy
         id: tags
+        # Every value below crosses into the shell through env, never through
+        # `${{ }}` interpolation: this job holds `packages: write` and later
+        # mints an App token with push access to main, and INPUT_TAG in
+        # particular is attacker-shaped free text from workflow_dispatch.
+        # Expression interpolation would splice it into the script source.
+        env:
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+          EVENT_NAME: ${{ github.event_name }}
+          COMMIT_SHA: ${{ github.sha }}
+          PR_NUMBER: ${{ github.event.number }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
         run: |
           # Construct image path: ghcr.io/owner/keychute
           # Lowercase the owner name to avoid issues with docker
-          OWNER="$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
-          IMAGE_PATH="${{ env.REGISTRY }}/${OWNER}/${{ env.IMAGE_NAME }}"
+          OWNER="$(echo "${REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          IMAGE_PATH="${REGISTRY}/${OWNER}/${IMAGE_NAME}"
           echo "image-path=${IMAGE_PATH}" >> "$GITHUB_OUTPUT"
 
           # Determine tag and push strategy
           SHOULD_PUSH="false"
-          SHORT_SHA="$(echo "${{ github.sha }}" | cut -c1-7)"
+          SHORT_SHA="$(echo "${COMMIT_SHA}" | cut -c1-7)"
 
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-             if [ -n "${{ github.event.inputs.tag }}" ]; then
-               TAG="${{ github.event.inputs.tag }}"
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
+             if [ -n "${INPUT_TAG}" ]; then
+               TAG="${INPUT_TAG}"
              else
                TAG="$(date +%Y%m%d_%H%M%S)-${SHORT_SHA}"
              fi
              SHOULD_PUSH="true"
-          elif [ "${{ github.event_name }}" = "push" ] || [ "${{ github.event_name }}" = "schedule" ]; then
+          elif [ "${EVENT_NAME}" = "push" ] || [ "${EVENT_NAME}" = "schedule" ]; then
              TAG="$(date +%Y%m%d_%H%M%S)-${SHORT_SHA}"
              SHOULD_PUSH="true"
           else
              # pull_request
-             TAG="pr-${{ github.event.number }}"
+             TAG="pr-${PR_NUMBER}"
              SHOULD_PUSH="false"
           fi
 
@@ -68,8 +79,12 @@ jobs:
             echo "tag=${TAG}"
             echo "should-push=${SHOULD_PUSH}"
             # The cluster runs arm64; amd64 is built too so the image is
-            # portable. The Dockerfile cross-compiles from the native build
-            # host (see --platform=$BUILDPLATFORM), so this needs no QEMU.
+            # portable. No QEMU setup step is needed because the Dockerfile
+            # never executes a target-arch command: every RUN is pinned to
+            # --platform=$BUILDPLATFORM (cross-compile for the binaries, a
+            # `rootfs` stage for the CA bundle and the passwd/group entries)
+            # and the one per-target stage is COPY-only. Adding a RUN to the
+            # `runtime` stage would break that and require setup-qemu-action.
             echo "platforms=linux/amd64,linux/arm64"
           } >> "$GITHUB_OUTPUT"
 
@@ -136,6 +151,9 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
           IMAGE_TAG: ${{ needs.prepare.outputs.tag }}
+          REPOSITORY: ${{ github.repository }}
+          SERVER_URL: ${{ github.server_url }}
+          COMMIT_SHA: ${{ github.sha }}
         run: |
           set -e
 
@@ -151,7 +169,7 @@ jobs:
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${REPOSITORY}.git"
 
           # ubuntu-latest ships mikefarah yq, but fall back to a user-writable
           # install if it's ever missing.
@@ -174,9 +192,8 @@ jobs:
             echo "No changes to commit"
           else
             git add "${VALUES_PATH}" "${CHART_PATH}"
-            git commit -m "chore: update image to ${IMAGE_DIGEST:0:19}
-
-          Source: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}"
+            git commit -m "chore: update image to ${IMAGE_DIGEST:0:19}" \
+                       -m "Source: ${SERVER_URL}/${REPOSITORY}/commit/${COMMIT_SHA}"
             git pull --rebase
             git push
             echo "Updated chart with new image digest"

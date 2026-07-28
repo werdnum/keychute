@@ -283,13 +283,21 @@ pub async fn recent_duplicate_push(
     .await?)
 }
 
-/// Purge lifecycle (addendum #11d): delete replay rows whose window has
-/// closed. Their pin on secret_versions ends with them.
-pub async fn delete_stale_grant_reads(db: &PgPool, cutoff: DateTime<Utc>) -> anyhow::Result<u64> {
-    let res = sqlx::query("DELETE FROM grant_reads WHERE first_read_at < $1")
-        .bind(cutoff)
-        .execute(db)
-        .await?;
+/// Purge lifecycle (addendum #11d): drop the secret_versions pin of replay
+/// rows whose window has closed. The row itself is KEPT as a tombstone:
+/// deleting it would let the same idempotency key — which
+/// [`crate::db::grants::begin_grant_use`] already reported as `Exhausted` —
+/// silently burn a fresh use on a multi-use grant after the next sweep, and
+/// release a newer secret version under a key the caller believes is spent.
+/// Tombstones die with their grant (`ON DELETE CASCADE`).
+pub async fn unpin_stale_grant_reads(db: &PgPool, cutoff: DateTime<Utc>) -> anyhow::Result<u64> {
+    let res = sqlx::query(
+        "UPDATE grant_reads SET secret_version_id = NULL \
+         WHERE first_read_at < $1 AND secret_version_id IS NOT NULL",
+    )
+    .bind(cutoff)
+    .execute(db)
+    .await?;
     Ok(res.rows_affected())
 }
 
@@ -548,23 +556,46 @@ mod tests {
         assert!(active.contains(&g_live));
         assert!(!active.contains(&g_dead));
 
-        // grant_reads purge honors the cutoff.
+        // grant_reads unpin honors the cutoff, and keeps the burned rows.
         sqlx::query(
-            "INSERT INTO grant_reads (grant_id, idem_key, first_read_at) VALUES ($1, 'old', $2)",
+            "INSERT INTO grant_reads (grant_id, idem_key, secret_version_id, first_read_at) \
+             VALUES ($1, 'old', $2, $3)",
         )
         .bind(g_live)
+        .bind(Uuid::new_v4())
         .bind(now - Duration::seconds(300))
         .execute(db)
         .await?;
         sqlx::query(
-            "INSERT INTO grant_reads (grant_id, idem_key, first_read_at) VALUES ($1, 'new', $2)",
+            "INSERT INTO grant_reads (grant_id, idem_key, secret_version_id, first_read_at) \
+             VALUES ($1, 'new', $2, $3)",
         )
         .bind(g_live)
+        .bind(Uuid::new_v4())
         .bind(now)
         .execute(db)
         .await?;
-        let purged = delete_stale_grant_reads(db, now - Duration::seconds(60)).await?;
-        assert_eq!(purged, 1);
+        let unpinned = unpin_stale_grant_reads(db, now - Duration::seconds(60)).await?;
+        assert_eq!(unpinned, 1);
+        // A second sweep touches nothing (tombstones are not rewritten).
+        assert_eq!(
+            unpin_stale_grant_reads(db, now - Duration::seconds(60)).await?,
+            0
+        );
+        // The stale row survives as a tombstone (key stays burned) with its
+        // version pin dropped; the in-window row keeps its pin.
+        let rows: Vec<(String, Option<Uuid>)> = sqlx::query_as(
+            "SELECT idem_key, secret_version_id FROM grant_reads WHERE grant_id = $1 \
+             ORDER BY idem_key",
+        )
+        .bind(g_live)
+        .fetch_all(db)
+        .await?;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].0, "old");
+        assert!(rows[1].1.is_none());
+        assert_eq!(rows[0].0, "new");
+        assert!(rows[0].1.is_some());
 
         t.teardown().await;
         Ok(())

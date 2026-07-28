@@ -99,7 +99,12 @@ struct JwksCache {
 
 struct CachedJwks {
     keys: HashMap<String, Jwk>,
+    /// When the cached document was last SUCCESSFULLY fetched (staleness).
     fetched_at: Instant,
+    /// When a fetch was last ATTEMPTED, successful or not (rate limiting).
+    /// Advancing this on failure is what keeps an IdP outage from turning
+    /// every request into a serialized 10-second fetch behind the cache lock.
+    last_attempt: Instant,
 }
 
 /// Minimum spacing between two JWKS fetches for the same URL. Without it a
@@ -122,21 +127,24 @@ enum CacheAction {
     Serve,
     /// Fetch the JWKS document (unknown kid, or the entry aged out).
     Refresh,
-    /// Would refetch, but the last fetch was too recent: reject without a
-    /// network call.
+    /// Would refetch, but the last attempt was too recent: serve the cached
+    /// key if we hold it (stale), otherwise reject — no network call either
+    /// way.
     RateLimited,
 }
 
 /// Pure cache-expiry decision, factored out so it is testable without network.
 /// `cached` is `None` when nothing is cached for the URL, else
-/// `(kid_is_present, age_of_the_cached_document)`.
-fn cache_action(cached: Option<(bool, Duration)>) -> CacheAction {
+/// `(kid_is_present, age_of_the_cached_document, time_since_last_attempt)`.
+/// Rate limiting keys off the last ATTEMPT (not the last success) so a failing
+/// IdP is retried at most once per [`JWKS_MIN_REFRESH`].
+fn cache_action(cached: Option<(bool, Duration, Duration)>) -> CacheAction {
     match cached {
         None => CacheAction::Refresh,
-        Some((has_kid, age)) => {
+        Some((has_kid, age, attempt_age)) => {
             if has_kid && age < JWKS_MAX_AGE {
                 CacheAction::Serve
-            } else if age < JWKS_MIN_REFRESH {
+            } else if attempt_age < JWKS_MIN_REFRESH {
                 CacheAction::RateLimited
             } else {
                 CacheAction::Refresh
@@ -177,20 +185,30 @@ async fn jwk_for_kid(jwks_url: &str, kid: &str) -> Result<Jwk, StatusCode> {
     let mut map = cache.inner.lock().await;
     let entry = map.get(jwks_url);
     let stale_hit = entry.and_then(|c| c.keys.get(kid).cloned());
-    let action = cache_action(entry.map(|c| (stale_hit.is_some(), c.fetched_at.elapsed())));
+    let action = cache_action(entry.map(|c| {
+        (
+            stale_hit.is_some(),
+            c.fetched_at.elapsed(),
+            c.last_attempt.elapsed(),
+        )
+    }));
     match action {
         CacheAction::Serve => {
             // `Serve` is only produced when the kid was found.
             return stale_hit.ok_or(StatusCode::UNAUTHORIZED);
         }
-        CacheAction::RateLimited => return Err(StatusCode::UNAUTHORIZED),
+        // The last attempt (possibly a failure) was moments ago: serve the
+        // stale key when we hold it, otherwise reject — never refetch.
+        CacheAction::RateLimited => return stale_hit.ok_or(StatusCode::UNAUTHORIZED),
         CacheAction::Refresh => {}
     }
     match fetch_jwks(jwks_url).await {
         Ok(keys) => {
+            let now = Instant::now();
             let cached = CachedJwks {
                 keys,
-                fetched_at: Instant::now(),
+                fetched_at: now,
+                last_attempt: now,
             };
             let jwk = cached.keys.get(kid).cloned();
             map.insert(jwks_url.to_owned(), cached);
@@ -198,10 +216,21 @@ async fn jwk_for_kid(jwks_url: &str, kid: &str) -> Result<Jwk, StatusCode> {
         }
         Err(err) => {
             tracing::warn!(error = %err, "JWKS fetch failed");
+            // Record the failed attempt so the next JWKS_MIN_REFRESH of
+            // requests take the RateLimited path instead of each re-fetching
+            // (serialized behind the cache mutex) during an IdP outage.
+            // `fetched_at` is left alone: the document really is stale.
+            let now = Instant::now();
+            map.entry(jwks_url.to_owned())
+                .or_insert_with(|| CachedJwks {
+                    keys: HashMap::new(),
+                    fetched_at: now,
+                    last_attempt: now,
+                })
+                .last_attempt = now;
             // Stale-if-error: an IdP outage must not lock the operator out of
             // the approval UI when we still hold a key that validated moments
-            // ago. The entry keeps its old `fetched_at`, so the next request
-            // retries the fetch as soon as the rate limit allows.
+            // ago.
             match stale_hit {
                 Some(jwk) => {
                     tracing::warn!(kid, "serving stale cached JWK after failed refresh");
@@ -235,13 +264,7 @@ async fn authenticate_oidc(
     }
     let key = DecodingKey::from_jwk(&jwk).map_err(|_| StatusCode::UNAUTHORIZED)?;
 
-    let mut validation = Validation::new(header.alg);
-    validation.set_issuer(&[cfg.issuer.as_str()]);
-    validation.set_audience(&[cfg.audience.as_str()]);
-    validation.leeway = cfg.clock_skew_seconds;
-    validation.validate_exp = true;
-    validation.validate_nbf = true;
-
+    let validation = oidc_validation(cfg, header.alg);
     let claims = decode::<serde_json::Value>(token, &key, &validation)
         .map_err(|_| StatusCode::UNAUTHORIZED)?
         .claims;
@@ -257,6 +280,22 @@ async fn authenticate_oidc(
     } else {
         Err(StatusCode::FORBIDDEN)
     }
+}
+
+/// Claim validation for OIDC tokens. Factored out so tests can exercise the
+/// required-claims behavior without a network JWKS fetch.
+fn oidc_validation(cfg: &OidcHumanAuth, alg: Algorithm) -> Validation {
+    let mut validation = Validation::new(alg);
+    // `set_issuer`/`set_audience` only pin the EXPECTED values; they do not
+    // make the claims mandatory. Without this line a token that omits `iss`
+    // and `aud` entirely would validate on signature + exp alone.
+    validation.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
+    validation.set_issuer(&[cfg.issuer.as_str()]);
+    validation.set_audience(&[cfg.audience.as_str()]);
+    validation.leeway = cfg.clock_skew_seconds;
+    validation.validate_exp = true;
+    validation.validate_nbf = true;
+    validation
 }
 
 /// Mandatory allowlist: subject membership OR group-claim membership.
@@ -333,13 +372,11 @@ mod tests {
     #[test]
     fn jwks_cache_serves_a_fresh_known_kid() {
         assert_eq!(
-            cache_action(Some((true, Duration::from_secs(0)))),
+            cache_action(Some((true, Duration::from_secs(0), Duration::from_secs(0)))),
             CacheAction::Serve
         );
-        assert_eq!(
-            cache_action(Some((true, JWKS_MAX_AGE - Duration::from_secs(1)))),
-            CacheAction::Serve
-        );
+        let age = JWKS_MAX_AGE - Duration::from_secs(1);
+        assert_eq!(cache_action(Some((true, age, age))), CacheAction::Serve);
     }
 
     #[test]
@@ -347,29 +384,55 @@ mod tests {
         // The regression this guards: a provider rotating key material behind
         // an unchanged `kid` must not be served from cache forever.
         assert_eq!(
-            cache_action(Some((true, JWKS_MAX_AGE))),
+            cache_action(Some((true, JWKS_MAX_AGE, JWKS_MAX_AGE))),
             CacheAction::Refresh
         );
+        let age = JWKS_MAX_AGE + Duration::from_secs(60);
+        assert_eq!(cache_action(Some((true, age, age))), CacheAction::Refresh);
+    }
+
+    #[test]
+    fn jwks_cache_rate_limits_unknown_kids() {
+        // Unknown kid, fetch attempted moments ago: no IdP call.
         assert_eq!(
-            cache_action(Some((true, JWKS_MAX_AGE + Duration::from_secs(60)))),
+            cache_action(Some((
+                false,
+                Duration::from_secs(0),
+                Duration::from_secs(0)
+            ))),
+            CacheAction::RateLimited
+        );
+        let age = JWKS_MIN_REFRESH - Duration::from_millis(1);
+        assert_eq!(
+            cache_action(Some((false, age, age))),
+            CacheAction::RateLimited
+        );
+        // Past the floor, one refresh is allowed.
+        assert_eq!(
+            cache_action(Some((false, JWKS_MIN_REFRESH, JWKS_MIN_REFRESH))),
             CacheAction::Refresh
         );
     }
 
     #[test]
-    fn jwks_cache_rate_limits_unknown_kids() {
-        // Unknown kid, fetched moments ago: reject without touching the IdP.
+    fn jwks_cache_rate_limits_off_the_last_attempt_not_the_last_success() {
+        // The regression this guards: during an IdP outage the cached document
+        // ages past JWKS_MAX_AGE and every failed refresh used to leave
+        // `fetched_at` untouched, so N concurrent operator requests each spent
+        // a full fetch timeout serialized behind the cache mutex. A recent
+        // FAILED attempt must rate-limit the retry (the stale key is served by
+        // the caller when it holds the kid).
         assert_eq!(
-            cache_action(Some((false, Duration::from_secs(0)))),
+            cache_action(Some((true, JWKS_MAX_AGE, Duration::from_secs(1)))),
             CacheAction::RateLimited
         );
         assert_eq!(
-            cache_action(Some((false, JWKS_MIN_REFRESH - Duration::from_millis(1)))),
+            cache_action(Some((false, JWKS_MAX_AGE, Duration::from_secs(1)))),
             CacheAction::RateLimited
         );
-        // Past the floor, one refresh is allowed.
+        // Once the attempt itself is old enough, the refresh goes through.
         assert_eq!(
-            cache_action(Some((false, JWKS_MIN_REFRESH))),
+            cache_action(Some((true, JWKS_MAX_AGE, JWKS_MIN_REFRESH))),
             CacheAction::Refresh
         );
     }
@@ -381,9 +444,8 @@ mod tests {
         assert!(JWKS_MIN_REFRESH < JWKS_MAX_AGE);
     }
 
-    #[test]
-    fn allowlist_by_subject_and_group() {
-        let cfg = OidcHumanAuth {
+    fn oidc_cfg() -> OidcHumanAuth {
+        OidcHumanAuth {
             issuer: "https://iss".into(),
             audience: "keychute".into(),
             jwks_url: "https://iss/jwks".into(),
@@ -391,7 +453,12 @@ mod tests {
             allowed_group: Some("keychute-admins".into()),
             group_claim: "groups".into(),
             clock_skew_seconds: 60,
-        };
+        }
+    }
+
+    #[test]
+    fn allowlist_by_subject_and_group() {
+        let cfg = oidc_cfg();
         let with_group = serde_json::json!({ "groups": ["x", "keychute-admins"] });
         let wrong_group = serde_json::json!({ "groups": ["x"] });
         let no_groups = serde_json::json!({});
@@ -402,5 +469,50 @@ mod tests {
         // Group claim must be an array; a plain string never matches.
         let string_claim = serde_json::json!({ "groups": "keychute-admins" });
         assert!(!authorize_claims(&cfg, "bob", &string_claim));
+    }
+
+    /// Sign `claims` with a throwaway HS256 key and decode with the real OIDC
+    /// validation (built for HS256 so no JWKS/keygen is needed — the required-
+    /// claims behavior under test is algorithm-independent).
+    fn decode_with_oidc_validation(
+        claims: &serde_json::Value,
+    ) -> jsonwebtoken::errors::Result<serde_json::Value> {
+        let secret = b"unit-test-secret";
+        let token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(Algorithm::HS256),
+            claims,
+            &jsonwebtoken::EncodingKey::from_secret(secret),
+        )
+        .unwrap();
+        let validation = oidc_validation(&oidc_cfg(), Algorithm::HS256);
+        decode::<serde_json::Value>(&token, &DecodingKey::from_secret(secret), &validation)
+            .map(|d| d.claims)
+    }
+
+    #[test]
+    fn oidc_validation_rejects_tokens_missing_iss_and_aud() {
+        // The regression this guards: `Validation::new` only requires `exp`,
+        // and `set_issuer`/`set_audience` do not add to the required set — a
+        // correctly signed token omitting both claims used to authenticate.
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 600;
+        let no_iss_no_aud = serde_json::json!({ "exp": exp, "sub": "alice" });
+        assert!(decode_with_oidc_validation(&no_iss_no_aud).is_err());
+        let no_aud = serde_json::json!({ "exp": exp, "sub": "alice", "iss": "https://iss" });
+        assert!(decode_with_oidc_validation(&no_aud).is_err());
+        let no_iss = serde_json::json!({ "exp": exp, "sub": "alice", "aud": "keychute" });
+        assert!(decode_with_oidc_validation(&no_iss).is_err());
+        let no_sub = serde_json::json!({
+            "exp": exp, "iss": "https://iss", "aud": "keychute"
+        });
+        assert!(decode_with_oidc_validation(&no_sub).is_err());
+        // Sanity: the full claim set still validates.
+        let complete = serde_json::json!({
+            "exp": exp, "sub": "alice", "iss": "https://iss", "aud": "keychute"
+        });
+        assert!(decode_with_oidc_validation(&complete).is_ok());
     }
 }

@@ -268,6 +268,36 @@ impl Config {
                 }
             }
         }
+        // Security-critical limits must be sane: a nonpositive expiry stores
+        // every request already-expired, a nonpositive replay window disables
+        // idempotent replay, and zero pending/concurrency limits reject every
+        // request, wait, or proxy stream. (Unsigned fields only need a zero
+        // check; the i64 ones feed chrono/SQL arithmetic and can go negative.)
+        let l = &self.limits;
+        if l.request_expiry_seconds <= 0 {
+            bail!(
+                "limits.request_expiry_seconds must be positive (got {})",
+                l.request_expiry_seconds
+            );
+        }
+        if l.replay_window_seconds <= 0 {
+            bail!(
+                "limits.replay_window_seconds must be positive (got {})",
+                l.replay_window_seconds
+            );
+        }
+        if l.max_pending_per_client <= 0 {
+            bail!(
+                "limits.max_pending_per_client must be positive (got {})",
+                l.max_pending_per_client
+            );
+        }
+        if l.max_waits_per_client == 0 {
+            bail!("limits.max_waits_per_client must be positive");
+        }
+        if l.max_proxy_streams_per_client == 0 {
+            bail!("limits.max_proxy_streams_per_client must be positive");
+        }
         let names: std::collections::HashSet<_> = self.clients.iter().map(|c| &c.name).collect();
         if names.len() != self.clients.len() {
             bail!("duplicate client names in config");
@@ -349,6 +379,35 @@ clients:
             audience: "keychute.example.dev".into(),
             subject: "system:serviceaccount:ns:agent".into(),
         });
+        cfg.normalize();
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn limits_reject_nonpositive_security_critical_values() {
+        let check = |mutate: fn(&mut Limits), needle: &str| {
+            let mut cfg: Config = serde_yaml::from_str(BASE_YAML).unwrap();
+            cfg.normalize();
+            mutate(&mut cfg.limits);
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains(needle), "{err}");
+        };
+        // Negative expiry would store every request already-expired.
+        check(|l| l.request_expiry_seconds = -1, "request_expiry_seconds");
+        check(|l| l.request_expiry_seconds = 0, "request_expiry_seconds");
+        // Zero replay window disables idempotent replay entirely.
+        check(|l| l.replay_window_seconds = 0, "replay_window_seconds");
+        check(|l| l.replay_window_seconds = -60, "replay_window_seconds");
+        // Zero/negative caps would reject every request, wait, or stream.
+        check(|l| l.max_pending_per_client = 0, "max_pending_per_client");
+        check(|l| l.max_pending_per_client = -1, "max_pending_per_client");
+        check(|l| l.max_waits_per_client = 0, "max_waits_per_client");
+        check(
+            |l| l.max_proxy_streams_per_client = 0,
+            "max_proxy_streams_per_client",
+        );
+        // The defaults themselves must pass.
+        let mut cfg: Config = serde_yaml::from_str(BASE_YAML).unwrap();
         cfg.normalize();
         cfg.validate().unwrap();
     }

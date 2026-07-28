@@ -8,7 +8,7 @@ and an explicit, operator-chosen risk tier for every delivery path.
 
 ## Status
 
-v1 server-side implementation (design milestones M0–M3, minus cluster wiring):
+v1 server-side implementation (design milestones M0–M3) plus packaging:
 
 - `server/` — the `keychute-server` binary: envelope crypto (KEK keyset +
   process-local ephemeral KEK), Postgres store, policy engine, client API
@@ -21,6 +21,8 @@ v1 server-side implementation (design milestones M0–M3, minus cluster wiring):
   database, a real server process, a TLS recording upstream, a fake Pushover,
   and drives the REST API, the real approval UI (CSRF flow included), and the
   real CLI binary.
+- `charts/keychute/` — the Helm chart; `Dockerfile` + `.github/workflows/` —
+  the multi-arch image build.
 
 ## Development
 
@@ -36,5 +38,16 @@ E2E_DATABASE_URL=postgres://postgres@127.0.0.1:5432/postgres cargo test -p keych
 cargo test -p keychute-e2e -- --ignored --test-threads=1   # slow sweeper tests
 ```
 
-Not yet in-tree: Helm chart, image build workflow, kube-config wiring, and the
-family-assistant integration (see DESIGN §7–8).
+## Deployment
+
+The Helm chart lives in `charts/keychute`; the multi-arch image build and the
+chart digest bump are in `.github/workflows/build.yaml`. See DESIGN §7 for how
+the two fit together.
+
+```sh
+helm lint charts/keychute
+helm template charts/keychute
+```
+
+Not yet in-tree: kube-config wiring and the family-assistant integration (see
+DESIGN §8).

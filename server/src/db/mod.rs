@@ -28,19 +28,34 @@ pub(crate) async fn take_kek_shared_lock(tx: &mut sqlx::PgConnection) -> Result<
     Ok(())
 }
 
-/// Addendum #19 (`verify_no_references`): rows still wrapped under `kek_id`.
+/// Addendum #19 (`verify_no_references`): true when nothing still references
+/// `kek_id`, i.e. it is safe to retire. Takes the EXCLUSIVE form of the KEK
+/// advisory lock for the check's transaction, so it serializes against every
+/// in-flight transaction inserting a wrapped DEK (those hold the shared form):
+/// a writer that already sealed under `kek_id` has either committed — and is
+/// counted here — or queues behind this lock and commits only after the check,
+/// under whatever KEK is active by then. Without the lock, an in-flight insert
+/// could land just after a zero count and become permanently undecryptable
+/// once the operator removes the KEK.
+///
 /// Counts `secret_versions.kek_id` and `access_requests.context_kek_id`.
 /// Grant passthrough payloads carry no kek_id column: durable passthroughs are
 /// wrapped under the active KEK and short-lived, and ephemeral ones die with
 /// the process, so they are intentionally not counted here.
-pub async fn count_wrapped_dek_references(db: &sqlx::PgPool, kek_id: &str) -> anyhow::Result<i64> {
-    Ok(sqlx::query_scalar(
+pub async fn verify_no_references(db: &sqlx::PgPool, kek_id: &str) -> anyhow::Result<bool> {
+    let mut tx = db.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('keychute-kek'))")
+        .execute(&mut *tx)
+        .await?;
+    let count: i64 = sqlx::query_scalar(
         "SELECT (SELECT count(*) FROM secret_versions WHERE kek_id = $1) \
               + (SELECT count(*) FROM access_requests WHERE context_kek_id = $1)",
     )
     .bind(kek_id)
-    .fetch_one(db)
-    .await?)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(count == 0)
 }
 
 pub use clients::{get_client_by_name, list_clients, reconcile_clients, ClientRow};

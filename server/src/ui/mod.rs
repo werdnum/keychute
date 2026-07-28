@@ -951,7 +951,15 @@ async fn revoke(
         &op.subject,
         &form.csrf_token,
     )?;
-    db::revoke_grant(&state.db, id, &op.subject).await?;
+    // No matching live grant means nothing was revoked and nothing audited
+    // (already revoked, or gone): say so rather than redirecting as if it
+    // worked, same as the approve/deny handlers.
+    if !db::revoke_grant(&state.db, id, &op.subject).await? {
+        return Err(UiError::new(
+            StatusCode::CONFLICT,
+            "grant is no longer active",
+        ));
+    }
     Ok(Redirect::to("/ui/grants").into_response())
 }
 
@@ -1222,7 +1230,14 @@ async fn delete_policy(
         &form.csrf_token,
     )?;
     // Deletion and its audit row commit together (same reasoning as creation).
-    policy_store::delete_policy_audited(&state.db, id, &op.subject).await?;
+    // No matching row means nothing was deleted and nothing audited — report
+    // the conflict instead of a silent no-op redirect.
+    if !policy_store::delete_policy_audited(&state.db, id, &op.subject).await? {
+        return Err(UiError::new(
+            StatusCode::CONFLICT,
+            "policy no longer exists",
+        ));
+    }
     Ok(Redirect::to("/ui/policies").into_response())
 }
 

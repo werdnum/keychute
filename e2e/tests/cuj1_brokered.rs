@@ -110,13 +110,17 @@ async fn brokered_proxy_injects_credential_and_strips_caller_headers() {
     assert!(kinds.contains(&"proxy-completed"), "{kinds:?}");
     // The write-ahead attempt row also records where the credential was about
     // to be sent (no status yet: it commits before the upstream exchange).
+    // The recorded path carries the caller's query string: it is forwarded
+    // upstream verbatim and is not constrained by the grant, so omitting it
+    // would make `?limit=10` and `?transfer_to=attacker` indistinguishable
+    // after the fact.
     let attempt = rows.iter().find(|r| r.0 == "proxy-attempt").unwrap();
     assert_eq!(attempt.1.as_deref(), Some("POST"));
-    assert_eq!(attempt.2.as_deref(), Some("/v1/echo"));
+    assert_eq!(attempt.2.as_deref(), Some("/v1/echo?q=1"));
     assert_eq!(attempt.3, None);
     let completed = rows.iter().find(|r| r.0 == "proxy-completed").unwrap();
     assert_eq!(completed.1.as_deref(), Some("POST"));
-    assert_eq!(completed.2.as_deref(), Some("/v1/echo"));
+    assert_eq!(completed.2.as_deref(), Some("/v1/echo?q=1"));
     assert_eq!(completed.3, Some(200));
 }
 

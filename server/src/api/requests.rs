@@ -522,10 +522,28 @@ pub async fn create(
                         secret.as_ref().map(|s| s.name.as_str()),
                         row.id,
                     );
-                    match state.notifier.send(&n).await {
-                        Ok(()) => db::mark_push_delivered(&state.db, row.id).await?,
-                        Err(e) => {
+                    // Bounded like the sweeper's send: `push_lock` is held
+                    // across this call, so a notifier without its own timeout
+                    // would otherwise wedge every subsequent create that needs
+                    // approval. A timed-out push is a FAILED delivery — the row
+                    // stays undelivered and the sweeper retries it.
+                    match tokio::time::timeout(
+                        crate::notify::PUSH_SEND_TIMEOUT,
+                        state.notifier.send(&n),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => db::mark_push_delivered(&state.db, row.id).await?,
+                        Ok(Err(e)) => {
                             tracing::warn!(error = %e, "approval push failed; sweeper will retry");
+                            db::increment_push_attempts(&state.db, row.id).await?;
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                request_id = %row.id,
+                                timeout_seconds = crate::notify::PUSH_SEND_TIMEOUT.as_secs(),
+                                "approval push timed out; sweeper will retry"
+                            );
                             db::increment_push_attempts(&state.db, row.id).await?;
                         }
                     }

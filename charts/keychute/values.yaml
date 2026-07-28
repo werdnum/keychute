@@ -117,25 +117,30 @@ clients: []
 # in the reference cluster); add `keychute: keychute.keychute` to `databases`
 # and `keychute.keychute: []` to `users` in storage-cluster/postgresql.yaml.
 #
-# The connection URL is assembled in the Deployment from these values plus the
-# Secret, using Kubernetes' $(VAR) env expansion, and handed to the server as
-# KEYCHUTE_DATABASE_URL (never rendered into the ConfigMap).
+# The connection URL is assembled at container start from these values plus
+# the Secret: the password arrives as its own env var and a small shell
+# wrapper percent-encodes it before splicing it into KEYCHUTE_DATABASE_URL,
+# so passwords containing @ / ? # % etc. work and the credential is never
+# rendered into the ConfigMap.
 # ---------------------------------------------------------------------------
 database:
   host: storage-cluster.storage.svc.cluster.local
   port: 5432
   name: keychute
-  user: keychute
+  # Login role. The Zalando operator creates the role named exactly as listed
+  # under `users:` — here `keychute.keychute` (the `<namespace>.<name>`
+  # convention used across this cluster) — and derives the credentials Secret
+  # name from it, so `user` and `existingSecret` must stay in lockstep.
+  user: keychute.keychute
   sslMode: require
   # Secret holding the role's credentials. NOT created by this chart. The
   # operator names it `<user>.<cluster>.credentials.postgresql.acid.zalan.do`
   # and uses the keys `username` / `password`.
-  existingSecret: keychute.storage-cluster.credentials.postgresql.acid.zalan.do
+  existingSecret: keychute.keychute.storage-cluster.credentials.postgresql.acid.zalan.do
   passwordKey: password
   # Escape hatch: if set, this Secret key is expected to hold a complete
   # `postgres://…` URL and is used verbatim instead of assembling one from the
-  # fields above. Use it when the password contains characters that would need
-  # percent-encoding in a URL.
+  # fields above (e.g. for a non-Zalando database with its own URL secret).
   urlSecret: ""
   urlKey: url
 
@@ -219,10 +224,11 @@ ingress:
     # the `<ingress>-<host-with-dashes>` convention.
     httpRouteName: ""
     clientID: keychute
-    # Secret holding the OIDC client secret (key `client-secret`). NOT created
-    # by this chart.
+    # Secret holding the OIDC client secret. NOT created by this chart. The
+    # key inside the Secret MUST be `client-secret`: Envoy Gateway's
+    # SecretObjectReference has no key field, so EG always reads that exact
+    # key and there is deliberately no knob to change it.
     clientSecretName: keychute-oidc
-    clientSecretKey: client-secret
     # Well-known endpoints of the realm named by `oidc.issuer` above.
     authorizationEndpoint: https://id.andrewgarrett.dev/realms/master/protocol/openid-connect/auth
     tokenEndpoint: https://id.andrewgarrett.dev/realms/master/protocol/openid-connect/token

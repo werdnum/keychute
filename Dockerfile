@@ -14,13 +14,21 @@
 # Base build environment.
 #
 # Pinned to the runner's native platform and cross-compiled to TARGETPLATFORM,
-# so multi-arch builds need no QEMU emulation — only the final COPY-only stage
-# is per-target. Unlike the Go services here, the build is NOT CGO-free:
+# so multi-arch builds need no QEMU emulation: every stage that executes a
+# command is pinned to $BUILDPLATFORM, and the one per-target stage (runtime)
+# runs nothing at all — it is COPY-only. Unlike the Go services here, the
+# build is NOT CGO-free:
 # aws-lc-sys (pulled in by rustls via axum-server/reqwest) is a cmake + C
 # project, so the builder carries cmake and, when cross-compiling, a GNU cross
 # toolchain. aws-lc-sys ships pre-generated bindings for both target triples we
 # build, so no bindgen/libclang is required.
-FROM --platform=$BUILDPLATFORM rust:1.97.1-bookworm AS chef
+#
+# Digest-pinned, like every action in .github/workflows and the chart's own app
+# image: the monthly scheduled rebuild pushes its result straight into
+# values.yaml, so a floating base tag would let an unreviewed base-image change
+# roll out on a timer. The tag is kept in the reference for human readability;
+# the digest is what actually resolves. Bump both together.
+FROM --platform=$BUILDPLATFORM rust:1.97.1-bookworm@sha256:77fac8b98f9f46062bb680b6d25d5bcaabfc400143952ebc572e924bcbedc3fa AS chef
 WORKDIR /app
 
 # cargo-chef lets the (very expensive: aws-lc-sys, ring, sqlx, axum) dependency
@@ -108,20 +116,46 @@ RUN set -eux; \
     cp "target/${triple}/release/keychute" /out/keychute
 
 # ---------------------------------------------------------------------------
-# Runtime.
+# Runtime rootfs prep.
 #
-# debian-slim rather than distroless/static: the binaries are glibc-linked
-# (gnu triples, matching the bookworm builder) and need ca-certificates for
-# outbound TLS — the brokered proxy dials arbitrary HTTPS origins and the
-# Pushover notifier calls out. Nothing else is installed; there is no package
-# manager use at runtime and no shell tooling beyond Debian's base.
-FROM debian:bookworm-slim AS runtime
+# Everything the runtime image needs beyond the two binaries — the CA bundle
+# and the unprivileged account — is produced here, on $BUILDPLATFORM, so the
+# per-target runtime stage below can be COPY-only and the whole multi-arch
+# build stays free of QEMU. All three artifacts are architecture-independent
+# text: /etc/passwd and /etc/group are byte-identical across the arches of
+# this same base image apart from the two entries added here, and the
+# ca-certificates payload is PEM.
+FROM --platform=$BUILDPLATFORM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS rootfs
 RUN set -eux; \
     apt-get update; \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates; \
     rm -rf /var/lib/apt/lists/*; \
     groupadd --gid 65532 keychute; \
     useradd --uid 65532 --gid 65532 --no-create-home --shell /usr/sbin/nologin keychute
+
+# ---------------------------------------------------------------------------
+# Runtime.
+#
+# debian-slim rather than distroless/static: the binaries are glibc-linked
+# (gnu triples, matching the bookworm builder).
+#
+# The system CA bundle is shipped but is NOT what the binaries currently trust:
+# reqwest is built with `rustls-tls` and sqlx with `tls-rustls`, both of which
+# resolve to the compiled-in webpki-roots set (Cargo.lock has webpki-roots and
+# no rustls-native-certs), so the brokered proxy and the Pushover notifier
+# verify against bundled roots. /etc/ssl/certs is kept as a cheap hedge — it is
+# what any later switch to native roots, or any added tool, would look for —
+# and costs one COPY of arch-independent PEM. Internal-CA trust for upstream
+# origins is a separate, explicit path: config `upstream_ca_path`, loaded in
+# server/src/state.rs.
+#
+# No RUN in this stage: it is the only per-target stage, and keeping it
+# COPY-only is what lets the arm64 leg build on an amd64 runner without QEMU.
+FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS runtime
+COPY --from=rootfs /etc/passwd /etc/passwd
+COPY --from=rootfs /etc/group /etc/group
+COPY --from=rootfs /usr/share/ca-certificates /usr/share/ca-certificates
+COPY --from=rootfs /etc/ssl/certs /etc/ssl/certs
 
 COPY --from=builder /out/keychute-server /usr/local/bin/keychute-server
 COPY --from=builder /out/keychute /usr/local/bin/keychute

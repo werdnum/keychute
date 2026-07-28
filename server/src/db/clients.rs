@@ -37,6 +37,21 @@ pub async fn reconcile_clients(db: &PgPool, clients: &[ClientConfig]) -> anyhow:
     .bind(&names)
     .execute(&mut *tx)
     .await?;
+    // Release the bindings of the CONFIGURED rows too: a credential can move
+    // between two configured clients (e.g. a token hash reassigned from one
+    // name to another), and the upsert loop below processes clients one at a
+    // time — upserting the new holder while the old holder still carries the
+    // credential would hit the same 0002 unique indexes, order-dependently.
+    // Every configured client's current credential is restored by its upsert
+    // in this same transaction, so no authenticatable window opens.
+    sqlx::query(
+        "UPDATE clients \
+         SET api_token_sha256 = NULL, sa_audience = NULL, sa_subject = NULL \
+         WHERE name = ANY($1)",
+    )
+    .bind(&names)
+    .execute(&mut *tx)
+    .await?;
     for c in clients {
         let auth_kind = if c.auth.api_token_sha256.is_some() {
             "api-token"

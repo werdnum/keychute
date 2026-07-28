@@ -56,7 +56,15 @@ pub fn canonicalize(raw: &str) -> Result<String, &'static str> {
     }
 
     // Dot segments: the leading '/' guarantees split element 0 is "".
-    if s.split('/').any(|seg| seg == "." || seg == "..") {
+    // Each segment is judged by the portion BEFORE any ';' (path parameters):
+    // servlet-family upstreams strip `;params` and only then normalize, so a
+    // segment `..;jsessionid=x` — or its encoded spelling `..%3b`, which the
+    // decode above has already turned into `..;` — would land on `..`
+    // upstream and escape the approved prefix scope.
+    if s.split('/').any(|seg| {
+        let base = seg.split(';').next().unwrap_or(seg);
+        base == "." || base == ".."
+    }) {
         return Err("dot segment in path");
     }
 

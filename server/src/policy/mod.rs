@@ -298,12 +298,19 @@ fn scopes_overlap(p: &PolicyRow, req: &Constraints) -> bool {
             .iter()
             .any(|pm| req.methods.iter().any(|rm| pm.eq_ignore_ascii_case(rm)));
 
+    // Deny rows fail closed: prefixes are compared ASCII-case-insensitively
+    // (like methods just above) so a deny on `/admin` cannot be dodged by
+    // requesting `/Admin` and letting a broader allow row win. Widening the
+    // deny is the safe direction; the subset rule for non-deny rows keeps the
+    // exact, case-sensitive segment-boundary match of `prefix_matches`.
     let prefixes_overlap = p.path_prefixes.is_empty()
         || req.path_prefixes.is_empty()
         || p.path_prefixes.iter().any(|pp| {
-            req.path_prefixes
-                .iter()
-                .any(|rp| paths::prefix_matches(pp, rp) || paths::prefix_matches(rp, pp))
+            let pp = pp.to_ascii_lowercase();
+            req.path_prefixes.iter().any(|rp| {
+                let rp = rp.to_ascii_lowercase();
+                paths::prefix_matches(&pp, &rp) || paths::prefix_matches(&rp, &pp)
+            })
         });
 
     origins_overlap && methods_overlap && prefixes_overlap
@@ -451,34 +458,45 @@ mod tests {
             ("/a%25b", "/a%b"), // decoded once: literal '%' survives
             ("/a/b/", "/a/b/"),
             ("/caf%C3%A9", "/café"),
-            ("/...x", "/...x"), // not a dot segment
+            ("/...x", "/...x"),         // not a dot segment
+            ("/v1;p=1/x", "/v1;p=1/x"), // path params on a non-dot segment
+            ("/x;..", "/x;.."),         // '..' only after ';' — base is "x"
         ];
         for (raw, want) in ok {
             assert_eq!(canonicalize(raw).as_deref(), Ok(*want), "raw={raw:?}");
         }
 
         let bad: &[&str] = &[
-            "no-slash", "", "/a%2Fb",   // encoded '/'
-            "/a%2fb",   // encoded '/', lowercase
-            "/a%5Cb",   // encoded '\'
-            "/a%5cb",   // encoded '\', lowercase
-            "/a\\b",    // raw backslash
-            "/a/./b",   // dot segment
-            "/a/../b",  // dot-dot segment
-            "/..",      // trailing dot-dot
-            "/.",       // trailing dot
-            "/a/..",    // dot-dot at end
-            "/%GG",     // bad hex
-            "/%2",      // truncated escape
-            "/%",       // bare percent
-            "/a%0Ab",   // encoded control char (LF)
-            "/a\u{7}b", // raw control char
-            "/%00",     // NUL
-            "/%FF%FE",  // non-UTF8 after decode
-            "//",       // all-slash: would strip to an unconstrained prefix
-            "///",      // all-slash
-            "/a//b",    // duplicate slash (empty segment)
-            "/a/b//",   // trailing duplicate slash
+            "no-slash",
+            "",
+            "/a%2Fb",                   // encoded '/'
+            "/a%2fb",                   // encoded '/', lowercase
+            "/a%5Cb",                   // encoded '\'
+            "/a%5cb",                   // encoded '\', lowercase
+            "/a\\b",                    // raw backslash
+            "/a/./b",                   // dot segment
+            "/a/../b",                  // dot-dot segment
+            "/..",                      // trailing dot-dot
+            "/.",                       // trailing dot
+            "/a/..",                    // dot-dot at end
+            "/%GG",                     // bad hex
+            "/%2",                      // truncated escape
+            "/%",                       // bare percent
+            "/a%0Ab",                   // encoded control char (LF)
+            "/a\u{7}b",                 // raw control char
+            "/%00",                     // NUL
+            "/%FF%FE",                  // non-UTF8 after decode
+            "/..;/x",                   // dot-dot hidden behind a path parameter
+            "/..;jsessionid=1/x",       // servlet-style '..;params'
+            "/..%3b/x",                 // encoded ';' decodes to '..;'
+            "/..%3B/x",                 // uppercase hex spelling
+            "/.;/x",                    // single-dot behind a path parameter
+            "/.;x",                     // single-dot with params, no trailing slash
+            "/v1/account/..;/v1/admin", // full escape shape from the report
+            "//",                       // all-slash: would strip to an unconstrained prefix
+            "///",                      // all-slash
+            "/a//b",                    // duplicate slash (empty segment)
+            "/a/b//",                   // trailing duplicate slash
         ];
         for raw in bad {
             assert!(canonicalize(raw).is_err(), "expected reject: {raw:?}");
@@ -724,6 +742,33 @@ mod tests {
             &req_brokered(),
             &[allow, deny],
         ));
+    }
+
+    #[test]
+    fn deny_prefix_overlap_is_case_insensitive() {
+        // A deny on "/admin" cannot be dodged by requesting "/Admin", even
+        // when a broader auto-approve row would otherwise win.
+        let mut deny = row(Outcome::Deny);
+        deny.path_prefixes = vec!["/admin".into()];
+        let allow = row(Outcome::AutoApprove); // unconstrained: covers all
+        let mut r = req_brokered();
+        r.constraints.path_prefixes = vec!["/Admin".into()];
+        assert_deny(&eval(&client(), Some(&secret()), &[], &r, &[allow, deny]));
+
+        // The other direction too: uppercase deny row, lowercase request.
+        let mut deny = row(Outcome::Deny);
+        deny.path_prefixes = vec!["/Admin/Danger".into()];
+        let mut r = req_brokered();
+        r.constraints.path_prefixes = vec!["/admin".into()];
+        assert_deny(&eval(&client(), Some(&secret()), &[], &r, &[deny]));
+
+        // Disjoint paths still do not fire regardless of case.
+        let mut deny = row(Outcome::Deny);
+        deny.path_prefixes = vec!["/Admin".into()];
+        let mut r = req_brokered();
+        r.constraints.path_prefixes = vec!["/administrator".into()];
+        let e = eval(&client(), Some(&secret()), &[], &r, &[deny]);
+        assert_eq!(e.decision, Decision::RequireApproval);
     }
 
     #[test]

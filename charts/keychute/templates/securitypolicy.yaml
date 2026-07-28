@@ -27,11 +27,12 @@ spec:
       authorizationEndpoint: {{ .Values.ingress.oidc.authorizationEndpoint | quote }}
       tokenEndpoint: {{ .Values.ingress.oidc.tokenEndpoint | quote }}
     clientID: {{ .Values.ingress.oidc.clientID | quote }}
+    # SecretObjectReference has no `key` field — Envoy Gateway always reads
+    # the fixed key `client-secret` from this Secret, so that is the key the
+    # Secret must carry. (An extra `key:` here would be silently pruned by the
+    # CRD's structural schema and the policy would never program.)
     clientSecret:
       name: {{ .Values.ingress.oidc.clientSecretName }}
-      {{- if ne .Values.ingress.oidc.clientSecretKey "client-secret" }}
-      key: {{ .Values.ingress.oidc.clientSecretKey }}
-      {{- end }}
     scopes:
       {{- range .Values.ingress.oidc.scopes }}
       - {{ . | quote }}

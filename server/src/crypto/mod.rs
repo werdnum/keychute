@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Alias for plaintext secret material. Never Debug/Display.
 pub type SecretBytes = SecretBox<[u8]>;
@@ -211,6 +211,18 @@ struct KeysetFile {
     mac_key: String,
 }
 
+/// Base64 is still key material: wipe it on drop (including the error paths out
+/// of [`Keyset::from_file`]), like every other buffer in this module that has
+/// held a key. `active` is an identifier, not material.
+impl Drop for KeysetFile {
+    fn drop(&mut self) {
+        for b64 in self.keys.values_mut() {
+            b64.zeroize();
+        }
+        self.mac_key.zeroize();
+    }
+}
+
 pub struct Keyset {
     active: String,
     keys: HashMap<String, KeyMaterial>,
@@ -219,8 +231,12 @@ pub struct Keyset {
 
 impl Keyset {
     pub fn load(path: &Path) -> anyhow::Result<Keyset> {
-        let raw = std::fs::read_to_string(path)
-            .map_err(|e| anyhow::anyhow!("reading keyset file {}: {e}", path.display()))?;
+        // The file text is base64 key material: zeroize it like every other
+        // buffer that has held a key.
+        let raw = Zeroizing::new(
+            std::fs::read_to_string(path)
+                .map_err(|e| anyhow::anyhow!("reading keyset file {}: {e}", path.display()))?,
+        );
         let file: KeysetFile = serde_json::from_str(&raw)
             .map_err(|e| anyhow::anyhow!("parsing keyset file {}: {e}", path.display()))?;
         Keyset::from_file(file)
@@ -233,13 +249,25 @@ impl Keyset {
         if !file.keys.contains_key(&file.active) {
             anyhow::bail!("active kek id {:?} not present in keys", file.active);
         }
+        // `EPHEMERAL_KEK_ID` is reserved: rows carrying it are routed to the
+        // process-local ephemeral KEK, not the keyset, so a file-backed key
+        // under that id would never be consulted — every request context sealed
+        // with it would silently fail to open (blanking the approval page's
+        // justification) after the next restart.
+        if file.keys.contains_key(EPHEMERAL_KEK_ID) {
+            anyhow::bail!(
+                "keyset uses the reserved kek id {EPHEMERAL_KEK_ID:?}: rename it, \
+                 that id is reserved for the process-local ephemeral KEK"
+            );
+        }
         let mut keys = HashMap::with_capacity(file.keys.len());
         for (id, b64) in &file.keys {
             keys.insert(id.clone(), decode_key(b64, &format!("key {id:?}"))?);
         }
         let mac_key = decode_key(&file.mac_key, "mac_key")?;
         Ok(Keyset {
-            active: file.active,
+            // Cloned, not moved: `KeysetFile` has a zeroizing `Drop`.
+            active: file.active.clone(),
             keys,
             mac_key,
         })
@@ -616,6 +644,30 @@ mod tests {
         // Valid input loads.
         let ks = load_from_str(&keyset_json("k0", &[("k0", &[1u8; 32])], &[9u8; 32])).unwrap();
         assert_eq!(ks.active_kek_id(), "k0");
+    }
+
+    #[test]
+    fn keyset_load_rejects_the_reserved_ephemeral_kek_id() {
+        // Rows tagged "ephemeral" are routed to the process-local KEK, never to
+        // the keyset, so this must fail loudly at load rather than silently
+        // shadowing every ephemeral-sealed row.
+        let err = match load_from_str(&keyset_json(
+            EPHEMERAL_KEK_ID,
+            &[(EPHEMERAL_KEK_ID, &[1u8; 32])],
+            &[9u8; 32],
+        )) {
+            Ok(_) => panic!("reserved kek id must be rejected"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains(EPHEMERAL_KEK_ID), "{err}");
+
+        // Also rejected as a non-active (decrypt-only) key.
+        assert!(load_from_str(&keyset_json(
+            "k0",
+            &[("k0", &[1u8; 32]), (EPHEMERAL_KEK_ID, &[2u8; 32])],
+            &[9u8; 32],
+        ))
+        .is_err());
     }
 
     #[test]

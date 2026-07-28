@@ -24,7 +24,8 @@ except the Postgres one which the storage-cluster operator drops in):
 
 {{- if and .Values.ingress.enabled .Values.ingress.oidc.enabled }}
 
-  4. {{ .Values.ingress.oidc.clientSecretName }} / key {{ .Values.ingress.oidc.clientSecretKey }}
+  4. {{ .Values.ingress.oidc.clientSecretName }} / key client-secret
+     (the key name is fixed by Envoy Gateway and cannot be changed)
      — the Keycloak client secret used by the gateway's OIDC SecurityPolicy,
      which targets HTTPRoute "{{ include "keychute.httpRouteName" . }}".
 {{- end }}
@@ -46,5 +47,5 @@ Internal clients should use:
   https://{{ include "keychute.serviceFQDN" . }}
 verifying against the internal CA bundle{{ if .Values.backendTLSPolicy.enabled }} (ConfigMap {{ .Values.backendTLSPolicy.caBundleConfigMap }}){{ end }}.
 {{- if .Values.ingress.enabled }}
-Humans approve at https://{{ .Values.ingress.host }}/.
+Humans approve at https://{{ .Values.ingress.host }}/ui/requests.
 {{- end }}
