@@ -60,7 +60,11 @@ and is agent-influenceable. The approval UI therefore renders tier-2 context as
 
 1. The FA agent needs to call an authenticated API. It invokes an FA tool that asks
    Keychute for a **grant** on secret `example-api-token` with mechanism `brokered`,
-   declaring target constraints (host, methods, path prefix) and a requested TTL.
+   declaring target constraints — an HTTPS origin (scheme fixed to `https`, host,
+   optional port) plus methods and path prefix — and a requested TTL. The scheme
+   and port are part of the constraint precisely so an approved `api.example.com`
+   grant cannot be exercised against `http://` or an alternate service on the
+   same host.
 2. Keychute matches this against policy. No standing grant → it sends a Pushover
    notification: *"family-assistant requests 1 h of brokered access to
    api.example.com using 'Example API token'. Purpose: ⟨client-supplied context⟩."*
@@ -68,8 +72,9 @@ and is agent-influenceable. The approval UI therefore renders tier-2 context as
 3. I approve, which stores a durable grant. FA's wait resolves with the `grant_id`
    (never the credential).
 4. FA makes requests through `POST /v1/grants/{grant_id}/proxy`. Keychute validates
-   each request against the grant's constraints, injects the credential (e.g.
-   `Authorization: Bearer …`), forwards, and streams the response back. **Redirects
+   each request against the grant's constraints, injects the credential according
+   to the secret's operator-configured injection template (§5), forwards, and
+   streams the response back. **Redirects
    are never followed server-side**: 3xx responses are returned to the client, so a
    redirect target only ever gets the credential if the client re-requests it
    through the proxy and it passes constraint validation itself. Every proxied call
@@ -220,17 +225,27 @@ k8s-agent image).
 
 **Envelope encryption, ciphertext-only database.**
 
-- A **KEK** (32 bytes) lives in a Kubernetes Secret (created via the repo's
-  sealed-secrets workflow), mounted as a file. Postgres never sees it.
+- The **KEK file** (a Kubernetes Secret created via the repo's sealed-secrets
+  workflow, mounted as a file; Postgres never sees it) holds a small **keyset**:
+  `kek_id → 32-byte key`, exactly one marked active. Every wrapped DEK records
+  the `kek_id` that wrapped it.
 - Each secret *version* gets a fresh random **DEK**; plaintext is encrypted with
   XChaCha20-Poly1305 under the DEK; the DEK is wrapped under the KEK. AAD binds
   ciphertext to `(secret_id, version)` so rows can't be swapped or replayed across
   secrets.
-- KEK rotation = rewrap all DEKs (cheap, no payload re-encryption). Secret rotation
-  = new version row; old versions retained (visible in audit trail) until purged.
+- KEK rotation = add the new key to the keyset, mark it active, rewrap rows to it
+  (cheap — no payload re-encryption, each row update atomic), then retire the old
+  key once no row references its `kek_id`. Because both keys coexist in the file
+  during rotation and every row names its wrapping key, a crash at any point
+  leaves every secret decryptable on restart. Secret rotation = new version row;
+  old versions retained (visible in audit trail) until purged.
 - Plaintext exists only transiently in Keychute memory during a release or proxy
-  call, in `zeroize`-on-drop buffers, and is never logged, never in error messages,
-  never in the DB (enforced by types, reviewed as an invariant).
+  call, and is never logged, never in error messages, never in the DB (enforced
+  by types, reviewed as an invariant). Application-owned buffers zeroize on drop;
+  the copies the HTTP and TLS stacks unavoidably make (header values in
+  `reqwest`/`hyper`, response and TLS buffers) cannot be zeroized from
+  application code, so beyond our own buffers the guarantee is explicitly
+  best-effort short-lived process memory, not provable erasure.
 - The database is the existing Zalando `storage-cluster` (PG 15, Patroni, daily
   logical backups). Backups therefore contain ciphertext only — losing the KEK
   Secret loses the data, so the KEK's sealed form in git plus the sealed-secrets
@@ -241,15 +256,25 @@ the ciphertext-only design removes the main reason to isolate.
 
 ### Data model (first cut)
 
-- `secrets` — id, name, description, max_tier, created/updated, current_version.
+- `secrets` — id, name, description, max_tier, created/updated, current_version,
+  and an operator-managed **injection template** for brokered use: how the
+  credential is placed on proxied requests (default
+  `Authorization: Bearer {secret}`; alternatively a named custom header, Basic
+  auth, or query parameter). Injection placement is never taken from the
+  requesting client — an agent that could choose the header could smuggle the
+  secret into a field the target echoes back.
 - `secret_versions` — secret_id, version, ciphertext, nonce, wrapped_dek, aad
   context, created_by (approval that ingested it).
 - `clients` — id, name (`family-assistant`, `k8s-agent`), authn binding (SA
   audience+subject, or API-key hash), max_tier, allowed mechanisms, enabled.
 - `policies` — (client, secret | secret-tag) → mechanism, tier, constraints
-  (host allowlist, methods, path prefix, origin), outcome (`auto-approve` /
-  `notify-only` / `require-approval` / `deny`), expiry. Standing grants (CUJ 3
-  pre-approval) are rows here with an expiry, created from the approval UI.
+  (HTTPS origins, methods, path prefixes, autofill page origin), outcome
+  (`auto-approve` / `notify-only` / `require-approval` / `deny`), expiry.
+  Standing grants (CUJ 3 pre-approval) are rows here with an expiry, created from
+  the approval UI. Resolution over overlapping rows is deterministic: `deny`
+  overrides any other matching outcome; otherwise the most specific match wins
+  (exact secret over tag, specific client over wildcard), with an explicit
+  integer priority as the final tiebreaker.
 - `access_requests` — client, secret, requested mechanism+tier+constraints,
   client-supplied context (freeform + structured), state
   (`pending`/`approved`/`denied`/`expired`), resolved_by, timestamps.
@@ -369,9 +394,14 @@ In `werdnum/kube-config` (a later PR, once the service exists):
   (ClusterRoleBinding) so the server may create `TokenReview`s — without it every
   SA-token authn attempt is rejected by the API server.
 - Internal clients use `https://keychute.keychute.svc.cluster.local` with a
-  cert-manager-issued certificate served by the Rust process (rustls); plaintext
-  HTTP is not offered, since static API tokens and tier-1/2 plaintext reads
-  transit this connection and the cluster network is not in the trusted base.
+  certificate from a **cluster-internal cert-manager CA issuer** served by the
+  Rust process (rustls) — public CAs cannot issue for `*.svc.cluster.local` —
+  and plaintext HTTP is not offered, since static API tokens and tier-1/2
+  plaintext reads transit this connection and the cluster network is not in the
+  trusted base. The CA bundle (public material only) is fanned out to client
+  namespaces with the existing reflector pattern and configured explicitly:
+  mounted and referenced in family-assistant's config, and a `--ca-bundle`/env
+  path for the CLI baked into the k8s-agent image.
 - k8s-agent: add the `keychute` CLI to the image (renovate-pinned ref, like the
   sudo-service CLI), and a projected token volume with
   `audience: keychute.andrewgarrett.dev`.
@@ -427,7 +457,11 @@ calendar estimates.
   (store-or-passthrough), durable grants with a single-use read endpoint
   including grant TTL and an expiry purge (a passthrough payload must not outlive
   its grant, so this cannot defer to a later milestone), audit log, client authn
-  (API tokens + TokenReview), `keychute` CLI. Deployed to the
+  (API tokens + TokenReview), `keychute` CLI, and a minimal abuse guard — a
+  per-client cap on open pending requests and dedup/throttling of Pushover
+  notifications for repeated identical requests — since M1 is deployed and the
+  threat model already assumes prompt-injected clients (full per-client rate
+  limiting remains M5). Deployed to the
   cluster; k8s-agent image gains the CLI. *This is the first real value: agents stop
   needing credentials pasted into transcripts.*
 - **M2 — Policy engine & standing grants.** Policy rows, outcomes
