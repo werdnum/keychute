@@ -1,6 +1,7 @@
 //! Access requests: idempotent creation, resolution, expiry, push outbox.
 
 use crate::audit::{insert_audit, kinds, AuditEvent};
+use crate::crypto::{AadContext, CryptoError, EphemeralKek, SecretBytes};
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -153,19 +154,45 @@ pub async fn list_pending(db: &PgPool) -> anyhow::Result<Vec<AccessRequestRow>> 
 ///
 /// ALWAYS sealed under the process-local ephemeral KEK (DESIGN §5: a durable
 /// wrap would let a backup copy of a purged payload be decrypted through the
-/// long-lived KEK recovery chain, outliving the grant it was scoped to). There
-/// is deliberately no way to express a keyset-wrapped passthrough here: such a
-/// payload would be a wrapped-DEK reference sealed by the caller, outside the
-/// transaction that holds the KEK shared lock, which is exactly the ordering
-/// addendum #19 forbids (see [`super::SealFn`]). Because the ephemeral KEK is
-/// not in the keyset and is never retired, sealing these before the transaction
-/// is safe — and the store's `passthrough_ephemeral` column is `true` for every
-/// row that carries a payload.
+/// long-lived KEK recovery chain, outliving the grant it was scoped to). That
+/// is a property of the type, not a convention: the fields are private and
+/// [`PassthroughPayload::seal`] — which takes an [`EphemeralKek`] and performs
+/// the sealing itself — is the only way to make one, so a keyset-sealed blob
+/// cannot be smuggled in. A durable payload would be a wrapped-DEK reference
+/// sealed by the caller, outside the transaction that holds the KEK shared
+/// lock, which is exactly the ordering addendum #19 forbids (see
+/// [`super::SealFn`]). Because the ephemeral KEK is not in the keyset and is
+/// never retired, sealing these before the transaction is safe — and the
+/// store's `passthrough_ephemeral` column is `true` for every row that carries
+/// a payload.
 #[derive(Debug, Clone)]
 pub struct PassthroughPayload {
-    pub ciphertext: Vec<u8>,
-    pub nonce: Vec<u8>,
-    pub wrapped_dek: Vec<u8>,
+    ciphertext: Vec<u8>,
+    nonce: Vec<u8>,
+    wrapped_dek: Vec<u8>,
+}
+
+impl PassthroughPayload {
+    /// Seal `value` for `grant_id` under the process-local ephemeral KEK. The
+    /// only constructor (see the type docs).
+    pub fn seal(
+        kek: &EphemeralKek,
+        grant_id: Uuid,
+        value: &SecretBytes,
+    ) -> Result<PassthroughPayload, CryptoError> {
+        let sealed = kek.seal(value, AadContext::GrantPassthrough { grant_id })?;
+        debug_assert_eq!(sealed.kek_id, crate::crypto::EPHEMERAL_KEK_ID);
+        Ok(PassthroughPayload {
+            ciphertext: sealed.ciphertext,
+            nonce: sealed.nonce,
+            wrapped_dek: sealed.wrapped_dek,
+        })
+    }
+
+    /// `(ciphertext, nonce, wrapped_dek)` for the store layer's INSERTs.
+    pub fn parts(&self) -> (&[u8], &[u8], &[u8]) {
+        (&self.ciphertext, &self.nonce, &self.wrapped_dek)
+    }
 }
 
 /// Grant fields decided at approval time (constraints possibly narrowed,
@@ -209,12 +236,10 @@ pub async fn resolve_approve(
     // column stays `true` after the sweeper nulls the ciphertext, which is how
     // the read path tells a purged passthrough grant from a stored-secret one.
     let (pt_ct, pt_nonce, pt_dek, pt_eph) = match &grant.passthrough {
-        Some(p) => (
-            Some(&p.ciphertext),
-            Some(&p.nonce),
-            Some(&p.wrapped_dek),
-            true,
-        ),
+        Some(p) => {
+            let (ct, nonce, dek) = p.parts();
+            (Some(ct), Some(nonce), Some(dek), true)
+        }
         None => (None, None, None, false),
     };
     let grant_id: Uuid = sqlx::query_scalar(

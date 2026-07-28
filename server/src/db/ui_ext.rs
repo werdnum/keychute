@@ -120,12 +120,10 @@ pub async fn approve_request(
     // See `requests::resolve_approve`: payloads are ephemeral-KEK-sealed by
     // construction, and the flag outlives the ciphertext the sweeper nulls.
     let (pt_ct, pt_nonce, pt_dek, pt_eph) = match &grant.passthrough {
-        Some(p) => (
-            Some(&p.ciphertext),
-            Some(&p.nonce),
-            Some(&p.wrapped_dek),
-            true,
-        ),
+        Some(p) => {
+            let (ct, nonce, dek) = p.parts();
+            (Some(ct), Some(nonce), Some(dek), true)
+        }
         None => (None, None, None, false),
     };
     sqlx::query(
@@ -490,17 +488,9 @@ mod tests {
         // Passthrough path.
         let row2 = insert_pending(db, "s2", "k2", Utc::now() + Duration::seconds(600)).await?;
         let g2 = Uuid::new_v4();
-        let sealed = ephemeral
-            .seal(
-                &SecretBox::new(b"once".as_slice().into()),
-                AadContext::GrantPassthrough { grant_id: g2 },
-            )
-            .unwrap();
-        let pt = PassthroughPayload {
-            ciphertext: sealed.ciphertext,
-            nonce: sealed.nonce,
-            wrapped_dek: sealed.wrapped_dek,
-        };
+        let pt =
+            PassthroughPayload::seal(&ephemeral, g2, &SecretBox::new(b"once".as_slice().into()))
+                .unwrap();
         let got = approve_request(db, row2.id, "andrew", g2, &grant_params(Some(pt)), None).await?;
         assert_eq!(got, Some(g2));
         let grant = crate::db::get_grant(db, g2).await?.unwrap();

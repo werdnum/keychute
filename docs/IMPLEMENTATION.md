@@ -513,7 +513,9 @@ These override anything above where they conflict.
     not part of the keyset and is never retired (`verify_no_references`
     correspondingly does not count them, and their transactions do not take the
     lock). That carve-out is enforced by the type, not by convention —
-    `db::PassthroughPayload` cannot express a keyset-wrapped payload, so no
+    `db::PassthroughPayload` has private fields and exactly one constructor,
+    `PassthroughPayload::seal(&EphemeralKek, grant_id, value)`, which does the
+    ephemeral sealing itself: a keyset-sealed blob cannot be smuggled in, so no
     caller can reintroduce the "seal first, lock later" shape by attaching a
     durable payload to a grant. The read path matches: a passthrough is only
     ever opened with the ephemeral KEK, never by guessing an active keyset key.

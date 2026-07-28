@@ -395,6 +395,17 @@ async fn requests_page(
 // ---------------------------------------------------------------------------
 // GET /ui/requests/{id}
 
+/// Hidden field carrying the render-time answer to "is this secret stored?".
+/// The approve handler refuses (409) when reality no longer matches it, so a
+/// stale form can never silently change which credential is released.
+const F_SECRET_PRESENT: &str = "secret_present";
+
+/// Wording shared by the GET banner and the 409 body.
+const SECRET_STATE_CHANGED: &str =
+    "the stored state of this secret changed while you were reviewing this \
+     request, so this form no longer means what it said: nothing was approved. \
+     Re-check the details below and decide again.";
+
 async fn request_detail_page(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -405,6 +416,20 @@ async fn request_detail_page(
         .await?
         .ok_or_else(|| UiError::new(StatusCode::NOT_FOUND, "no such request"))?;
     let now = Utc::now();
+    render_request_detail(&state, &op, &row, now, None).await
+}
+
+/// Render the approval page for `row`. `notice` renders as a banner above the
+/// forms; the approve handler passes it when re-rendering after a 409 so the
+/// operator re-decides against the page's new state.
+async fn render_request_detail(
+    state: &AppState,
+    op: &Operator,
+    row: &AccessRequestRow,
+    now: DateTime<Utc>,
+    notice: Option<&str>,
+) -> UiResult<Html<String>> {
+    let id = row.id;
     if row.state != "pending" || row.expires_at <= now {
         let label = if row.state == "pending" {
             "expired"
@@ -435,9 +460,9 @@ async fn request_detail_page(
         ));
     }
     let mechanism = parse_mechanism(&row.mechanism)?;
-    let constraints = parse_constraints(&row)?;
+    let constraints = parse_constraints(row)?;
     let secret = db::get_secret_by_name(&state.db, &row.secret_name).await?;
-    let context = decrypt_context(&state, &row);
+    let context = decrypt_context(state, row);
 
     let secret_line = match &secret {
         Some(s) => html! {
@@ -463,6 +488,9 @@ async fn request_detail_page(
         "Approve request",
         html! {
             h1 { "Access request from " (row.client_name) }
+            @if let Some(text) = notice {
+                p .caveat { (text) }
+            }
             p .muted {
                 "Created " (age_label(row.created_at, now)) " ago · expires at "
                 (row.expires_at.format("%Y-%m-%d %H:%M:%S UTC"))
@@ -472,6 +500,8 @@ async fn request_detail_page(
 
             form method="post" action={ "/ui/requests/" (id) "/approve" } {
                 input type="hidden" name="csrf_token" value=(approve_token);
+                input type="hidden" name=(F_SECRET_PRESENT)
+                    value=(if secret.is_some() { "1" } else { "0" });
                 fieldset {
                     legend { "Narrow the grant (optional — values may only shrink the request)" }
                     label {
@@ -540,6 +570,9 @@ async fn request_detail_page(
 #[derive(Deserialize)]
 struct ApproveForm {
     csrf_token: String,
+    /// [`F_SECRET_PRESENT`]: "1"/"0" as rendered. Required.
+    #[serde(default)]
+    secret_present: Option<String>,
     #[serde(default)]
     ttl_seconds: Option<String>,
     #[serde(default)]
@@ -669,6 +702,17 @@ fn validate_injection(
     }
 }
 
+/// Does the approval form's render-time assumption about the secret still
+/// hold? `Some(true)` = yes, `Some(false)` = the secret was created or removed
+/// under the operator (409), `None` = no usable marker (malformed form).
+fn secret_state_still_matches(rendered: Option<&str>, present_now: bool) -> Option<bool> {
+    match rendered {
+        Some("1") => Some(present_now),
+        Some("0") => Some(!present_now),
+        _ => None,
+    }
+}
+
 fn take_secret_value(form: &mut ApproveForm) -> Option<SecretBytes> {
     let mut raw = form.secret_value.take()?;
     if raw.is_empty() {
@@ -747,7 +791,37 @@ async fn approve(
     };
 
     let secret = db::get_secret_by_name(&state.db, &row.secret_name).await?;
+
+    // The approval page renders two materially different forms: for an absent
+    // secret it asks for the value and promises "released once, to this grant
+    // only" unless "store" is ticked; for a stored one it asks for nothing and
+    // releases what is stored. If that flipped between render and submit, the
+    // submitted form no longer means what the operator was shown — approving
+    // either way would release a credential they did not choose. Refuse and
+    // re-render so they decide against the new state (same 409 shape as the
+    // "resolved concurrently" case below).
+    match secret_state_still_matches(non_empty(&form.secret_present), secret.is_some()) {
+        None => {
+            return Err(UiError::bad_request(
+                "malformed approval form; reload the page and retry",
+            ))
+        }
+        Some(false) => {
+            let page =
+                render_request_detail(&state, &op, &row, now, Some(SECRET_STATE_CHANGED)).await?;
+            return Ok((StatusCode::CONFLICT, page).into_response());
+        }
+        Some(true) => {}
+    }
+
     let secret_value = take_secret_value(&mut form);
+    if secret.is_some() && secret_value.is_some() {
+        // The stored-secret form has no value field: a value here means the
+        // submission does not match the page it claims to come from.
+        return Err(UiError::bad_request(
+            "malformed approval form; reload the page and retry",
+        ));
+    }
     let store_requested = non_empty(&form.store_secret).is_some();
 
     let grant_id = Uuid::new_v4();
@@ -815,17 +889,12 @@ async fn approve(
                 // Sealed outside the transaction deliberately: the
                 // process-local ephemeral KEK is not part of the keyset and can
                 // never be retired, so addendum #19's ordering does not apply.
-                // This is the ONLY KEK a passthrough is ever sealed under —
-                // `PassthroughPayload` cannot express any other.
-                let sealed = state
-                    .ephemeral_kek
-                    .seal(&value, AadContext::GrantPassthrough { grant_id })
-                    .map_err(|e| anyhow::anyhow!("sealing passthrough: {e}"))?;
-                passthrough = Some(PassthroughPayload {
-                    ciphertext: sealed.ciphertext,
-                    nonce: sealed.nonce,
-                    wrapped_dek: sealed.wrapped_dek,
-                });
+                // It is also the ONLY KEK a passthrough can be sealed under —
+                // `PassthroughPayload::seal` is the type's sole constructor.
+                passthrough = Some(
+                    PassthroughPayload::seal(&state.ephemeral_kek, grant_id, &value)
+                        .map_err(|e| anyhow::anyhow!("sealing passthrough: {e}"))?,
+                );
             }
         }
     }
@@ -1560,6 +1629,23 @@ mod tests {
         // Exactly at the cap is elapsed too: not_after == now yields a grant
         // with zero remaining lifetime.
         assert!(policy_cap_elapsed(Some(now), now));
+    }
+
+    #[test]
+    fn stale_approval_form_is_detected_in_both_directions() {
+        // Rendered against an absent secret, still absent: the form means what
+        // it said (operator's typed value is the one released).
+        assert_eq!(secret_state_still_matches(Some("0"), false), Some(true));
+        // ...but one appeared in the meantime: approving would release the
+        // stored credential instead of the one the operator typed.
+        assert_eq!(secret_state_still_matches(Some("0"), true), Some(false));
+        // Rendered against a stored secret, still stored.
+        assert_eq!(secret_state_still_matches(Some("1"), true), Some(true));
+        // ...and the mirror case, if a delete path ever exists.
+        assert_eq!(secret_state_still_matches(Some("1"), false), Some(false));
+        // No usable marker: never guess a branch.
+        assert_eq!(secret_state_still_matches(None, false), None);
+        assert_eq!(secret_state_still_matches(Some("yes"), true), None);
     }
 
     #[test]

@@ -619,9 +619,14 @@ impl TestEnv {
     /// extract the approve form's CSRF token, POST with extra form fields.
     pub async fn approve(&self, request_id: &str, extra: &[(&str, &str)]) -> anyhow::Result<()> {
         let page = self.ui_get(&format!("/ui/requests/{request_id}")).await?;
-        let token = extract_csrf(&page, &format!("/ui/requests/{request_id}/approve"))
-            .context("approve form csrf token not found")?;
-        let mut form: Vec<(&str, &str)> = vec![("csrf_token", &token)];
+        let action = format!("/ui/requests/{request_id}/approve");
+        let token = extract_csrf(&page, &action).context("approve form csrf token not found")?;
+        // Hidden field recording whether the secret was stored when the page
+        // rendered; a browser submits it, and the handler 409s if it went stale.
+        let present = extract_form_field(&page, &action, "secret_present")
+            .context("approve form secret_present marker not found")?;
+        let mut form: Vec<(&str, &str)> =
+            vec![("csrf_token", &token), ("secret_present", &present)];
         form.extend_from_slice(extra);
         let (status, body) = self
             .ui_post(&format!("/ui/requests/{request_id}/approve"), &form)
@@ -857,14 +862,19 @@ impl ApiClient {
 // HTML scraping
 
 /// Extract the csrf token of the form whose `action` attribute equals
-/// `action`: find `action="<action>"`, then the first
-/// `name="csrf_token" value="…"` after it.
+/// `action` (see [`extract_form_field`]).
 pub fn extract_csrf(html: &str, action: &str) -> Option<String> {
+    extract_form_field(html, action, "csrf_token")
+}
+
+/// Value of the first `name="<field>" value="…"` input inside the form whose
+/// action is `action` — what a browser would submit for that field.
+pub fn extract_form_field(html: &str, action: &str, field: &str) -> Option<String> {
     let marker = format!("action=\"{action}\"");
     let start = html.find(&marker)?;
     let rest = &html[start..];
-    let needle = "name=\"csrf_token\" value=\"";
-    let at = rest.find(needle)? + needle.len();
+    let needle = format!("name=\"{field}\" value=\"");
+    let at = rest.find(&needle)? + needle.len();
     let rest = &rest[at..];
     let end = rest.find('"')?;
     Some(rest[..end].to_owned())

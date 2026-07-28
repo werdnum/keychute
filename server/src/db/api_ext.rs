@@ -200,12 +200,10 @@ pub async fn insert_access_request_with_id(
                 // ephemeral-KEK-sealed by construction, and the flag outlives
                 // the ciphertext the sweeper nulls.
                 let (pt_ct, pt_nonce, pt_dek, pt_eph) = match &grant.passthrough {
-                    Some(p) => (
-                        Some(&p.ciphertext),
-                        Some(&p.nonce),
-                        Some(&p.wrapped_dek),
-                        true,
-                    ),
+                    Some(p) => {
+                        let (ct, nonce, dek) = p.parts();
+                        (Some(ct), Some(nonce), Some(dek), true)
+                    }
                     None => (None, None, None, false),
                 };
                 let id: Uuid = sqlx::query_scalar(

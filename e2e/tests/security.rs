@@ -414,3 +414,96 @@ async fn manual_approval_is_capped_at_standing_policy_expiry() {
         "grant outlives its standing policy: grant {grant_not_after}, policy {policy_not_after}"
     );
 }
+
+/// A stale approval form must not silently change meaning. The page renders a
+/// value field (and the "released once, to this grant only" promise) only while
+/// the secret is absent; if one is created before the form is submitted, the
+/// operator's typed credential would otherwise be dropped and the newly stored
+/// credential released in its place. That must be a 409 showing the new state.
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_approval_form_is_refused_when_the_secret_appears_underneath() {
+    let env = TestEnv::spawn(SpawnOpts::default()).await.unwrap();
+
+    let (status, body) = env
+        .k8s()
+        .create_request(cli_read_request("stale-1", "payroll", 600, "pay people"))
+        .await
+        .unwrap();
+    assert_eq!(status, 201, "{body}");
+    let request_id = body["request_id"].as_str().unwrap().to_owned();
+    let action = format!("/ui/requests/{request_id}/approve");
+
+    // The operator opens the approval page while "payroll" is not stored.
+    let page = env
+        .ui_get(&format!("/ui/requests/{request_id}"))
+        .await
+        .unwrap();
+    assert!(page.contains("NOT stored in Keychute"));
+    let token = extract_csrf(&page, &action).expect("approve csrf token");
+    let present = extract_form_field(&page, &action, "secret_present").expect("state marker");
+    assert_eq!(present, "0", "page rendered against an absent secret");
+
+    // Someone else stores "payroll" in the meantime.
+    env.seed_secret(
+        "payroll",
+        "stored-credential-A",
+        "cooperating-client",
+        "bearer",
+        "",
+    )
+    .await
+    .unwrap();
+
+    // Submitting the now-stale form (store unticked) must not approve.
+    let (status, body) = env
+        .ui_post(
+            &action,
+            &[
+                ("csrf_token", &token),
+                ("secret_present", &present),
+                ("secret_value", "operator-typed-B"),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(status, 409, "stale approval form must conflict: {body}");
+    assert!(
+        body.contains("changed while you were reviewing"),
+        "409 explains the change: {body}"
+    );
+    // The 409 body IS the approval page in its new state, ready to re-decide.
+    assert!(body.contains("stored, version 1"), "re-rendered: {body}");
+    assert!(!body.contains("NOT stored in Keychute"));
+    assert!(extract_csrf(&body, &action).is_some(), "fresh csrf token");
+
+    // Nothing was approved: the request is still pending, with no grant.
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM grants WHERE request_id = $1")
+        .bind(request_id.parse::<uuid::Uuid>().unwrap())
+        .fetch_one(&env.db)
+        .await
+        .unwrap();
+    assert_eq!(n, 0, "stale form must not mint a grant");
+    let state: String = sqlx::query_scalar("SELECT state FROM access_requests WHERE id = $1")
+        .bind(request_id.parse::<uuid::Uuid>().unwrap())
+        .fetch_one(&env.db)
+        .await
+        .unwrap();
+    assert_eq!(state, "pending");
+
+    // Re-deciding against the fresh page works and releases the stored value —
+    // this time knowingly.
+    env.approve(&request_id, &[]).await.unwrap();
+    let st: serde_json::Value = env
+        .k8s()
+        .get(&format!("/v1/access-requests/{request_id}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let grant_id = st["grant_id"].as_str().unwrap().to_owned();
+    let (status, body) = env.k8s().read_grant(&grant_id, "stale-read").await.unwrap();
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["secret"], "stored-credential-A");
+}
