@@ -51,7 +51,11 @@ pub async fn approve_request(
     store: Option<StoreSecretParams<'_>>,
 ) -> anyhow::Result<Option<Uuid>> {
     let mut tx = db.begin().await?;
-    if store.is_some() || grant.passthrough.is_some() {
+    // Only the stored-secret path inserts a KEYSET-wrapped DEK. A passthrough
+    // payload is wrapped under the process-local ephemeral KEK, which is not in
+    // the keyset and is never retired ([`crate::db::PassthroughPayload`]), so
+    // addendum #19 does not apply to it.
+    if store.is_some() {
         take_kek_shared_lock(&mut tx).await?;
     }
     let updated = sqlx::query(
@@ -113,12 +117,14 @@ pub async fn approve_request(
         .await?;
     }
 
+    // See `requests::resolve_approve`: payloads are ephemeral-KEK-sealed by
+    // construction, and the flag outlives the ciphertext the sweeper nulls.
     let (pt_ct, pt_nonce, pt_dek, pt_eph) = match &grant.passthrough {
         Some(p) => (
             Some(&p.ciphertext),
             Some(&p.nonce),
             Some(&p.wrapped_dek),
-            p.ephemeral,
+            true,
         ),
         None => (None, None, None, false),
     };
@@ -494,7 +500,6 @@ mod tests {
             ciphertext: sealed.ciphertext,
             nonce: sealed.nonce,
             wrapped_dek: sealed.wrapped_dek,
-            ephemeral: true,
         };
         let got = approve_request(db, row2.id, "andrew", g2, &grant_params(Some(pt)), None).await?;
         assert_eq!(got, Some(g2));

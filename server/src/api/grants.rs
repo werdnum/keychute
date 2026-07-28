@@ -19,6 +19,15 @@ use uuid::Uuid;
 
 /// Decrypt a grant's passthrough payload. Any failure — including a nulled
 /// payload or a process restart under the ephemeral KEK — is `payload-lost`.
+///
+/// The process-local ephemeral KEK is the only key a passthrough payload is
+/// ever wrapped under ([`db::PassthroughPayload`], DESIGN §5), so there is no
+/// keyset branch here: the grants table records no `kek_id`, and a row whose
+/// `passthrough_ephemeral` is somehow false could only be decrypted by guessing
+/// a keyset key. Guessing would also mean the payload had been sealed outside
+/// the writing transaction's KEK shared lock. Such a row cannot be written by
+/// this code; if one existed it would be reported `payload-lost`, which is the
+/// same fail-closed answer a restart gives.
 fn open_passthrough(state: &AppState, grant: &db::GrantRow) -> Result<SecretBytes, ApiFailure> {
     let (Some(ct), Some(nonce), Some(dek)) = (
         &grant.passthrough_ciphertext,
@@ -27,21 +36,18 @@ fn open_passthrough(state: &AppState, grant: &db::GrantRow) -> Result<SecretByte
     ) else {
         return Err(ApiFailure::PayloadLost);
     };
-    let aad = AadContext::GrantPassthrough { grant_id: grant.id };
-    if grant.passthrough_ephemeral {
-        state
-            .ephemeral_kek
-            .open(ct, nonce, dek, aad)
-            .map_err(|_| ApiFailure::PayloadLost)
-    } else {
-        // Durable passthroughs are wrapped under the keyset KEK that was
-        // active at approval time; the grants table stores no kek_id, so the
-        // active key is tried (grants are short-lived relative to rotations).
-        state
-            .keyset
-            .open(ct, nonce, dek, state.keyset.active_kek_id(), aad)
-            .map_err(|_| ApiFailure::PayloadLost)
+    if !grant.passthrough_ephemeral {
+        return Err(ApiFailure::PayloadLost);
     }
+    state
+        .ephemeral_kek
+        .open(
+            ct,
+            nonce,
+            dek,
+            AadContext::GrantPassthrough { grant_id: grant.id },
+        )
+        .map_err(|_| ApiFailure::PayloadLost)
 }
 
 fn open_secret_version(

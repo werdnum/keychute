@@ -253,13 +253,35 @@ async fn brokered_grant_is_owner_scoped() {
 /// so only a legacy row can reach this state.)
 #[tokio::test(flavor = "multi_thread")]
 async fn unusable_basic_credential_does_not_burn_a_grant_use() {
+    unusable_basic_credential_case("injection_username = NULL, injection_header = NULL").await;
+}
+
+/// Same property for a username that EXISTS but cannot form a header value.
+/// This check lives in `InjectionSpec::validate`, which the proxy runs before
+/// use-accounting precisely because it needs no plaintext: a CRLF username
+/// would split the outbound `Authorization` header, so nothing reaches
+/// upstream and no use may be spent. (Rejecting CR/LF/NUL in the decrypted
+/// secret itself is unavoidably post-accounting — see `injection_header`.)
+#[tokio::test(flavor = "multi_thread")]
+async fn header_splitting_basic_username_does_not_burn_a_grant_use() {
+    unusable_basic_credential_case(
+        "injection_username = 'svc' || chr(13) || chr(10) || 'X-Evil: 1', \
+         injection_header = NULL",
+    )
+    .await;
+}
+
+/// Break a seeded `basic` secret's injection template with `break_assignments`,
+/// prove the proxy refuses it without contacting upstream or accounting a use,
+/// then repair the row and prove the grant's single use is still spendable.
+async fn unusable_basic_credential_case(break_assignments: &str) {
     let env = TestEnv::spawn(SpawnOpts::default()).await.unwrap();
     env.seed_secret("basic-api-token", "p4ss", "brokered", "basic", "svc")
         .await
         .unwrap();
-    sqlx::query(
-        "UPDATE secrets SET injection_username = NULL, injection_header = NULL WHERE name = $1",
-    )
+    sqlx::query(&format!(
+        "UPDATE secrets SET {break_assignments} WHERE name = $1"
+    ))
     .bind("basic-api-token")
     .execute(&env.db)
     .await
@@ -309,12 +331,14 @@ async fn unusable_basic_credential_does_not_burn_a_grant_use() {
     );
 
     // Repair the row: the single use is still there to spend.
-    sqlx::query("UPDATE secrets SET injection_username = $2 WHERE name = $1")
-        .bind("basic-api-token")
-        .bind("svc")
-        .execute(&env.db)
-        .await
-        .unwrap();
+    sqlx::query(
+        "UPDATE secrets SET injection_username = $2, injection_header = NULL WHERE name = $1",
+    )
+    .bind("basic-api-token")
+    .bind("svc")
+    .execute(&env.db)
+    .await
+    .unwrap();
     let resp = env
         .fa()
         .get(&format!("/v1/grants/{grant_id}/proxy/v1/echo"))

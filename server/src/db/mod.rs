@@ -48,10 +48,11 @@ pub(crate) async fn take_kek_shared_lock(tx: &mut sqlx::PgConnection) -> Result<
 /// could land just after a zero count and become permanently undecryptable
 /// once the operator removes the KEK.
 ///
-/// Counts `secret_versions.kek_id` and `access_requests.context_kek_id`.
-/// Grant passthrough payloads carry no kek_id column: durable passthroughs are
-/// wrapped under the active KEK and short-lived, and ephemeral ones die with
-/// the process, so they are intentionally not counted here.
+/// Counts `secret_versions.kek_id` and `access_requests.context_kek_id` —
+/// every place a keyset-wrapped DEK is stored. Grant passthrough payloads are
+/// intentionally not counted: they are wrapped under the process-local
+/// ephemeral KEK, which is not in the keyset and dies with the process
+/// ([`PassthroughPayload`]), so no `kek_id` here can ever be one of theirs.
 pub async fn verify_no_references(db: &sqlx::PgPool, kek_id: &str) -> anyhow::Result<bool> {
     let mut tx = db.begin().await?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtext('keychute-kek'))")

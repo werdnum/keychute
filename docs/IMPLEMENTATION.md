@@ -450,8 +450,21 @@ These override anything above where they conflict.
     version under a key the caller believes is spent. Tombstones are collected
     with their grant (`ON DELETE CASCADE`).
 12. **Outbound URL construction.** Build `Url` from the approved origin
-    (`https://host[:port]`), then `set_path(&encoded_canonical_path)` and
-    `set_query(...)` on that parsed URL. Never string-concat, never `join()`.
+    (`https://host[:port]`), then `set_path(...)` and `set_query(...)` on that
+    parsed URL. Never string-concat, never `join()`. What `set_path` receives is
+    the **decoded** canonical path (the one `prefix_matches` approved and the
+    audit row records) with `%` — and only `%` — escaped to `%25` first. Do NOT
+    hand it an already-percent-encoded path: `set_path` percent-encodes its
+    argument itself, so pre-encoding double-encodes (`/a%20b` → canonical
+    `/a b` → `/a%20b` → emitted `/a%2520b`), sending a *different* upstream
+    resource than the one approved. The `%25` pre-escape is needed because `%`
+    is the one character `set_path` leaves alone: a canonical path may contain
+    a literal `%` (raw `/a%2541` canonicalizes to `/a%41`), and emitting that
+    bare would give upstream a second decode (`/aA`). Handing over a decoded
+    path is safe only because `paths::canonicalize` has already rejected every
+    input whose decoded form could change the path's STRUCTURE (`%2F`, `%5C`,
+    raw `\`, dot segments, `//`, control characters, non-UTF-8), so `set_path`
+    cannot introduce structure `prefix_matches` did not see.
     Origin host normalization: lowercase ASCII, strip trailing dot, reject
     userinfo/IP-with-brackets oddities at parse (already in types Origin);
     ports compared *effective* (443 == None).
@@ -495,10 +508,15 @@ These override anything above where they conflict.
     future) retirement path takes the exclusive form before checking
     zero-references. v1 ships the shared-side discipline in the store layer +
     a `verify_no_references(kek_id)` store function; the operator runbook does
-    the rest. Grant passthrough payloads are out of scope: they are sealed
-    under the process-local ephemeral KEK, which is not part of the keyset and
-    is never retired (`verify_no_references` correspondingly does not count
-    them).
+    the rest. Grant passthrough payloads are out of scope, and are the ONLY
+    carve-out: they are sealed under the process-local ephemeral KEK, which is
+    not part of the keyset and is never retired (`verify_no_references`
+    correspondingly does not count them, and their transactions do not take the
+    lock). That carve-out is enforced by the type, not by convention —
+    `db::PassthroughPayload` cannot express a keyset-wrapped payload, so no
+    caller can reintroduce the "seal first, lock later" shape by attaching a
+    durable payload to a grant. The read path matches: a passthrough is only
+    ever opened with the ephemeral KEK, never by guessing an active keyset key.
 
 ## Definition of done per module
 

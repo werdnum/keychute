@@ -150,13 +150,22 @@ pub async fn list_pending(db: &PgPool) -> anyhow::Result<Vec<AccessRequestRow>> 
 
 /// Passthrough payload attached to a grant at approval time (secret entered
 /// but not stored).
+///
+/// ALWAYS sealed under the process-local ephemeral KEK (DESIGN §5: a durable
+/// wrap would let a backup copy of a purged payload be decrypted through the
+/// long-lived KEK recovery chain, outliving the grant it was scoped to). There
+/// is deliberately no way to express a keyset-wrapped passthrough here: such a
+/// payload would be a wrapped-DEK reference sealed by the caller, outside the
+/// transaction that holds the KEK shared lock, which is exactly the ordering
+/// addendum #19 forbids (see [`super::SealFn`]). Because the ephemeral KEK is
+/// not in the keyset and is never retired, sealing these before the transaction
+/// is safe — and the store's `passthrough_ephemeral` column is `true` for every
+/// row that carries a payload.
 #[derive(Debug, Clone)]
 pub struct PassthroughPayload {
     pub ciphertext: Vec<u8>,
     pub nonce: Vec<u8>,
     pub wrapped_dek: Vec<u8>,
-    /// True when wrapped under the process-local ephemeral KEK.
-    pub ephemeral: bool,
 }
 
 /// Grant fields decided at approval time (constraints possibly narrowed,
@@ -195,12 +204,16 @@ pub async fn resolve_approve(
     if updated.rows_affected() != 1 {
         return Ok(None);
     }
+    // `passthrough_ephemeral` mirrors "this grant carries a payload": payloads
+    // are ephemeral-KEK-sealed by construction ([`PassthroughPayload`]). The
+    // column stays `true` after the sweeper nulls the ciphertext, which is how
+    // the read path tells a purged passthrough grant from a stored-secret one.
     let (pt_ct, pt_nonce, pt_dek, pt_eph) = match &grant.passthrough {
         Some(p) => (
             Some(&p.ciphertext),
             Some(&p.nonce),
             Some(&p.wrapped_dek),
-            p.ephemeral,
+            true,
         ),
         None => (None, None, None, false),
     };

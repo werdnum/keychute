@@ -122,9 +122,58 @@ pub(crate) enum InjectionSpec<'a> {
     BasicPassword { username: &'a str },
 }
 
+impl InjectionSpec<'_> {
+    /// The half of [`injection_header`] that does NOT need the decrypted
+    /// secret: resolve the header name the credential will be set on, and
+    /// reject a template that could never form a valid header regardless of
+    /// what the secret turns out to be.
+    ///
+    /// Split out so `handle_inner` can run it BEFORE use-accounting — a
+    /// credential whose *template* is unusable can never reach upstream, so it
+    /// must not burn a use of a finite-`max_uses` grant (same reasoning as the
+    /// 413 body cap). `injection_header` calls it again rather than trusting
+    /// the caller to have done so, which keeps it the single definition of
+    /// "usable template" for both call sites.
+    pub(crate) fn validate(&self) -> Result<HeaderName, ApiFailure> {
+        match self {
+            InjectionSpec::Bearer => Ok(AUTHORIZATION),
+            InjectionSpec::Header(name) => {
+                let lower = name.to_ascii_lowercase();
+                if STRIP_LIST.contains(&lower.as_str()) || lower.starts_with("x-forwarded-") {
+                    return Err(ApiFailure::BadCredentialEncoding);
+                }
+                HeaderName::from_bytes(name.as_bytes())
+                    .map_err(|_| ApiFailure::BadCredentialEncoding)
+            }
+            InjectionSpec::BasicPassword { username } => {
+                // `:` would move the field boundary inside the base64 payload,
+                // so upstream would see a different username than the operator
+                // configured; CR/LF/NUL would make the built header value
+                // invalid (or split it).
+                if username.contains(':')
+                    || username.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0)
+                {
+                    return Err(ApiFailure::BadCredentialEncoding);
+                }
+                Ok(AUTHORIZATION)
+            }
+        }
+    }
+}
+
 /// Build the injection header. Fails closed with `bad-credential-encoding`
 /// when the secret (or template) cannot form a valid header value; the value
 /// is marked sensitive so it is never logged.
+///
+/// Residual, deliberately not moved before use-accounting: the checks below
+/// that inspect `secret` (CR/LF/NUL in the plaintext, and `HeaderValue`
+/// rejecting the assembled bytes) fail a request AFTER a use has been
+/// accounted and a `proxy-attempt` row written, returning 502. Hoisting them
+/// would mean decrypting before accounting, which is the worse trade: the
+/// plaintext must not enter the process before the use that pays for it is
+/// recorded. The template half is hoisted instead (see
+/// [`InjectionSpec::validate`]), which covers every failure that does not
+/// depend on the stored bytes.
 pub(crate) fn injection_header(
     spec: &InjectionSpec<'_>,
     secret: &[u8],
@@ -139,6 +188,7 @@ pub(crate) fn injection_header(
         Ok(v)
     }
 
+    let name = spec.validate()?;
     match spec {
         InjectionSpec::Bearer => {
             if !header_safe(secret) {
@@ -146,26 +196,15 @@ pub(crate) fn injection_header(
             }
             let mut bytes = b"Bearer ".to_vec();
             bytes.extend_from_slice(secret);
-            Ok((AUTHORIZATION, value(bytes)?))
+            Ok((name, value(bytes)?))
         }
-        InjectionSpec::Header(name) => {
-            let lower = name.to_ascii_lowercase();
-            if STRIP_LIST.contains(&lower.as_str()) || lower.starts_with("x-forwarded-") {
-                return Err(ApiFailure::BadCredentialEncoding);
-            }
-            let header_name = HeaderName::from_bytes(name.as_bytes())
-                .map_err(|_| ApiFailure::BadCredentialEncoding)?;
+        InjectionSpec::Header(_) => {
             if !header_safe(secret) {
                 return Err(ApiFailure::BadCredentialEncoding);
             }
-            Ok((header_name, value(secret.to_vec())?))
+            Ok((name, value(secret.to_vec())?))
         }
         InjectionSpec::BasicPassword { username } => {
-            if username.contains(':')
-                || username.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0)
-            {
-                return Err(ApiFailure::BadCredentialEncoding);
-            }
             let mut credentials = Vec::with_capacity(username.len() + 1 + secret.len());
             credentials.extend_from_slice(username.as_bytes());
             credentials.push(b':');
@@ -173,7 +212,7 @@ pub(crate) fn injection_header(
             let encoded = base64::engine::general_purpose::STANDARD.encode(&credentials);
             let mut bytes = b"Basic ".to_vec();
             bytes.extend_from_slice(encoded.as_bytes());
-            Ok((AUTHORIZATION, value(bytes)?))
+            Ok((name, value(bytes)?))
         }
     }
 }
@@ -451,6 +490,12 @@ async fn handle_inner(
         }
         _ => return Err(ApiFailure::BadCredentialEncoding),
     };
+    // Everything about the template that can fail without seeing the plaintext
+    // (bad/stripped header name, a basic username carrying `:` or CR/LF/NUL) is
+    // decided here, still before use-accounting. `injection_header` re-runs it
+    // once the secret is in hand; see its docs for the residual that genuinely
+    // cannot move.
+    spec.validate()?;
 
     // The write-ahead attempt row records where the credential is about to be
     // sent (method/origin/path), before anything leaves the process. The
@@ -996,6 +1041,51 @@ mod tests {
             injection_header(&InjectionSpec::BasicPassword { username: "a:b" }, b"p"),
             Err(ApiFailure::BadCredentialEncoding)
         ));
+    }
+
+    /// `validate` decides every template failure without the plaintext, so the
+    /// proxy can run it before use-accounting. Whatever it rejects,
+    /// `injection_header` must reject too — for ANY secret, including one that
+    /// would otherwise have produced a perfectly good header.
+    #[test]
+    fn validate_matches_injection_header_without_the_secret() {
+        assert_eq!(InjectionSpec::Bearer.validate().unwrap(), AUTHORIZATION);
+        assert_eq!(
+            InjectionSpec::Header("X-Api-Key").validate().unwrap(),
+            HeaderName::from_static("x-api-key")
+        );
+        assert_eq!(
+            InjectionSpec::BasicPassword { username: "svc" }
+                .validate()
+                .unwrap(),
+            AUTHORIZATION
+        );
+
+        let bad_templates: &[InjectionSpec<'_>] = &[
+            InjectionSpec::Header("host"),
+            InjectionSpec::Header("X-Forwarded-For"),
+            InjectionSpec::Header("bad name!"),
+            // A `:` moves the base64 field boundary; CR/LF/NUL would split or
+            // invalidate the header value.
+            InjectionSpec::BasicPassword { username: "a:b" },
+            InjectionSpec::BasicPassword {
+                username: "svc\r\nX-Evil: 1",
+            },
+            InjectionSpec::BasicPassword { username: "sv\0c" },
+        ];
+        for spec in bad_templates {
+            assert!(
+                matches!(spec.validate(), Err(ApiFailure::BadCredentialEncoding)),
+                "template should be rejected before use-accounting"
+            );
+            assert!(
+                matches!(
+                    injection_header(spec, b"p4ss"),
+                    Err(ApiFailure::BadCredentialEncoding)
+                ),
+                "a hoisted check must still hold at build time"
+            );
+        }
     }
 
     #[test]

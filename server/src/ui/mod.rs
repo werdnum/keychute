@@ -815,6 +815,8 @@ async fn approve(
                 // Sealed outside the transaction deliberately: the
                 // process-local ephemeral KEK is not part of the keyset and can
                 // never be retired, so addendum #19's ordering does not apply.
+                // This is the ONLY KEK a passthrough is ever sealed under —
+                // `PassthroughPayload` cannot express any other.
                 let sealed = state
                     .ephemeral_kek
                     .seal(&value, AadContext::GrantPassthrough { grant_id })
@@ -823,7 +825,6 @@ async fn approve(
                     ciphertext: sealed.ciphertext,
                     nonce: sealed.nonce,
                     wrapped_dek: sealed.wrapped_dek,
-                    ephemeral: true,
                 });
             }
         }

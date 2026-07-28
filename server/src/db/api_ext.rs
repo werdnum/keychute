@@ -76,14 +76,12 @@ pub async fn insert_access_request_with_id(
     seal_context: Option<super::SealFn<'_>>,
 ) -> anyhow::Result<InsertOutcome> {
     let mut tx = db.begin().await?;
-    // Same pattern as `ui_ext::approve_request`: the lock must cover EVERY
-    // wrapped-DEK insert in this transaction — the sealed request context AND
-    // an auto-approve grant's passthrough payload (currently always None from
-    // the API path, but the store layer must not depend on that).
-    let inserts_wrapped_dek = seal_context.is_some()
-        || matches!(resolution,
-            InitialResolution::Approved { grant, .. } if grant.passthrough.is_some());
-    if inserts_wrapped_dek {
+    // Same pattern as `ui_ext::approve_request`: the lock covers every
+    // KEYSET-wrapped DEK inserted here, which is only the sealed request
+    // context. An auto-approve grant's passthrough payload is wrapped under the
+    // process-local ephemeral KEK ([`crate::db::PassthroughPayload`]) — not in
+    // the keyset, never retired — so addendum #19 does not apply to it.
+    if seal_context.is_some() {
         super::take_kek_shared_lock(&mut tx).await?;
     }
     // Sealed under the lock, never before it.
@@ -198,12 +196,15 @@ pub async fn insert_access_request_with_id(
                 .bind(resolved_by)
                 .fetch_one(&mut *tx)
                 .await?;
+                // See `requests::resolve_approve`: payloads are
+                // ephemeral-KEK-sealed by construction, and the flag outlives
+                // the ciphertext the sweeper nulls.
                 let (pt_ct, pt_nonce, pt_dek, pt_eph) = match &grant.passthrough {
                     Some(p) => (
                         Some(&p.ciphertext),
                         Some(&p.nonce),
                         Some(&p.wrapped_dek),
-                        p.ephemeral,
+                        true,
                     ),
                     None => (None, None, None, false),
                 };
