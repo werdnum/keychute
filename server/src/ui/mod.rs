@@ -784,16 +784,7 @@ async fn approve(
                 let (injection_kind, injection_header, injection_username) =
                     validate_injection(kind, non_empty(&form.injection_header))?;
                 let secret_id = Uuid::new_v4();
-                let sealed = state
-                    .keyset
-                    .seal(
-                        &value,
-                        AadContext::SecretVersion {
-                            secret_id,
-                            version: 1,
-                        },
-                    )
-                    .map_err(|e| anyhow::anyhow!("sealing secret: {e}"))?;
+                let keyset = &state.keyset;
                 store = Some(StoreSecretParams {
                     secret_id,
                     name: row.secret_name.clone(),
@@ -802,7 +793,17 @@ async fn approve(
                     injection_kind,
                     injection_header,
                     injection_username,
-                    sealed,
+                    // Sealed by the approval transaction under the KEK shared
+                    // lock (addendum #19), never before it.
+                    seal: Box::new(move || {
+                        keyset.seal(
+                            &value,
+                            AadContext::SecretVersion {
+                                secret_id,
+                                version: 1,
+                            },
+                        )
+                    }),
                 });
             } else {
                 if mechanism == Mechanism::Brokered {
@@ -811,6 +812,9 @@ async fn approve(
                          check \"store this secret in Keychute\"",
                     ));
                 }
+                // Sealed outside the transaction deliberately: the
+                // process-local ephemeral KEK is not part of the keyset and can
+                // never be retired, so addendum #19's ordering does not apply.
                 let sealed = state
                     .ephemeral_kek
                     .seal(&value, AadContext::GrantPassthrough { grant_id })
@@ -844,8 +848,7 @@ async fn approve(
         passthrough,
     };
     let approved =
-        db::ui_ext::approve_request(&state.db, id, &op.subject, grant_id, &grant, store.as_ref())
-            .await?;
+        db::ui_ext::approve_request(&state.db, id, &op.subject, grant_id, &grant, store).await?;
     if approved.is_none() {
         return Err(UiError::new(
             StatusCode::CONFLICT,
@@ -1387,19 +1390,10 @@ async fn save_secret(
             let (injection_kind, injection_header, injection_username) =
                 validate_injection(kind, non_empty(&form.injection_header))?;
             let secret_id = Uuid::new_v4();
-            let sealed = state
-                .keyset
-                .seal(
-                    &value,
-                    AadContext::SecretVersion {
-                        secret_id,
-                        version: 1,
-                    },
-                )
-                .map_err(|e| anyhow::anyhow!("sealing secret: {e}"))?;
+            let keyset = &state.keyset;
             db::ui_ext::create_secret_with_version(
                 &state.db,
-                &StoreSecretParams {
+                StoreSecretParams {
                     secret_id,
                     name,
                     description: non_empty(&form.description).unwrap_or("").to_owned(),
@@ -1407,7 +1401,17 @@ async fn save_secret(
                     injection_kind,
                     injection_header,
                     injection_username,
-                    sealed,
+                    // Sealed inside the insert transaction, under the KEK
+                    // shared lock (addendum #19).
+                    seal: Box::new(move || {
+                        keyset.seal(
+                            &value,
+                            AadContext::SecretVersion {
+                                secret_id,
+                                version: 1,
+                            },
+                        )
+                    }),
                 },
                 &op.subject,
             )

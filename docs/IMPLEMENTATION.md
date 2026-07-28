@@ -442,8 +442,13 @@ These override anything above where they conflict.
     expired + audit; (b) grants: passthrough payload nulled when [consumed and
     replay window closed] or [expired] or [revoked]; (c) request context
     ciphertext nulled when request reached terminal state more than 24 h ago;
-    (d) grant_reads rows older than replay window deleted (their pin on
-    secret_versions ends with them).
+    (d) grant_reads rows older than the replay window keep the row but drop its
+    `secret_version_id` pin (`ui_ext::unpin_stale_grant_reads`). The row stays
+    as a tombstone and MUST NOT be deleted: `begin_grant_use` already reported
+    that idempotency key as `Exhausted`, and deleting the row would let the
+    same key burn a fresh use on a multi-use grant and release a newer secret
+    version under a key the caller believes is spent. Tombstones are collected
+    with their grant (`ON DELETE CASCADE`).
 12. **Outbound URL construction.** Build `Url` from the approved origin
     (`https://host[:port]`), then `set_path(&encoded_canonical_path)` and
     `set_query(...)` on that parsed URL. Never string-concat, never `join()`.
@@ -480,11 +485,20 @@ These override anything above where they conflict.
     bytes, `reason` ≤ 4 KiB, `structured` context ≤ 16 KiB serialized,
     constraints lists ≤ 32 entries each. Oversize → 400.
 19. **KEK retirement lock.** Every transaction that INSERTs a wrapped DEK takes
-    `pg_advisory_xact_lock_shared(hashtext('keychute-kek'))`. The (admin CLI /
+    `pg_advisory_xact_lock_shared(hashtext('keychute-kek'))`, and takes it
+    BEFORE reading the active KEK: sealing is done by a callback the store
+    function runs inside the transaction (`db::SealFn`, or the
+    version-numbered closure of `rotate_secret_version`), never by the caller
+    beforehand. A caller that sealed first could have its key retired in the
+    gap — the zero-reference check would pass while its reference is still
+    uncommitted — leaving that row permanently undecryptable. The (admin CLI /
     future) retirement path takes the exclusive form before checking
     zero-references. v1 ships the shared-side discipline in the store layer +
     a `verify_no_references(kek_id)` store function; the operator runbook does
-    the rest.
+    the rest. Grant passthrough payloads are out of scope: they are sealed
+    under the process-local ephemeral KEK, which is not part of the keyset and
+    is never retired (`verify_no_references` correspondingly does not count
+    them).
 
 ## Definition of done per module
 

@@ -387,7 +387,9 @@ async fn push_one(state: &AppState, row: &db::AccessRequestRow) -> anyhow::Resul
 /// Increment `push_attempts` iff the request is still pending, unexpired and
 /// undelivered — the same predicate `list_pending_needing_push` selects on.
 /// False means the row is no longer pushable and the caller must not send.
-async fn claim_for_push(db: &sqlx::PgPool, request_id: Uuid) -> anyhow::Result<bool> {
+/// Shared with the create path's initial push (`api::requests::create`), which
+/// races the operator resolving the just-committed row.
+pub(crate) async fn claim_for_push(db: &sqlx::PgPool, request_id: Uuid) -> anyhow::Result<bool> {
     let claimed: Option<(Uuid,)> = sqlx::query_as(
         "UPDATE access_requests SET push_attempts = push_attempts + 1 \
          WHERE id = $1 AND state = 'pending' AND push_delivered_at IS NULL \

@@ -18,9 +18,19 @@ pub mod ui_ext;
 #[cfg(test)]
 mod tests;
 
+/// Seals a payload inside the writing transaction. Addendum #19: the active
+/// KEK must be READ under the shared lock, not before it — a caller that
+/// sealed first could have that KEK retired between the seal and the commit
+/// (retirement's zero-reference check would run in the gap and see nothing),
+/// leaving the row permanently undecryptable. Store functions that persist a
+/// wrapped DEK therefore take one of these rather than pre-sealed bytes.
+pub type SealFn<'a> =
+    Box<dyn FnOnce() -> Result<crate::crypto::Sealed, crate::crypto::CryptoError> + Send + 'a>;
+
 /// Addendum #19: transactions inserting a wrapped DEK take the shared side of
 /// the KEK-retirement advisory lock, so KEK retirement (exclusive side) can
-/// verify no new references appear while it checks.
+/// verify no new references appear while it checks. Take it BEFORE sealing
+/// (see [`SealFn`]).
 pub(crate) async fn take_kek_shared_lock(tx: &mut sqlx::PgConnection) -> Result<(), sqlx::Error> {
     sqlx::query("SELECT pg_advisory_xact_lock_shared(hashtext('keychute-kek'))")
         .execute(tx)

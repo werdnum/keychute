@@ -49,10 +49,15 @@ const STRIP_LIST: &[&str] = &[
     "expect",
 ];
 
-/// Hop-by-hop headers stripped from the upstream response.
+/// Hop-by-hop headers stripped from the upstream response — the full RFC set,
+/// including the two `Proxy-*` ones the request side also strips. An upstream
+/// 407 challenges *its* own proxy hop, not our caller, so `Proxy-Authenticate`
+/// must not be forwarded either.
 const RESPONSE_STRIP: &[&str] = &[
     "connection",
     "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
     "proxy-connection",
     "te",
     "trailer",
@@ -274,18 +279,58 @@ fn proxy_suffix(raw_path: &str) -> Option<&str> {
     }
 }
 
+/// Cap on the post-upstream completion-audit insert. That work is deliberately
+/// outside the stream deadline (see [`handle`]), but it still needs a bound of
+/// its own so a wedged database cannot hold the caller's response open.
+const COMPLETION_AUDIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 async fn handle(state: AppState, grant_id: Uuid, req: Request) -> Result<Response, ApiFailure> {
     // ONE deadline covers the whole proxied lifetime: request handling, the
     // upstream exchange, and streaming the response body back to the caller.
-    // `timeout_at` governs everything up to returning the response; `forward`
-    // sets the reqwest timeout to the time REMAINING at send, which reqwest
-    // applies through the end of response-body streaming — so the body stream
-    // (which outlives this function) cannot extend the total past the limit.
+    // `forward` sets the reqwest timeout to the time REMAINING at send, which
+    // reqwest applies through the end of response-body streaming — so the body
+    // stream (which outlives this function) cannot extend the total past the
+    // limit; the race below covers everything before that point.
+    //
+    // The race is DISARMED the moment the upstream exchange produces a
+    // response. Past that point the side effect has committed, and the only
+    // work left in this function is the completion-audit insert (bounded by
+    // `COMPLETION_AUDIT_TIMEOUT`) plus building the response: cancelling it
+    // would turn a committed upstream 200 into a 504 and invite the caller to
+    // repeat the side effect.
     let limit = std::time::Duration::from_secs(state.config.limits.proxy_stream_deadline_seconds);
     let deadline = tokio::time::Instant::now() + limit;
-    match tokio::time::timeout_at(deadline, handle_inner(&state, grant_id, req, deadline)).await {
-        Ok(result) => result,
-        Err(_) => Err(ApiFailure::UpstreamTimeout),
+    let (committed_tx, committed_rx) = tokio::sync::oneshot::channel();
+    run_before_deadline(
+        handle_inner(&state, grant_id, req, deadline, committed_tx),
+        committed_rx,
+        deadline,
+    )
+    .await
+}
+
+/// Run `inner` under `deadline` until `committed` fires, then let it finish
+/// untimed. A `committed` sender dropped WITHOUT a send (an early return, or an
+/// upstream exchange that never produced a response) leaves the deadline armed.
+async fn run_before_deadline<F>(
+    inner: F,
+    committed: tokio::sync::oneshot::Receiver<()>,
+    deadline: tokio::time::Instant,
+) -> Result<Response, ApiFailure>
+where
+    F: std::future::Future<Output = Result<Response, ApiFailure>>,
+{
+    let disarm = async move {
+        if committed.await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::pin!(inner);
+    tokio::select! {
+        biased;
+        result = &mut inner => result,
+        _ = disarm => inner.await,
+        _ = tokio::time::sleep_until(deadline) => Err(ApiFailure::UpstreamTimeout),
     }
 }
 
@@ -294,6 +339,7 @@ async fn handle_inner(
     grant_id: Uuid,
     req: Request,
     deadline: tokio::time::Instant,
+    committed: tokio::sync::oneshot::Sender<()>,
 ) -> Result<Response, ApiFailure> {
     let (parts, body) = req.into_parts();
     let client = authenticate_client(state, &parts.headers).await?;
@@ -372,6 +418,40 @@ async fn handle_inner(
         .await?
         .ok_or(ApiFailure::PayloadLost)?;
 
+    // How the credential will be placed into the outbound request — resolved
+    // BEFORE use-accounting for the same reason as the 413 above: every failure
+    // here is `bad-credential-encoding` for a credential that can never reach
+    // upstream, and an unusable credential must not burn a use of a
+    // finite-max_uses grant. Nothing here needs the plaintext, so the decrypt
+    // still happens only once a use has been accounted.
+    let basic_username: String;
+    let spec = match secret.injection_kind.as_str() {
+        "bearer" => InjectionSpec::Bearer,
+        "header" => {
+            let name = secret
+                .injection_header
+                .as_deref()
+                .ok_or(ApiFailure::BadCredentialEncoding)?;
+            InjectionSpec::Header(name)
+        }
+        "basic" | "basic-password" => {
+            // The username lives in `injection_username` (migration 0003); the
+            // UI's create path stores it in `injection_header` for `basic`, so
+            // fall back to that. A row with neither fails CLOSED (like the
+            // `header` kind above): defaulting to "" would ship
+            // `Basic base64(":" + secret)` upstream, leaking the secret into
+            // the upstream's auth-failure log.
+            basic_username = db::api_ext::get_injection_username(&state.db, secret.id)
+                .await?
+                .or_else(|| secret.injection_header.clone())
+                .ok_or(ApiFailure::BadCredentialEncoding)?;
+            InjectionSpec::BasicPassword {
+                username: &basic_username,
+            }
+        }
+        _ => return Err(ApiFailure::BadCredentialEncoding),
+    };
+
     // The write-ahead attempt row records where the credential is about to be
     // sent (method/origin/path), before anything leaves the process. The
     // caller's query string is forwarded verbatim, so it is part of "where":
@@ -424,33 +504,6 @@ async fn handle_inner(
         .map_err(|e| ApiFailure::Internal(e.into()))?;
 
     // Injection header (confined expose_secret site: proxy header injection).
-    let basic_username: String;
-    let spec = match secret.injection_kind.as_str() {
-        "bearer" => InjectionSpec::Bearer,
-        "header" => {
-            let name = secret
-                .injection_header
-                .as_deref()
-                .ok_or(ApiFailure::BadCredentialEncoding)?;
-            InjectionSpec::Header(name)
-        }
-        "basic" | "basic-password" => {
-            // The username lives in `injection_username` (migration 0003); the
-            // UI's create path stores it in `injection_header` for `basic`, so
-            // fall back to that. A row with neither fails CLOSED (like the
-            // `header` kind above): defaulting to "" would ship
-            // `Basic base64(":" + secret)` upstream, leaking the secret into
-            // the upstream's auth-failure log and burning a grant use.
-            basic_username = db::api_ext::get_injection_username(&state.db, secret.id)
-                .await?
-                .or_else(|| secret.injection_header.clone())
-                .ok_or(ApiFailure::BadCredentialEncoding)?;
-            InjectionSpec::BasicPassword {
-                username: &basic_username,
-            }
-        }
-        _ => return Err(ApiFailure::BadCredentialEncoding),
-    };
     let (header_name, header_value) = injection_header(&spec, plaintext.expose_secret())?;
     let mut outbound = build_outbound_headers(&parts.headers, &header_name);
     outbound.insert(header_name, header_value);
@@ -467,6 +520,7 @@ async fn handle_inner(
         outbound,
         slot,
         deadline,
+        committed,
     )
     .await
 }
@@ -487,6 +541,8 @@ async fn forward(
     outbound_headers: HeaderMap,
     slot: crate::state::SlotGuard,
     deadline: tokio::time::Instant,
+    // Fired once upstream has responded, to disarm the outer deadline race.
+    committed: tokio::sync::oneshot::Sender<()>,
 ) -> Result<Response, ApiFailure> {
     let url = outbound_url(&origin.to_display(), canonical_path, parts.uri.query())
         .map_err(|e| ApiFailure::Internal(anyhow::anyhow!("origin parse: {e}")))?;
@@ -513,32 +569,45 @@ async fn forward(
 
     let status = upstream.status();
 
+    // Upstream has responded, so whatever side effect it had has committed:
+    // release the caller's response from the stream deadline (see `handle`).
+    // Nothing below may turn that committed response into an error status.
+    let _ = committed.send(());
+
     // proxy-completed audit row: method/origin/path/status, never bodies.
-    // The upstream side effect has already committed, so an audit-insert
-    // failure here must NOT become a 500: the caller would retry and
-    // duplicate the side effect (or find a finite-use grant already burned).
-    // The design allows an attempt row without a completion row after a
-    // mid-release failure; log loudly and return the upstream response.
-    if let Err(e) = insert_audit(
-        &state.db,
-        &AuditEvent {
-            kind: kinds::PROXY_COMPLETED,
-            request_id: Some(grant.request_id),
-            grant_id: Some(grant.id),
-            client_name: Some(grant.client_name.clone()),
-            secret_name: Some(grant.secret_name.clone()),
-            secret_version_id: Some(secret_version_id),
-            method: Some(method.to_owned()),
-            origin: Some(origin.to_display()),
-            path: Some(audited_path.to_owned()),
-            status: Some(status.as_u16() as i32),
-            ..Default::default()
-        },
+    // Neither a failing nor a slow insert may become a 500 or a 504 here: the
+    // caller would retry and duplicate the side effect (or find a finite-use
+    // grant already burned). The design allows an attempt row without a
+    // completion row after a mid-release failure; log loudly either way and
+    // return the upstream response.
+    let audited = tokio::time::timeout(
+        COMPLETION_AUDIT_TIMEOUT,
+        insert_audit(
+            &state.db,
+            &AuditEvent {
+                kind: kinds::PROXY_COMPLETED,
+                request_id: Some(grant.request_id),
+                grant_id: Some(grant.id),
+                client_name: Some(grant.client_name.clone()),
+                secret_name: Some(grant.secret_name.clone()),
+                secret_version_id: Some(secret_version_id),
+                method: Some(method.to_owned()),
+                origin: Some(origin.to_display()),
+                path: Some(audited_path.to_owned()),
+                status: Some(status.as_u16() as i32),
+                ..Default::default()
+            },
+        ),
     )
-    .await
-    {
+    .await;
+    let audit_error: Option<String> = match audited {
+        Ok(Ok(())) => None,
+        Ok(Err(e)) => Some(e.to_string()),
+        Err(_) => Some(format!("timed out after {COMPLETION_AUDIT_TIMEOUT:?}")),
+    };
+    if let Some(error) = audit_error {
         tracing::error!(
-            error = %e,
+            error = %error,
             grant_id = %grant.id,
             client_name = %grant.client_name,
             "proxy-completed audit insert failed; returning upstream response \
@@ -639,6 +708,8 @@ mod tests {
             ("TE", "trailers"),
             ("Trailer", "X-Checksum"),
             ("Proxy-Connection", "keep-alive"),
+            ("Proxy-Authenticate", "Basic realm=\"upstream-proxy\""),
+            ("Proxy-Authorization", "Basic dXA6cHc="),
             ("X-Upstream-Internal", "secret-routing"),
             ("Set-Cookie", "upstream=state"),
             ("Content-Type", "text/plain"),
@@ -652,6 +723,10 @@ mod tests {
         assert!(out.get("te").is_none());
         assert!(out.get("trailer").is_none());
         assert!(out.get("proxy-connection").is_none());
+        // A 407 challenge addresses the upstream's own proxy hop, not our
+        // caller: it must not be forwarded.
+        assert!(out.get("proxy-authenticate").is_none());
+        assert!(out.get("proxy-authorization").is_none());
         // Named in upstream Connection value.
         assert!(out.get("x-upstream-internal").is_none());
         // Upstream Set-Cookie passes through (upstream state for the client).
@@ -659,6 +734,59 @@ mod tests {
         assert_eq!(out.get("content-type").unwrap(), "text/plain");
         // The handler later overrides cache-control; passthrough here is fine.
         assert_eq!(out.get("cache-control").unwrap(), "public, max-age=3600");
+    }
+
+    /// The RFC hop-by-hop set, which the response filter must cover whole
+    /// (DESIGN §4 / IMPLEMENTATION #4: "strips hop-by-hop headers likewise").
+    #[test]
+    fn response_strip_covers_the_whole_hop_by_hop_set() {
+        for h in [
+            "connection",
+            "keep-alive",
+            "proxy-authenticate",
+            "proxy-authorization",
+            "proxy-connection",
+            "te",
+            "trailer",
+            "transfer-encoding",
+            "upgrade",
+        ] {
+            assert!(RESPONSE_STRIP.contains(&h), "response strip missing {h}");
+        }
+    }
+
+    /// Once the upstream exchange has produced a response, the stream deadline
+    /// no longer applies: post-upstream work (the completion-audit insert) must
+    /// not be able to turn a committed upstream response into a 504.
+    #[tokio::test]
+    async fn deadline_is_disarmed_once_upstream_has_responded() {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(50);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let inner = async move {
+            let _ = tx.send(());
+            // Stands in for a slow completion-audit insert.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            Ok(Response::new(Body::empty()))
+        };
+        let out = run_before_deadline(inner, rx, deadline).await;
+        assert!(out.is_ok(), "committed response must survive the deadline");
+    }
+
+    /// Without that signal — an early return, or an upstream exchange that
+    /// never produced a response — the deadline still bites.
+    #[tokio::test]
+    async fn deadline_still_applies_before_upstream_responds() {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(50);
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let inner = async move {
+            // Sender dropped without a send, as an early `?` return would.
+            drop(tx);
+            std::future::pending::<Result<Response, ApiFailure>>().await
+        };
+        assert!(matches!(
+            run_before_deadline(inner, rx, deadline).await,
+            Err(ApiFailure::UpstreamTimeout)
+        ));
     }
 
     #[test]

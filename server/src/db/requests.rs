@@ -34,16 +34,16 @@ pub struct AccessRequestRow {
 
 /// Insert parameters for a new access request. `idem_mac` is the keyed MAC of
 /// the normalized payload (computed by the caller with the keyset MAC key).
+///
+/// The encrypted client context is NOT part of this struct: it is sealed by a
+/// [`super::SealFn`] the insert runs inside its own transaction, under the KEK
+/// shared lock (addendum #19).
 #[derive(Debug, Clone)]
 pub struct NewAccessRequest {
     pub client_name: String,
     pub secret_name: String,
     pub mechanism: String,
     pub constraints: serde_json::Value,
-    pub context_ciphertext: Option<Vec<u8>>,
-    pub context_nonce: Option<Vec<u8>>,
-    pub context_wrapped_dek: Option<Vec<u8>>,
-    pub context_kek_id: Option<String>,
     pub expires_at: DateTime<Utc>,
     /// Cap inherited from the matching standing policy row (see
     /// [`AccessRequestRow::policy_not_after`]).
@@ -63,16 +63,23 @@ pub struct InsertedRequest {
 }
 
 /// Idempotent insert: `ON CONFLICT (idem_client, idem_key) DO NOTHING`, then
-/// select the surviving row. Rows storing a wrapped context DEK take the KEK
-/// shared advisory lock for the insert transaction (addendum #19).
+/// select the surviving row. `seal_context` is `Some` when the client sent a
+/// context to store: the transaction takes the KEK shared advisory lock and
+/// only then seals (addendum #19), so the KEK the seal picks cannot be retired
+/// before this row commits.
 pub async fn insert_access_request(
     db: &PgPool,
     req: &NewAccessRequest,
+    seal_context: Option<super::SealFn<'_>>,
 ) -> anyhow::Result<InsertedRequest> {
     let mut tx = db.begin().await?;
-    if req.context_wrapped_dek.is_some() {
-        super::take_kek_shared_lock(&mut tx).await?;
-    }
+    let context = match seal_context {
+        Some(seal) => {
+            super::take_kek_shared_lock(&mut tx).await?;
+            Some(seal().map_err(|e| anyhow::anyhow!("sealing request context: {e}"))?)
+        }
+        None => None,
+    };
     let inserted = sqlx::query_as::<_, AccessRequestRow>(
         "INSERT INTO access_requests \
          (client_name, secret_name, mechanism, constraints, \
@@ -86,10 +93,10 @@ pub async fn insert_access_request(
     .bind(&req.secret_name)
     .bind(&req.mechanism)
     .bind(&req.constraints)
-    .bind(&req.context_ciphertext)
-    .bind(&req.context_nonce)
-    .bind(&req.context_wrapped_dek)
-    .bind(&req.context_kek_id)
+    .bind(context.as_ref().map(|s| s.ciphertext.as_slice()))
+    .bind(context.as_ref().map(|s| s.nonce.as_slice()))
+    .bind(context.as_ref().map(|s| s.wrapped_dek.as_slice()))
+    .bind(context.as_ref().map(|s| s.kek_id.as_str()))
     .bind(req.expires_at)
     .bind(req.policy_not_after)
     .bind(&req.idem_client)
@@ -330,6 +337,9 @@ pub async fn mark_push_delivered(db: &PgPool, request_id: Uuid) -> anyhow::Resul
     Ok(())
 }
 
+/// Unconditional counter bump. Both push paths use
+/// `notify::claim_for_push` instead: it bumps the counter only while the row
+/// is still pushable, which is also the permission to send.
 pub async fn increment_push_attempts(db: &PgPool, request_id: Uuid) -> anyhow::Result<()> {
     sqlx::query("UPDATE access_requests SET push_attempts = push_attempts + 1 WHERE id = $1")
         .bind(request_id)

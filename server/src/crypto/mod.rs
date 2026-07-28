@@ -641,6 +641,9 @@ mod tests {
         // Active key missing from the map.
         assert!(load_from_str(&keyset_json("k1", &[("k0", &[1u8; 32])], &[9u8; 32])).is_err());
 
+        // No keys at all: nothing could ever be sealed or opened.
+        assert!(load_from_str(&keyset_json("k0", &[], &[9u8; 32])).is_err());
+
         // Valid input loads.
         let ks = load_from_str(&keyset_json("k0", &[("k0", &[1u8; 32])], &[9u8; 32])).unwrap();
         assert_eq!(ks.active_kek_id(), "k0");

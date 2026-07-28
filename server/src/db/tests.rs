@@ -88,10 +88,6 @@ fn new_request(client: &str, idem_key: &str, mac: &[u8]) -> NewAccessRequest {
         secret_name: "example-api-token".into(),
         mechanism: "cli-read".into(),
         constraints: serde_json::json!({ "ttl_seconds": 600, "max_uses": 1 }),
-        context_ciphertext: None,
-        context_nonce: None,
-        context_wrapped_dek: None,
-        context_kek_id: None,
         expires_at: Utc::now() + Duration::hours(1),
         policy_not_after: None,
         idem_client: client.to_owned(),
@@ -307,24 +303,28 @@ async fn insert_access_request_idempotency() -> anyhow::Result<()> {
     let Some(t) = setup().await? else {
         return Ok(());
     };
-    let first = insert_access_request(&t.pool, &new_request("fa", "key-1", b"mac-one")).await?;
+    let first =
+        insert_access_request(&t.pool, &new_request("fa", "key-1", b"mac-one"), None).await?;
     assert!(first.created);
 
     // Same key + same payload MAC: same row, not created.
-    let retry = insert_access_request(&t.pool, &new_request("fa", "key-1", b"mac-one")).await?;
+    let retry =
+        insert_access_request(&t.pool, &new_request("fa", "key-1", b"mac-one"), None).await?;
     assert!(!retry.created);
     assert_eq!(retry.row.id, first.row.id);
     assert_eq!(retry.row.idem_mac, first.row.idem_mac);
 
     // Same key + DIFFERENT payload: original row returned; caller sees the
     // MAC mismatch and answers 409.
-    let conflict = insert_access_request(&t.pool, &new_request("fa", "key-1", b"mac-two")).await?;
+    let conflict =
+        insert_access_request(&t.pool, &new_request("fa", "key-1", b"mac-two"), None).await?;
     assert!(!conflict.created);
     assert_eq!(conflict.row.id, first.row.id);
     assert_eq!(conflict.row.idem_mac, b"mac-one".to_vec());
 
     // Same key, different client: independent request.
-    let other = insert_access_request(&t.pool, &new_request("other", "key-1", b"mac-one")).await?;
+    let other =
+        insert_access_request(&t.pool, &new_request("other", "key-1", b"mac-one"), None).await?;
     assert!(other.created);
     assert_ne!(other.row.id, first.row.id);
     t.teardown().await;
@@ -336,7 +336,7 @@ async fn begin_grant_use_single_use_semantics() -> anyhow::Result<()> {
     let Some(t) = setup().await? else {
         return Ok(());
     };
-    let req = insert_access_request(&t.pool, &new_request("fa", "grant-key", b"mac")).await?;
+    let req = insert_access_request(&t.pool, &new_request("fa", "grant-key", b"mac"), None).await?;
     let grant_id = resolve_approve(
         &t.pool,
         req.row.id,

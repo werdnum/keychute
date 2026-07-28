@@ -57,30 +57,40 @@ pub enum InsertOutcome {
 /// [`super::requests::insert_access_request`].
 ///
 /// One transaction: KEK shared advisory lock (when a wrapped DEK is stored,
-/// addendum #19), the insert, the pending-cap check (`pending_cap`, applied
-/// only to newly created rows so idempotent retries always succeed), the
-/// `request-created` audit row, and — when policy already decided the outcome
-/// (`resolution`) — the deny/approve transition, the grant, and the
-/// corresponding resolution audit row. Creation and resolution therefore
-/// commit together: an `Existing` row always carries the decided state.
+/// addendum #19), the context seal, the insert, the pending-cap check
+/// (`pending_cap`, applied only to newly created rows so idempotent retries
+/// always succeed), the `request-created` audit row, and — when policy already
+/// decided the outcome (`resolution`) — the deny/approve transition, the
+/// grant, and the corresponding resolution audit row. Creation and resolution
+/// therefore commit together: an `Existing` row always carries the decided
+/// state.
+///
+/// `seal_context` (`Some` when the client sent a context) runs INSIDE this
+/// transaction, after the lock: see [`super::SealFn`].
 pub async fn insert_access_request_with_id(
     db: &PgPool,
     id: Uuid,
     req: &NewAccessRequest,
     pending_cap: Option<i64>,
     resolution: &InitialResolution<'_>,
+    seal_context: Option<super::SealFn<'_>>,
 ) -> anyhow::Result<InsertOutcome> {
     let mut tx = db.begin().await?;
     // Same pattern as `ui_ext::approve_request`: the lock must cover EVERY
     // wrapped-DEK insert in this transaction — the sealed request context AND
     // an auto-approve grant's passthrough payload (currently always None from
     // the API path, but the store layer must not depend on that).
-    let inserts_wrapped_dek = req.context_wrapped_dek.is_some()
+    let inserts_wrapped_dek = seal_context.is_some()
         || matches!(resolution,
             InitialResolution::Approved { grant, .. } if grant.passthrough.is_some());
     if inserts_wrapped_dek {
         super::take_kek_shared_lock(&mut tx).await?;
     }
+    // Sealed under the lock, never before it.
+    let context = match seal_context {
+        Some(seal) => Some(seal().map_err(|e| anyhow::anyhow!("sealing request context: {e}"))?),
+        None => None,
+    };
     if pending_cap.is_some() {
         // Serialize per-client creation so concurrent inserts cannot each see
         // only themselves under READ COMMITTED and collectively exceed the cap.
@@ -103,10 +113,10 @@ pub async fn insert_access_request_with_id(
     .bind(&req.secret_name)
     .bind(&req.mechanism)
     .bind(&req.constraints)
-    .bind(&req.context_ciphertext)
-    .bind(&req.context_nonce)
-    .bind(&req.context_wrapped_dek)
-    .bind(&req.context_kek_id)
+    .bind(context.as_ref().map(|s| s.ciphertext.as_slice()))
+    .bind(context.as_ref().map(|s| s.nonce.as_slice()))
+    .bind(context.as_ref().map(|s| s.wrapped_dek.as_slice()))
+    .bind(context.as_ref().map(|s| s.kek_id.as_str()))
     .bind(req.expires_at)
     .bind(req.policy_not_after)
     .bind(&req.idem_client)

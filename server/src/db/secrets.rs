@@ -53,18 +53,19 @@ pub async fn create_secret(
 }
 
 /// Append a new secret version: atomically bumps `secrets.current_version`
-/// and inserts the version row with that number in one transaction.
+/// and inserts the version row with that number in one transaction. `seal`
+/// receives the new version number (its AAD binds it) and runs inside the
+/// transaction, after the KEK shared lock — same discipline as
+/// [`crate::db::ui_ext::rotate_secret_version`].
 pub async fn insert_secret_version(
     db: &PgPool,
     secret_id: Uuid,
-    ciphertext: &[u8],
-    nonce: &[u8],
-    wrapped_dek: &[u8],
-    kek_id: &str,
+    seal: impl FnOnce(i32) -> Result<crate::crypto::Sealed, crate::crypto::CryptoError>,
     created_by_request: Option<Uuid>,
 ) -> anyhow::Result<SecretVersionRow> {
     let mut tx = db.begin().await?;
-    // Addendum #19: every wrapped-DEK writer holds the shared KEK lock.
+    // Addendum #19: every wrapped-DEK writer holds the shared KEK lock, and
+    // seals only once it does.
     super::take_kek_shared_lock(&mut tx).await?;
     let version: i32 = sqlx::query_scalar(
         "UPDATE secrets SET current_version = current_version + 1, updated_at = now() \
@@ -74,6 +75,7 @@ pub async fn insert_secret_version(
     .fetch_optional(&mut *tx)
     .await?
     .ok_or_else(|| anyhow::anyhow!("secret not found"))?;
+    let sealed = seal(version).map_err(|e| anyhow::anyhow!("sealing secret version: {e}"))?;
     let row = sqlx::query_as::<_, SecretVersionRow>(
         "INSERT INTO secret_versions \
          (secret_id, version, ciphertext, nonce, wrapped_dek, kek_id, created_by_request) \
@@ -81,10 +83,10 @@ pub async fn insert_secret_version(
     )
     .bind(secret_id)
     .bind(version)
-    .bind(ciphertext)
-    .bind(nonce)
-    .bind(wrapped_dek)
-    .bind(kek_id)
+    .bind(&sealed.ciphertext)
+    .bind(&sealed.nonce)
+    .bind(&sealed.wrapped_dek)
+    .bind(&sealed.kek_id)
     .bind(created_by_request)
     .fetch_one(&mut *tx)
     .await?;

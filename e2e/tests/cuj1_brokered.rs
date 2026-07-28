@@ -245,3 +245,92 @@ async fn brokered_grant_is_owner_scoped() {
     assert_eq!(resp.status(), 404);
     assert!(env.upstream_requests.lock().unwrap().is_empty());
 }
+
+/// A `basic` secret with no username source is unusable: the proxy fails
+/// closed with `bad-credential-encoding` without ever contacting upstream, so
+/// — like the 413 body cap — it must not burn a use of a finite-`max_uses`
+/// grant. (The username is nulled directly: the UI create path requires one,
+/// so only a legacy row can reach this state.)
+#[tokio::test(flavor = "multi_thread")]
+async fn unusable_basic_credential_does_not_burn_a_grant_use() {
+    let env = TestEnv::spawn(SpawnOpts::default()).await.unwrap();
+    env.seed_secret("basic-api-token", "p4ss", "brokered", "basic", "svc")
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE secrets SET injection_username = NULL, injection_header = NULL WHERE name = $1",
+    )
+    .bind("basic-api-token")
+    .execute(&env.db)
+    .await
+    .unwrap();
+
+    let mut req = brokered_request(
+        "cuj1-basic",
+        "basic-api-token",
+        "localhost",
+        env.upstream_port,
+        &["GET"],
+        &["/v1"],
+        600,
+    );
+    req["constraints"]["max_uses"] = serde_json::json!(1);
+    let (status, body) = env.fa().create_request(req).await.unwrap();
+    assert_eq!(status, 201, "{body}");
+    let request_id = body["request_id"].as_str().unwrap().to_owned();
+    env.approve(&request_id, &[]).await.unwrap();
+    let st: serde_json::Value = env
+        .fa()
+        .get(&format!("/v1/access-requests/{request_id}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let grant_id = st["grant_id"].as_str().unwrap().to_owned();
+
+    let resp = env
+        .fa()
+        .get(&format!("/v1/grants/{grant_id}/proxy/v1/echo"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 502);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "bad-credential-encoding");
+    assert!(env.upstream_requests.lock().unwrap().is_empty());
+    // Nothing was accounted: no write-ahead attempt row either.
+    let rid: uuid::Uuid = request_id.parse().unwrap();
+    let kinds = env.audit_kinds_for_request(rid).await;
+    assert!(
+        !kinds.iter().any(|k| k == "proxy-attempt"),
+        "unusable credential must not write an attempt row: {kinds:?}"
+    );
+
+    // Repair the row: the single use is still there to spend.
+    sqlx::query("UPDATE secrets SET injection_username = $2 WHERE name = $1")
+        .bind("basic-api-token")
+        .bind("svc")
+        .execute(&env.db)
+        .await
+        .unwrap();
+    let resp = env
+        .fa()
+        .get(&format!("/v1/grants/{grant_id}/proxy/v1/echo"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "the grant's one use was never burned");
+    let recs = env.upstream_requests.lock().unwrap().clone();
+    assert_eq!(recs.len(), 1);
+    assert_eq!(
+        recs[0].header("authorization"),
+        Some(format!("Basic {}", base64_std("svc:p4ss")).as_str())
+    );
+}
+
+fn base64_std(s: &str) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(s)
+}

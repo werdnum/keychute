@@ -10,13 +10,13 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::db::take_kek_shared_lock;
+use crate::db::{take_kek_shared_lock, SealFn};
 
 /// Secret created at approval time ("store this secret in Keychute",
-/// addendum #16). `secret_id` is app-generated so the payload can be sealed
-/// with its `SecretVersion { secret_id, version: 1 }` AAD before the
-/// transaction opens.
-pub struct StoreSecretParams {
+/// addendum #16). `secret_id` is app-generated so the payload's
+/// `SecretVersion { secret_id, version: 1 }` AAD is known before the
+/// transaction opens — the sealing itself happens inside it.
+pub struct StoreSecretParams<'a> {
     pub secret_id: Uuid,
     pub name: String,
     pub description: String,
@@ -28,8 +28,10 @@ pub struct StoreSecretParams {
     /// Username for 'basic' (migration 0003); NULL otherwise. The proxy also
     /// falls back to `injection_header` for pre-0003 'basic' rows.
     pub injection_username: Option<String>,
-    /// Sealed under the durable keyset with AAD SecretVersion{secret_id, 1}.
-    pub sealed: Sealed,
+    /// Seals the value under the durable keyset with AAD
+    /// SecretVersion{secret_id, 1}. Called inside the writing transaction,
+    /// under the KEK shared lock ([`crate::db::SealFn`]).
+    pub seal: SealFn<'a>,
 }
 
 /// Approve a pending request with an app-supplied grant id (required for
@@ -37,15 +39,16 @@ pub struct StoreSecretParams {
 ///
 /// One transaction: flip `pending -> approved` (rowcount-checked, incl.
 /// `now() < expires_at` per addendum #8), optionally create the secret +
-/// version 1 (addendum #16), insert the grant, audit. Returns `None` — with
-/// nothing written — when the request was not approvable.
+/// version 1 (addendum #16, sealed here under the KEK shared lock), insert the
+/// grant, audit. Returns `None` — with nothing written — when the request was
+/// not approvable.
 pub async fn approve_request(
     db: &PgPool,
     request_id: Uuid,
     resolved_by: &str,
     grant_id: Uuid,
     grant: &GrantParams,
-    store: Option<&StoreSecretParams>,
+    store: Option<StoreSecretParams<'_>>,
 ) -> anyhow::Result<Option<Uuid>> {
     let mut tx = db.begin().await?;
     if store.is_some() || grant.passthrough.is_some() {
@@ -65,6 +68,10 @@ pub async fn approve_request(
     }
 
     if let Some(s) = store {
+        // Sealed here, not by the caller: the KEK shared lock is already held,
+        // so the key this picks cannot be retired before the version row
+        // commits (addendum #19).
+        let sealed = (s.seal)().map_err(|e| anyhow::anyhow!("sealing secret: {e}"))?;
         sqlx::query(
             "INSERT INTO secrets \
              (id, name, description, max_tier, injection_kind, injection_header, \
@@ -86,10 +93,10 @@ pub async fn approve_request(
              VALUES ($1, 1, $2, $3, $4, $5, $6)",
         )
         .bind(s.secret_id)
-        .bind(&s.sealed.ciphertext)
-        .bind(&s.sealed.nonce)
-        .bind(&s.sealed.wrapped_dek)
-        .bind(&s.sealed.kek_id)
+        .bind(&sealed.ciphertext)
+        .bind(&sealed.nonce)
+        .bind(&sealed.wrapped_dek)
+        .bind(&sealed.kek_id)
         .bind(request_id)
         .execute(&mut *tx)
         .await?;
@@ -153,14 +160,16 @@ pub async fn approve_request(
 }
 
 /// Create a secret with its version 1 from the admin UI (`POST /ui/secrets`),
-/// with the `secret-created` audit row in the same transaction.
+/// with the `secret-created` audit row in the same transaction. The payload is
+/// sealed inside that transaction, under the KEK shared lock (addendum #19).
 pub async fn create_secret_with_version(
     db: &PgPool,
-    store: &StoreSecretParams,
+    store: StoreSecretParams<'_>,
     actor: &str,
 ) -> anyhow::Result<()> {
     let mut tx = db.begin().await?;
     take_kek_shared_lock(&mut tx).await?;
+    let sealed = (store.seal)().map_err(|e| anyhow::anyhow!("sealing secret: {e}"))?;
     sqlx::query(
         "INSERT INTO secrets \
          (id, name, description, max_tier, injection_kind, injection_header, \
@@ -182,10 +191,10 @@ pub async fn create_secret_with_version(
          VALUES ($1, 1, $2, $3, $4, $5)",
     )
     .bind(store.secret_id)
-    .bind(&store.sealed.ciphertext)
-    .bind(&store.sealed.nonce)
-    .bind(&store.sealed.wrapped_dek)
-    .bind(&store.sealed.kek_id)
+    .bind(&sealed.ciphertext)
+    .bind(&sealed.nonce)
+    .bind(&sealed.wrapped_dek)
+    .bind(&sealed.kek_id)
     .execute(&mut *tx)
     .await?;
     insert_audit(
@@ -385,17 +394,13 @@ mod tests {
             secret_name: secret_name.into(),
             mechanism: "cli-read".into(),
             constraints: serde_json::json!({"ttl_seconds": 600}),
-            context_ciphertext: None,
-            context_nonce: None,
-            context_wrapped_dek: None,
-            context_kek_id: None,
             expires_at,
             policy_not_after: None,
             idem_client: "test-client".into(),
             idem_key: idem.into(),
             idem_mac: vec![0u8; 32],
         };
-        Ok(crate::db::requests::insert_access_request(db, &req)
+        Ok(crate::db::requests::insert_access_request(db, &req, None)
             .await?
             .row)
     }
@@ -424,15 +429,6 @@ mod tests {
         // Store path: approval creates the secret + version 1 + grant.
         let row = insert_pending(db, "s1", "k1", Utc::now() + Duration::seconds(600)).await?;
         let secret_id = Uuid::new_v4();
-        let sealed = keyset
-            .seal(
-                &SecretBox::new(b"hunter2".as_slice().into()),
-                AadContext::SecretVersion {
-                    secret_id,
-                    version: 1,
-                },
-            )
-            .unwrap();
         let store = StoreSecretParams {
             secret_id,
             name: "s1".into(),
@@ -441,7 +437,15 @@ mod tests {
             injection_kind: "bearer".into(),
             injection_header: None,
             injection_username: None,
-            sealed,
+            seal: Box::new(|| {
+                keyset.seal(
+                    &SecretBox::new(b"hunter2".as_slice().into()),
+                    AadContext::SecretVersion {
+                        secret_id,
+                        version: 1,
+                    },
+                )
+            }),
         };
         let grant_id = Uuid::new_v4();
         let got = approve_request(
@@ -450,7 +454,7 @@ mod tests {
             "andrew",
             grant_id,
             &grant_params(None),
-            Some(&store),
+            Some(store),
         )
         .await?;
         assert_eq!(got, Some(grant_id));
@@ -597,6 +601,39 @@ mod tests {
         assert_eq!(rows[0].0, "new");
         assert!(rows[0].1.is_some());
 
+        // The property the tombstone exists for: the unpinned key is still
+        // burned as far as `begin_grant_use` is concerned — never a fresh use.
+        let burned = crate::db::begin_grant_use(
+            db,
+            g_live,
+            Some("old"),
+            None,
+            kinds::RELEASE_ATTEMPT,
+            60,
+            None,
+        )
+        .await?;
+        assert!(
+            matches!(burned, crate::db::GrantUse::Exhausted),
+            "unpinned tombstone must stay exhausted, got {burned:?}"
+        );
+        // ...and that verdict came from the key, not from a spent grant: an
+        // unseen key on the same grant is still a first use.
+        let fresh = crate::db::begin_grant_use(
+            db,
+            g_live,
+            Some("fresh"),
+            None,
+            kinds::RELEASE_ATTEMPT,
+            60,
+            None,
+        )
+        .await?;
+        assert!(
+            matches!(fresh, crate::db::GrantUse::FirstUse { .. }),
+            "grant should still have its use left, got {fresh:?}"
+        );
+
         t.teardown().await;
         Ok(())
     }
@@ -610,18 +647,9 @@ mod tests {
         let keyset = test_keyset();
 
         let secret_id = Uuid::new_v4();
-        let sealed = keyset
-            .seal(
-                &SecretBox::new(b"v1".as_slice().into()),
-                AadContext::SecretVersion {
-                    secret_id,
-                    version: 1,
-                },
-            )
-            .unwrap();
         create_secret_with_version(
             db,
-            &StoreSecretParams {
+            StoreSecretParams {
                 secret_id,
                 name: "rot".into(),
                 description: String::new(),
@@ -629,7 +657,15 @@ mod tests {
                 injection_kind: "header".into(),
                 injection_header: Some("X-Api-Key".into()),
                 injection_username: None,
-                sealed,
+                seal: Box::new(|| {
+                    keyset.seal(
+                        &SecretBox::new(b"v1".as_slice().into()),
+                        AadContext::SecretVersion {
+                            secret_id,
+                            version: 1,
+                        },
+                    )
+                }),
             },
             "andrew",
         )
@@ -667,6 +703,73 @@ mod tests {
                 .fetch_all(db)
                 .await?;
         assert_eq!(kinds, vec!["secret-created", "secret-rotated"]);
+
+        t.teardown().await;
+        Ok(())
+    }
+
+    /// Addendum #19 ordering: a writer must not read the active KEK (seal)
+    /// until it holds the shared advisory lock. With the exclusive side held —
+    /// what `db::verify_no_references` does while it proves a KEK is
+    /// unreferenced — the writer must still be parked, having sealed nothing.
+    #[tokio::test]
+    async fn sealing_waits_for_the_kek_advisory_lock() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let Some(t) = setup().await? else {
+            return Ok(());
+        };
+        let db = &t.pool;
+
+        // Stand-in for the retirement path: hold the exclusive lock.
+        let mut retiring = db.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext('keychute-kek'))")
+            .execute(&mut *retiring)
+            .await?;
+
+        let sealed = Arc::new(AtomicBool::new(false));
+        let flag = sealed.clone();
+        let pool = db.clone();
+        let keyset = test_keyset();
+        let secret_id = Uuid::new_v4();
+        let writer = tokio::spawn(async move {
+            create_secret_with_version(
+                &pool,
+                StoreSecretParams {
+                    secret_id,
+                    name: "locked".into(),
+                    description: String::new(),
+                    max_tier: 0,
+                    injection_kind: "bearer".into(),
+                    injection_header: None,
+                    injection_username: None,
+                    seal: Box::new(move || {
+                        flag.store(true, Ordering::SeqCst);
+                        keyset.seal(
+                            &SecretBox::new(b"v1".as_slice().into()),
+                            AadContext::SecretVersion {
+                                secret_id,
+                                version: 1,
+                            },
+                        )
+                    }),
+                },
+                "andrew",
+            )
+            .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !sealed.load(Ordering::SeqCst),
+            "sealed before taking the KEK shared lock"
+        );
+        // Retirement finishes; the writer proceeds and seals under the lock.
+        retiring.rollback().await?;
+        writer.await??;
+        assert!(sealed.load(Ordering::SeqCst));
+        assert!(crate::db::get_secret_by_name(db, "locked").await?.is_some());
 
         t.teardown().await;
         Ok(())

@@ -334,30 +334,24 @@ pub async fn create(
 
     // App-generated id so the encrypted context is AAD-bound to the row.
     let request_id = Uuid::new_v4();
-    let sealed_context = if req.context.reason.is_empty() && req.context.structured.is_none() {
-        None
-    } else {
-        let plaintext: SecretBytes = SecretBytes::new(
-            serde_json::to_vec(&req.context)
-                .map_err(|_| ApiFailure::InvalidRequest("invalid context"))?
-                .into_boxed_slice(),
-        );
-        Some(
-            state
-                .keyset
-                .seal(&plaintext, AadContext::RequestContext { request_id })
-                .map_err(|e| ApiFailure::Internal(e.into()))?,
-        )
-    };
-    let (ctx_ct, ctx_nonce, ctx_dek, ctx_kek) = match sealed_context {
-        Some(s) => (
-            Some(s.ciphertext),
-            Some(s.nonce),
-            Some(s.wrapped_dek),
-            Some(s.kek_id),
-        ),
-        None => (None, None, None, None),
-    };
+    let context_plaintext: Option<SecretBytes> =
+        if req.context.reason.is_empty() && req.context.structured.is_none() {
+            None
+        } else {
+            Some(SecretBytes::new(
+                serde_json::to_vec(&req.context)
+                    .map_err(|_| ApiFailure::InvalidRequest("invalid context"))?
+                    .into_boxed_slice(),
+            ))
+        };
+    // Addendum #19: sealing happens INSIDE the insert transaction, once it
+    // holds the KEK shared lock. Sealing here would let the KEK this picked be
+    // retired (its zero-reference check passing in the gap) before the row
+    // referencing it commits.
+    let keyset = &state.keyset;
+    let seal_context = context_plaintext.map(|plaintext| -> db::SealFn<'_> {
+        Box::new(move || keyset.seal(&plaintext, AadContext::RequestContext { request_id }))
+    });
 
     let now = Utc::now();
     let expires_at = now + Duration::seconds(state.config.limits.request_expiry_seconds);
@@ -367,10 +361,6 @@ pub async fn create(
         mechanism: req.mechanism.as_str().to_owned(),
         constraints: serde_json::to_value(&constraints)
             .map_err(|e| ApiFailure::Internal(e.into()))?,
-        context_ciphertext: ctx_ct,
-        context_nonce: ctx_nonce,
-        context_wrapped_dek: ctx_dek,
-        context_kek_id: ctx_kek,
         expires_at,
         // Cap inherited from the matching standing policy row: the auto-approve
         // path applies it below, and a later human approval reads it off the row.
@@ -437,6 +427,7 @@ pub async fn create(
         &new_row,
         pending_cap,
         &resolution,
+        seal_context,
     )
     .await?
     {
@@ -513,6 +504,18 @@ pub async fn create(
                 .await?;
                 if deduped {
                     db::mark_push_delivered(&state.db, row.id).await?;
+                } else if !crate::notify::claim_for_push(&state.db, row.id).await? {
+                    // Same conditional claim the sweeper's retry uses: the row
+                    // committed pending, but the operator may have approved,
+                    // denied or let it expire while this push was prepared
+                    // (dedup query, notifier lock). Sending now would be an
+                    // "approval needed" prompt for an already-decided request.
+                    // The claim also bumps `push_attempts`, so the failure
+                    // branches below no longer do.
+                    tracing::info!(
+                        request_id = %row.id,
+                        "request resolved before its approval push; not sending"
+                    );
                 } else {
                     let n = approval_notification(
                         &state,
@@ -536,7 +539,6 @@ pub async fn create(
                         Ok(Ok(())) => db::mark_push_delivered(&state.db, row.id).await?,
                         Ok(Err(e)) => {
                             tracing::warn!(error = %e, "approval push failed; sweeper will retry");
-                            db::increment_push_attempts(&state.db, row.id).await?;
                         }
                         Err(_) => {
                             tracing::warn!(
@@ -544,7 +546,6 @@ pub async fn create(
                                 timeout_seconds = crate::notify::PUSH_SEND_TIMEOUT.as_secs(),
                                 "approval push timed out; sweeper will retry"
                             );
-                            db::increment_push_attempts(&state.db, row.id).await?;
                         }
                     }
                 }
