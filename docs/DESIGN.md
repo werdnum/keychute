@@ -1,0 +1,407 @@
+# Keychute — Design & Project Plan
+
+**Status:** Draft for review — not yet approved, no implementation started.
+
+Keychute is a secrets store and *delivery broker* for AI agents. It holds credentials
+encrypted in Postgres and releases them — or the *use* of them — to agent-adjacent
+clients under an explicit, operator-visible risk model, with human approval in the
+loop by default (Pushover push → web approval UI).
+
+It runs as a Rust service in the K3s cluster managed by `werdnum/kube-config`, and
+integrates with `werdnum/family-assistant` and the in-cluster `k8s-agent`.
+
+---
+
+## 1. Positioning: why not Infisical / 1Password CLI / Vault
+
+Existing secret managers and the newer "secrets for agents" products enforce a single
+posture: the secret never leaves the backend (header-injection proxies), or the secret
+is handed to whoever authenticates (env injection, CLI read). Neither matches how
+agents actually operate.
+
+Keychute's core idea is **graduated disclosure**: secret handling is *not* limited to
+the backend. The service may keep the credential server-side and broker its use, or
+release it to cooperating deterministic client code, or — rarely, deliberately — hand
+it to an agent directly. None of these is perfectly safe; the point is that **the
+security level of every path is explicit, chosen per-secret and per-client by the
+operator, and shown to the human at approval time**. The operator makes the risk
+assessment, not the tool.
+
+### Delivery tiers
+
+| Tier | Name | Secret visible to | Typical use |
+|------|------|-------------------|-------------|
+| 0 | `brokered` | Keychute only — client gets a proxy endpoint that attaches the credential | Powerful API tokens; the standard "attach this header" flow |
+| 1 | `trusted-client` | Deterministic client code the agent **cannot** subvert (e.g. family-assistant backend code doing secure autofill) | Website passwords via agentic autofill |
+| 2 | `cooperating-client` | Deterministic client code the agent **could** subvert (same container, e.g. `keychute` CLI piping to `kubeseal` inside k8s-agent) | Dropping an API key into a SealedSecret without pasting it through an LLM transcript |
+| 3 | `direct` | The agent itself (and therefore its LLM provider's logs) | Low-sensitivity secrets where convenience wins |
+
+Every secret has a **maximum tier** (the most permissive delivery it will ever allow),
+every client has a **maximum tier** the operator trusts it with, and every release
+happens at an explicit tier ≤ both. The approval UI always states the tier in plain
+language: *"family-assistant will make HTTPS requests to api.hellofresh.com using this
+key; it will not see the key"* vs. *"the k8s-agent CLI will print this secret to
+stdout inside the agent's container; the agent can read it"*.
+
+---
+
+## 2. Critical user journeys
+
+### CUJ 1 — Brokered HTTP for family-assistant (tier 0)
+
+1. The FA agent needs to call an authenticated API. It invokes an FA tool that asks
+   Keychute for a **grant** on secret `example-api-token` with mechanism `brokered`,
+   declaring target constraints (host, methods, path prefix) and a requested TTL.
+2. Keychute matches this against policy. No standing grant → it sends a Pushover
+   notification: *"family-assistant requests 1 h of brokered access to
+   api.example.com using 'Example API token'. Purpose: ⟨client-supplied context⟩."*
+   The push links to the approval page (OIDC-protected).
+3. I approve. FA's pending request resolves with a `grant_id` (never the credential).
+4. FA makes requests through `POST /v1/grants/{grant_id}/proxy`. Keychute validates
+   each request against the grant's constraints, injects the credential (e.g.
+   `Authorization: Bearer …`), forwards, and streams the response back. Every proxied
+   call is audit-logged. The grant expires by TTL and/or request count.
+
+### CUJ 2 — k8s-agent needs a secret for a SealedSecret (tier 2)
+
+1. Inside its container, the agent runs
+   `keychute request my-service-api-key --reason "seal into my-service ns" | ./scripts/create-sealed-secret.sh …`.
+2. The CLI authenticates with an audience-bound projected service-account token
+   (the sudo-service pattern) and opens an SSE wait on the request.
+3. I get a Pushover push. The approval page shows the requester identity, the reason,
+   the tier warning ("the agent can read this from stdout"), and — if the secret is
+   **not** yet stored — an input field where I type/paste the secret, with an
+   "also store this in Keychute" checkbox. Approval-time entry doubles as the
+   ingestion path, so credentials never have to transit an LLM chat to get into the
+   system.
+4. On approval the plaintext is delivered once over the SSE channel; the CLI writes
+   it to stdout and exits. The pipe consumes it. Nothing lands in the agent
+   transcript unless the agent deliberately captures it — which is exactly the
+   residual risk tier 2 declares.
+
+### CUJ 3 — Secure agentic autofill for family-assistant (tier 1)
+
+1. I pre-approve a **standing grant**: secret `hellofresh-login` may be released to
+   client `family-assistant` at tier `trusted-client`, mechanism `autofill`, for
+   N days.
+2. The FA agent, driving the browser, calls a new deterministic FA tool
+   (e.g. `browser_fill_credential(ref, credential="hellofresh-login")`). The tool's
+   *backend code* — not the LLM — fetches the password from Keychute (release is
+   auto-approved by the standing grant, still audit-logged and optionally
+   notify-only pinged), and passes it straight into Playwright's `fill()` on the
+   target element. The value never enters the LLM context, tool arguments, or logs.
+3. Keychute records the release with the client-supplied context (page URL, field);
+   policy can constrain releases to matching origins (e.g. only when the page origin
+   is `hellofresh.com`).
+
+This is "Secure Agentic Autofill" like 1Password's, but without granting an agent
+platform access to the real password-manager account.
+
+---
+
+## 3. Threat model
+
+**In scope**
+
+- The agent's LLM provider logging everything the model sees (the original
+  motivation: don't paste credentials into Claude Code / codex).
+- A prompt-injected or misbehaving agent trying to exfiltrate secrets: requesting
+  secrets it shouldn't, lying about purpose, requesting a more permissive tier,
+  or (tier 2) reading what deterministic code in its own container handles.
+- Confused-deputy attacks: one client requesting on behalf of/impersonating another.
+- Database compromise: Postgres backups, disk, or a read of the DB must not yield
+  plaintext secrets (application-level encryption; the DB never sees plaintext).
+- Replay/abuse of approved grants beyond their constraints (host, path, TTL, count).
+
+**Explicitly out of scope / accepted residual risk**
+
+- A fully compromised Keychute *process* (it holds the KEK in memory).
+- Tier 2: the agent has root in its own container; it can `strace` the CLI or read
+  the pipe. The tier exists to remove the *default* leak (LLM transcript), not to
+  stop a determined malicious agent.
+- Tier 1 subversion via side channels the client fails to close (e.g. the agent
+  screenshotting a password it just autofilled before the page masks it). Client
+  integrations must document their containment story; see §8.
+- Verifying that client code actually *is* the deterministic code it claims to be.
+  Client trust levels are an operator judgement about a deployment, not an
+  attestation scheme (see §6, "mechanism honesty").
+
+---
+
+## 4. Architecture
+
+```
+                        ┌───────────────────────────── Keychute (Rust, ns keychute) ─┐
+  Pushover  ◄───────────┤  notifier                                                  │
+                        │                                                            │
+  Browser (me) ──OIDC──►│  approval web UI  ──┐                                      │
+                        │                     ├── policy engine ── release engine    │
+  family-assistant ────►│  client API (REST + SSE)                 │        │        │
+  k8s-agent CLI ───────►│    │                                     │        ▼        │
+                        │    └── TokenReview / API-key authn   audit log  crypto     │
+                        │                                          │      (KEK+DEK)  │
+                        └──────────────────────────────────────────┼─────────────────┘
+                                                                   ▼
+                                                    Postgres (storage-cluster,
+                                                    ciphertext only)
+```
+
+One binary, several logical components:
+
+- **Client API** (`/v1/…`): create access requests, wait for resolution (SSE),
+  exercise grants (proxy calls, one-shot fetch). Authn per §6.
+- **Approval UI**: minimal server-rendered (or tiny static SPA) pages behind
+  Envoy Gateway OIDC (`id.andrewgarrett.dev` Keycloak, the cluster's standard
+  `SecurityPolicy` pattern). Shows request context verbatim, tier in plain language,
+  secret-entry form for not-yet-stored secrets, and standing-grant management.
+- **Policy engine**: evaluates (client, secret, mechanism/tier, constraints,
+  context) → `auto-approve` / `notify-only` / `require-approval` / `deny`.
+- **Notifier**: Pushover, using the cluster's existing convention (secret with
+  `token` + `user_key`, same as alertmanager and sudo-service). Pluggable trait so
+  ntfy/webhook can be added later.
+- **Release engine**: executes the approved delivery — brokered proxying with
+  constraint checks, or one-shot plaintext delivery over the requester's SSE/fetch
+  channel with single-use semantics.
+- **Crypto**: envelope encryption (§5).
+- **Audit log**: append-only record of every request, decision, and release/use.
+
+### Rust stack (proposed)
+
+- `axum` + `tokio` + `tower` (HTTP, SSE, middleware), `hyper`/`reqwest` for the
+  outbound proxy leg.
+- `sqlx` (compile-time-checked queries, Postgres, TLS).
+- `chacha20poly1305` (XChaCha20-Poly1305 AEAD), `zeroize` + `secrecy` for in-memory
+  hygiene, `rand` (OS RNG) for DEKs/nonces.
+- `askama` or `maud` for the approval pages (server-rendered keeps the UI in the
+  same trust domain and avoids a JS supply chain for a security-critical page).
+- `tracing` with a redaction layer — secret material must be typed (`SecretBox`) so
+  it *cannot* be `Debug`-formatted into logs.
+- `utoipa` for an OpenAPI spec the FA integration and CLI are generated/checked
+  against.
+
+The CLI (`keychute`) is a small subcommand binary from the same workspace,
+distributed the way the `sudo-service` CLI is (fetched by pinned ref into the
+k8s-agent image).
+
+---
+
+## 5. Cryptography & storage
+
+**Envelope encryption, ciphertext-only database.**
+
+- A **KEK** (32 bytes) lives in a Kubernetes Secret (created via the repo's
+  sealed-secrets workflow), mounted as a file. Postgres never sees it.
+- Each secret *version* gets a fresh random **DEK**; plaintext is encrypted with
+  XChaCha20-Poly1305 under the DEK; the DEK is wrapped under the KEK. AAD binds
+  ciphertext to `(secret_id, version)` so rows can't be swapped or replayed across
+  secrets.
+- KEK rotation = rewrap all DEKs (cheap, no payload re-encryption). Secret rotation
+  = new version row; old versions retained (visible in audit trail) until purged.
+- Plaintext exists only transiently in Keychute memory during a release or proxy
+  call, in `zeroize`-on-drop buffers, and is never logged, never in error messages,
+  never in the DB (enforced by types, reviewed as an invariant).
+- The database is the existing Zalando `storage-cluster` (PG 15, Patroni, daily
+  logical backups). Backups therefore contain ciphertext only — losing the KEK
+  Secret loses the data, so the KEK's sealed form in git plus the sealed-secrets
+  controller key is the recovery chain. This is documented in the runbook.
+
+A dedicated `postgresql` CR is possible (the `lake-system` precedent) but overkill;
+the ciphertext-only design removes the main reason to isolate.
+
+### Data model (first cut)
+
+- `secrets` — id, name, description, max_tier, created/updated, current_version.
+- `secret_versions` — secret_id, version, ciphertext, nonce, wrapped_dek, aad
+  context, created_by (approval that ingested it).
+- `clients` — id, name (`family-assistant`, `k8s-agent`), authn binding (SA
+  audience+subject, or API-key hash), max_tier, allowed mechanisms, enabled.
+- `policies` — (client, secret | secret-tag) → mechanism, tier, constraints
+  (host allowlist, methods, path prefix, origin), outcome (`auto-approve` /
+  `notify-only` / `require-approval` / `deny`), expiry. Standing grants (CUJ 3
+  pre-approval) are rows here with an expiry, created from the approval UI.
+- `access_requests` — client, secret, requested mechanism+tier+constraints,
+  client-supplied context (freeform + structured), state
+  (`pending`/`approved`/`denied`/`expired`), resolved_by, timestamps.
+- `grants` — issued capability: request_id, constraints, TTL, max_uses, use_count,
+  revoked. (One-shot releases are grants with max_uses = 1.)
+- `audit_log` — append-only: every request, decision, release, and each individual
+  proxied call (method, host, path, status — never bodies or credentials).
+
+---
+
+## 6. Policy & approval model
+
+The user-visible question an approval answers has two parts, and policy treats them
+separately:
+
+1. **The thing being done, minus mechanism** — *"family-assistant wants to log into
+   HelloFresh"*. Matched against standing grants, recency ("did I recently approve
+   this same intent?"), and per-secret rules.
+2. **The mechanism / tier** — *"…and it will handle the password with deterministic
+   autofill code (tier 1)"*. Matched against the secret's max tier and the client's
+   max tier.
+
+Outcomes: `deny` (silent or with reason), `require-approval` (push + wait, with a
+timeout after which the request expires — sudo-service uses 1 h), `notify-only`
+(release proceeds, I get an FYI push — right for standing-grant autofill),
+`auto-approve` (silent, audit-logged; for the lowest-stakes cases).
+
+**Client-supplied context** rides with every request and is rendered verbatim (and
+clearly labelled as *client-asserted, unverified*) in the approval UI: a freeform
+"reason", plus structured fields the integration fills in — for FA, the conversation
+snippet or the `execute_script` source that triggered the need; for the CLI, the
+`--reason` flag and the requesting pod identity. Rendering the actual script that
+will consume the secret is a first-class goal of the UI.
+
+### Where enforcement lives — server, client, or both?
+
+**Both, with a clean split** (this resolves the open question in the project brief):
+
+- **The server is authoritative for release decisions**: whether a secret leaves,
+  at what tier, to which authenticated client, under what constraints, and it alone
+  enforces tier-0 constraints (it proxies the traffic). Nothing a client says can
+  raise a tier above the secret's or client's maximum.
+- **The client is responsible for containment after delivery**, and that
+  responsibility is exactly what the tier label encodes. Keychute cannot verify that
+  `family-assistant` really pipes the password into Playwright rather than into the
+  LLM context — that's the **mechanism-honesty problem**, and it's answered by
+  operator judgement, not protocol: registering a client at tier 1 *is* the
+  operator's statement that they trust that deployment's deterministic code.
+  Client-side policy (e.g. FA's own tool-policy `confirm` gates) can add friction on
+  top but is never load-bearing for Keychute's guarantees.
+
+### Authentication
+
+- **In-cluster clients** (k8s-agent, family-assistant): audience-bound projected
+  service-account tokens (`audience: keychute.andrewgarrett.dev`) validated via
+  TokenReview — proven pattern from sudo-service, no shared secrets to manage, and
+  the pod identity in the token becomes the request's verified requester identity.
+- **Humans** (approval UI): Envoy Gateway `SecurityPolicy` OIDC against Keycloak,
+  with the cluster-internal client API on skip-auth routes (again the sudo-service
+  shape: internal service URL for machines, OIDC-fronted external URL for me).
+- Non-cluster clients later, if ever: hashed static API keys bound to a client row.
+
+---
+
+## 7. Deployment (kube-config)
+
+Follows the sudo-service shape: **source + Helm chart live in `werdnum/keychute`**,
+cluster wiring lives in kube-config.
+
+In `werdnum/keychute`:
+
+- Rust workspace: `server/`, `cli/`, shared `types/` crate; `charts/keychute/`.
+- GitHub Actions: build `linux/arm64` image → `ghcr.io/werdnum/keychute`
+  (multi-stage Dockerfile, static-ish binary on `debian-slim`/`distroless`,
+  non-root), push by digest, bump the chart's default image digest — mirroring the
+  kube-config `containers/*` workflows and the sudo-service chart-bump flow.
+
+In `werdnum/kube-config` (a later PR, once the service exists):
+
+- `kubernetes/applications/workloads/keychute.yaml` — multi-source Application
+  (chart from keychute repo + `$values` + sealed secrets dir), `CreateNamespace=true`,
+  `ServerSideApply=true`, auto-sync.
+- `storage-cluster/postgresql.yaml`: add `keychute: keychute.keychute` to
+  `databases` and `keychute.keychute: []` to `users` — the operator drops the
+  credentials Secret into the `keychute` namespace (cross-namespace secrets are
+  already enabled).
+- Sealed secrets: `keychute-kek` (the master key), `keychute-pushover`
+  (`token`/`user_key`, cluster convention).
+- Ingress `keychute.andrewgarrett.dev` (nginx class, `letsencrypt-prod`), OIDC
+  `SecurityPolicy` on the approval routes, optional Cloudflare-tunnel exposure so
+  Pushover links work away from home (tunnel hostname + external-dns target
+  annotation, per repo docs). Internal clients use
+  `http://keychute.keychute.svc.cluster.local`.
+- k8s-agent: add the `keychute` CLI to the image (renovate-pinned ref, like the
+  sudo-service CLI), and a projected token volume with
+  `audience: keychute.andrewgarrett.dev`.
+- Namespace file with goldilocks labels; `ghcr-secret` imagePullSecret (conftest
+  enforces it); pgpool is available if connection pooling ever matters.
+
+---
+
+## 8. family-assistant integration (later PRs in that repo)
+
+Research findings that shape this (all verified against the current tree):
+
+- FA has **no Pushover** and its own notification stack (VAPID/APNs) — Keychute
+  does its own notifications; FA doesn't need to relay approvals.
+- FA already has a durable HITL `ConfirmationService`, but Keychute approvals are
+  **operator-level, not chat-user-level** — they stay in Keychute. FA's per-tool
+  `confirm` policy can still be layered on specific tools as chat-side friction.
+- FA has an `ApiBackend` protocol (`services/api_backend.py`) that injects bearer
+  tokens and never logs them — the natural seam for CUJ 1: a
+  `KeychuteBrokeredBackend` that sends requests to the grant proxy instead of the
+  target, or a standalone `authenticated_http_request` tool that manages
+  grant acquisition + proxying. Decision deferred to the FA-side design.
+- FA has **no generic secrets abstraction** — Keychute's client becomes the first,
+  a small `KeychuteClient` service class (SA token from a projected volume,
+  in-cluster URL).
+- Autofill: today `browser_fill` takes its text from LLM-generated arguments.
+  CUJ 3 needs a new deterministic path — `browser_fill_credential(ref,
+  credential_name)` — whose implementation fetches from Keychute and calls
+  Playwright `fill()` directly. Containment obligations for tier 1: the value never
+  enters tool results or logs; fill only into password-type inputs (or
+  operator-overridden per credential); and subsequent `browser_snapshot` /
+  `browser_extract` / screenshots must mask the filled field's value, since the
+  agent could otherwise read it back off the page. That masking work is part of the
+  integration, not optional. (`browser_request_handoff` remains the fallback for
+  sites where masking can't be made sound.)
+- Context enrichment: when a Keychute request originates inside `execute_script`
+  (the Monty sandbox), FA attaches the script source as structured context so the
+  approval UI can show me the exact code that will use the access.
+
+---
+
+## 9. Milestones
+
+Each milestone is independently testable and delivers something usable; no
+calendar estimates.
+
+- **M0 — Skeleton & crypto core.** Rust workspace, CI (fmt/clippy/test, ARM64 image
+  build), migrations, envelope-encryption module with KEK-file loading and
+  rotation-rewrap, `secrets`/`secret_versions` CRUD behind an admin API. Property
+  tests on the crypto seams; no network delivery yet.
+- **M1 — CUJ 2 end-to-end (CLI + approval).** Access requests, SSE wait, Pushover
+  notifier, approval UI with OIDC, approval-time secret entry (store-or-passthrough),
+  one-shot release, audit log, TokenReview authn, `keychute` CLI. Deployed to the
+  cluster; k8s-agent image gains the CLI. *This is the first real value: agents stop
+  needing credentials pasted into transcripts.*
+- **M2 — Policy engine & standing grants.** Policy rows, outcomes
+  (auto/notify/approve/deny), standing-grant creation and management in the UI,
+  grant TTL/max-use/revocation, notify-only pushes.
+- **M3 — CUJ 1 brokered proxy + FA integration.** Grant proxy endpoint with
+  host/method/path constraint enforcement and per-call audit; FA `KeychuteClient`
+  + brokered HTTP tool; script-source context attachment.
+- **M4 — CUJ 3 secure autofill.** `autofill` mechanism + origin constraints
+  server-side; FA `browser_fill_credential` with the masking/containment work in
+  the browser tools.
+- **M5 — Hardening.** Rate limits per client, request expiry sweeps, KEK rotation
+  runbook, `notify-only` digests, threat-model review against the implementation,
+  docs (user + operator).
+
+---
+
+## 10. Open questions for review
+
+1. **Approval-time secret entry retention** (CUJ 2): default the "store this
+   secret" checkbox on or off? Off is safer-by-default; on matches the likely
+   workflow (you'll be asked again).
+2. **FA request UX for tier-0 grants**: when Keychute requires approval, should the
+   FA agent's tool call block on SSE (minutes-long tool call, matches FA's deferred
+   confirmation machinery poorly?) or return "pending, retry" and let FA's durable
+   confirmation/task system resume? I lean *blocking with a generous timeout* for
+   v1, durable resume in M3 if it chafes.
+3. **Tier names**: `brokered` / `trusted-client` / `cooperating-client` / `direct`
+   — happy with these? They appear in UI copy and policy config, so worth settling
+   early.
+4. **Notify-only for autofill**: should every standing-grant autofill release ping
+   Pushover (auditable but noisy), or only log? Proposed default: notify-only for
+   the first release per grant per day.
+5. **Proxy response handling** (CUJ 1): responses stream back to FA unmodified.
+   Some APIs echo credentials in responses (rare). Do we want optional response
+   redaction rules per secret, or accept as residual risk for v1? Proposed: accept
+   and document.
+6. **Cloudflare tunnel exposure**: approval pages need to be reachable when I'm
+   away for Pushover links to be useful. Standard tunnel + Cloudflare Access +
+   Keycloak OIDC stacking, same as sudo-service — confirm that's the intent.
