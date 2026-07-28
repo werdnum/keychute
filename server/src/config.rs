@@ -225,8 +225,19 @@ impl Config {
         }
         match self.human_auth.mode {
             HumanAuthMode::Static => {
-                if self.human_auth.r#static.is_none() {
+                let Some(s) = &self.human_auth.r#static else {
                     bail!("human_auth.mode=static requires human_auth.static");
+                };
+                // Same trap as a malformed client digest below: no bearer
+                // token could ever match, silently locking the operator out.
+                if s.token_sha256.len() != 64
+                    || !s.token_sha256.bytes().all(|b| b.is_ascii_hexdigit())
+                {
+                    bail!(
+                        "human_auth.static.token_sha256 must be a 64-character hex \
+                         SHA-256 digest (got {} characters)",
+                        s.token_sha256.len()
+                    );
                 }
             }
             HumanAuthMode::Oidc => {
@@ -253,6 +264,21 @@ impl Config {
                      configure exactly one",
                     c.name
                 );
+            }
+            // Authn looks tokens up by their lowercase 64-hex SHA-256 digest
+            // (normalize() already lowercased this value): a malformed digest
+            // would reconcile as an enabled client no token can ever match —
+            // a healthy-looking deployment with a permanently locked-out
+            // client. Fail startup instead.
+            if let Some(h) = &c.auth.api_token_sha256 {
+                if h.len() != 64 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    bail!(
+                        "client {}: api_token_sha256 must be a 64-character hex \
+                         SHA-256 digest (got {} characters)",
+                        c.name,
+                        h.len()
+                    );
+                }
             }
             if c.mechanisms.is_empty() {
                 bail!("client {} has no allowed mechanisms", c.name);
@@ -349,7 +375,7 @@ clients:
     max_tier: "cooperating-client"
     mechanisms: ["cli-read"]
     auth:
-      api_token_sha256: "  FFEE00112233445566778899AABBCCDDEEFF00112233445566778899AABBCC  "
+      api_token_sha256: "  FFEE00112233445566778899AABBCCDDEEFF00112233445566778899AABBCCDD  "
 "#;
 
     #[test]
@@ -413,13 +439,35 @@ clients:
     }
 
     #[test]
+    fn malformed_token_digests_fail_validation() {
+        // A typo'd digest would otherwise reconcile as an enabled client (or a
+        // configured operator) that no presented token can ever match.
+        let check_client = |digest: &str| {
+            let mut cfg: Config = serde_yaml::from_str(BASE_YAML).unwrap();
+            cfg.clients[0].auth.api_token_sha256 = Some(digest.into());
+            cfg.normalize();
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains("api_token_sha256"), "{digest:?}: {err}");
+        };
+        check_client("");
+        check_client(&"a".repeat(63));
+        check_client(&"a".repeat(65));
+        check_client(&"g".repeat(64)); // non-hex
+        let mut cfg: Config = serde_yaml::from_str(BASE_YAML).unwrap();
+        cfg.human_auth.r#static.as_mut().unwrap().token_sha256 = "deadbeef".into();
+        cfg.normalize();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("human_auth.static.token_sha256"), "{err}");
+    }
+
+    #[test]
     fn normalize_lowercases_token_hashes() {
         let mut cfg: Config = serde_yaml::from_str(BASE_YAML).unwrap();
         cfg.normalize();
         cfg.validate().unwrap();
         assert_eq!(
             cfg.clients[0].auth.api_token_sha256.as_deref(),
-            Some("ffee00112233445566778899aabbccddeeff00112233445566778899aabbcc")
+            Some("ffee00112233445566778899aabbccddeeff00112233445566778899aabbccdd")
         );
         assert_eq!(
             cfg.human_auth.r#static.as_ref().unwrap().token_sha256,

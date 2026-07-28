@@ -198,7 +198,11 @@ pub async fn read(
         secret_version_id: released_version_id,
     };
 
-    insert_audit(
+    // Best-effort, like the proxy path's completion audit: `begin_grant_use`
+    // committed the use and the write-ahead `release-attempt` row above. A 500
+    // here would deny the caller the secret while the use stays spent — after
+    // the replay window that reads as `grant-exhausted` with nothing released.
+    if let Err(e) = insert_audit(
         &state.db,
         &AuditEvent {
             kind: kinds::RELEASE_COMPLETED,
@@ -212,7 +216,9 @@ pub async fn read(
         },
     )
     .await
-    .map_err(|e| ApiFailure::Internal(e.into()))?;
+    {
+        tracing::warn!(grant_id = %grant_row.id, error = %e, "release-completed audit insert failed");
+    }
 
     Ok((
         StatusCode::OK,

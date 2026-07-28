@@ -413,6 +413,9 @@ pub async fn create(
         (_, Some(grant)) => db::api_ext::InitialResolution::Approved {
             resolved_by: "policy:auto",
             grant,
+            // Committed with the approval so a failed immediate FYI push below
+            // is durably owed and retried by the sweeper.
+            notify_only: matches!(evaluation.decision, policy::Decision::NotifyOnly),
         },
         _ => db::api_ext::InitialResolution::Pending,
     };
@@ -470,8 +473,26 @@ pub async fn create(
                     req.mechanism,
                     &secret_label,
                 );
-                if let Err(e) = state.notifier.send(&n).await {
-                    tracing::warn!(error = %e, "notify-only push failed");
+                // Same claim + timeout discipline as the sweeper's FYI retry
+                // (which this races): the row committed with `notify_only`, so
+                // a failed or timed-out send here is not lost — it stays
+                // undelivered and the sweeper retries it.
+                let _push_guard = state.push_lock.lock().await;
+                if crate::notify::claim_for_fyi_push(&state.db, row.id).await? {
+                    match tokio::time::timeout(
+                        crate::notify::PUSH_SEND_TIMEOUT,
+                        state.notifier.send(&n),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => db::mark_push_delivered(&state.db, row.id).await?,
+                        Ok(Err(e)) => {
+                            tracing::warn!(error = %e, "notify-only push failed; sweeper will retry");
+                        }
+                        Err(_) => {
+                            tracing::warn!("notify-only push timed out; sweeper will retry");
+                        }
+                    }
                 }
             }
             let status = keychute_types::AccessRequestStatus {

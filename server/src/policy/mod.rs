@@ -389,9 +389,13 @@ fn request_is_subset(p: &PolicyRow, req: &Constraints) -> bool {
 }
 
 /// Precedence: client-specific beats wildcard; exact secret beats tag beats
-/// wildcard; then higher priority int; then most restrictive outcome.
+/// wildcard; then higher priority int; then most restrictive outcome; then
+/// earlier `not_after` (a full tie must not mint a longer-lived grant just
+/// because of row order — `policy_not_after` caps the grant); finally the row
+/// id, so the order is total and evaluation is independent of input order
+/// (the DB only orders rows by the non-unique `created_at`).
 /// Higher key wins under `max_by_key`.
-fn precedence_key(p: &PolicyRow) -> (u8, u8, i32, u8) {
+fn precedence_key(p: &PolicyRow) -> (u8, u8, i32, u8, std::cmp::Reverse<DateTime<Utc>>, Uuid) {
     let client_spec = u8::from(p.client_name.is_some());
     let secret_spec: u8 = if p.secret_name.is_some() {
         2
@@ -405,6 +409,9 @@ fn precedence_key(p: &PolicyRow) -> (u8, u8, i32, u8) {
         secret_spec,
         p.priority,
         p.outcome.restrictiveness(),
+        // No expiry sorts as latest: it is the least restrictive cap.
+        std::cmp::Reverse(p.not_after.unwrap_or(DateTime::<Utc>::MAX_UTC)),
+        p.id,
     )
 }
 
@@ -1020,6 +1027,40 @@ mod tests {
         );
         assert_eq!(e.decision, Decision::NotifyOnly);
         assert_eq!(e.policy_id, Some(notify.id));
+    }
+
+    #[test]
+    fn full_tie_prefers_restrictive_expiry_regardless_of_order() {
+        // Same specificity, priority and outcome, different not_after: the
+        // earlier expiry must cap the grant, whichever order the rows arrive
+        // in (the DB only orders by the non-unique created_at).
+        let mut short = row(Outcome::AutoApprove);
+        short.not_after = Some(now() + Duration::hours(1));
+        let mut long = row(Outcome::AutoApprove);
+        long.not_after = Some(now() + Duration::days(30));
+        let mut unlimited = row(Outcome::AutoApprove);
+        unlimited.not_after = None;
+        for rows in [
+            vec![short.clone(), long.clone(), unlimited.clone()],
+            vec![unlimited.clone(), long.clone(), short.clone()],
+            vec![long.clone(), unlimited.clone(), short.clone()],
+        ] {
+            let e = eval(&client(), Some(&secret()), &[], &req_brokered(), &rows);
+            assert_eq!(e.policy_id, Some(short.id));
+            assert_eq!(e.policy_not_after, short.not_after);
+        }
+        // Identical rows apart from id: the winner is order-independent.
+        let a = row(Outcome::AutoApprove);
+        let b = row(Outcome::AutoApprove);
+        let e1 = eval(
+            &client(),
+            Some(&secret()),
+            &[],
+            &req_brokered(),
+            &[a.clone(), b.clone()],
+        );
+        let e2 = eval(&client(), Some(&secret()), &[], &req_brokered(), &[b, a]);
+        assert_eq!(e1.policy_id, e2.policy_id);
     }
 
     #[test]

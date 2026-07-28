@@ -227,6 +227,17 @@ const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 /// Shared with the create-request handler's initial-push dedup.
 pub(crate) const PUSH_DEDUP_WINDOW_SECONDS: i64 = 60;
 const CONTEXT_RETENTION_HOURS: i64 = 24;
+/// Stop STARTING new pushes once a sweep's push phase has run this long. The
+/// queue walks serially and each row may burn `PUSH_SEND_TIMEOUT`, so an
+/// unreachable notifier with a deep queue would otherwise hold `sweep_once`
+/// (and therefore the next expiry + purge tick) for minutes. Unsent rows stay
+/// undelivered and lead the next sweep's queue; worst case the phase runs
+/// budget + one `PUSH_SEND_TIMEOUT`.
+const PUSH_PHASE_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+/// How long the sweeper keeps retrying an undelivered notify-only FYI push.
+/// Unlike approval pushes these have no pending window to bound them, and a
+/// days-old "access was released" note is noise, not information.
+const FYI_RETRY_WINDOW_HOURS: i64 = 24;
 
 /// Spawn the background sweeper: every 30 s — (a) expire stale pending
 /// requests (waking wait-endpoint pollers), (b) purge lifecycle (passthrough
@@ -306,18 +317,86 @@ async fn expire_phase(state: &AppState, now: chrono::DateTime<Utc>) -> anyhow::R
 }
 
 /// (c) Push retry. Every pending request without a recorded delivery is
-/// retried each sweep (attempts counter is telemetry only). With no real
-/// notifier nothing can be delivered: skip the loop entirely rather than
-/// spinning on rows that will never be marked delivered.
+/// retried each sweep (attempts counter is telemetry only), then undelivered
+/// notify-only FYI pushes within their retry window. With no real notifier
+/// nothing can be delivered: skip the loop entirely rather than spinning on
+/// rows that will never be marked delivered. The whole phase respects
+/// `PUSH_PHASE_BUDGET` so a dead notifier cannot stall the next sweep's
+/// expiry and purge phases behind a deep queue.
 async fn push_phase(state: &AppState) -> anyhow::Result<()> {
     if !state.notifier.is_real() {
         return Ok(());
     }
+    let deadline = tokio::time::Instant::now() + PUSH_PHASE_BUDGET;
     let pending = db::list_pending_needing_push(&state.db, i32::MAX).await?;
-    for row in pending {
+    let fyi = db::list_notify_only_needing_push(
+        &state.db,
+        Utc::now() - Duration::hours(FYI_RETRY_WINDOW_HOURS),
+    )
+    .await?;
+    let mut skipped: usize = 0;
+    for row in pending.iter().chain(fyi.iter()) {
+        if tokio::time::Instant::now() >= deadline {
+            skipped += 1;
+            continue;
+        }
         // One bad row must not abandon the rest of the queue.
-        if let Err(err) = push_one(state, &row).await {
+        let sent = if row.notify_only {
+            push_one_fyi(state, row).await
+        } else {
+            push_one(state, row).await
+        };
+        if let Err(err) = sent {
             tracing::warn!(request_id = %row.id, error = %err, "push retry failed");
+        }
+    }
+    if skipped > 0 {
+        tracing::warn!(
+            skipped,
+            budget_seconds = PUSH_PHASE_BUDGET.as_secs(),
+            "push phase budget exhausted; remaining rows retry next sweep"
+        );
+    }
+    Ok(())
+}
+
+/// FYI push for a notify-only release (migration 0006 outbox). No dedup: each
+/// row reports a distinct release that already happened. The conditional claim
+/// still guards against a concurrent create-path send marking the row
+/// delivered while this sweep was preparing.
+async fn push_one_fyi(state: &AppState, row: &db::AccessRequestRow) -> anyhow::Result<()> {
+    let _push_guard = state.push_lock.lock().await;
+    let Some(mechanism) = Mechanism::from_str_opt(&row.mechanism) else {
+        tracing::warn!(request_id = %row.id, "unknown mechanism on request row");
+        return Ok(());
+    };
+    // Same label shape as the create path's immediate FYI: quoted name when
+    // stored, bare generic label otherwise (addendum #5).
+    let label = match db::get_secret_by_name(&state.db, &row.secret_name).await? {
+        Some(s) => format!("'{}'", s.name),
+        None => "a not-yet-stored secret".to_owned(),
+    };
+    if !claim_for_fyi_push(&state.db, row.id).await? {
+        return Ok(());
+    }
+    let n = release_notification(
+        &state.config.external_url,
+        row.id,
+        &row.client_name,
+        mechanism,
+        &label,
+    );
+    match tokio::time::timeout(PUSH_SEND_TIMEOUT, state.notifier.send(&n)).await {
+        Ok(Ok(())) => db::mark_push_delivered(&state.db, row.id).await?,
+        Ok(Err(err)) => {
+            tracing::warn!(request_id = %row.id, error = %err, "FYI push delivery failed");
+        }
+        Err(_) => {
+            tracing::warn!(
+                request_id = %row.id,
+                timeout_seconds = PUSH_SEND_TIMEOUT.as_secs(),
+                "FYI push delivery timed out"
+            );
         }
     }
     Ok(())
@@ -394,6 +473,24 @@ pub(crate) async fn claim_for_push(db: &sqlx::PgPool, request_id: Uuid) -> anyho
         "UPDATE access_requests SET push_attempts = push_attempts + 1 \
          WHERE id = $1 AND state = 'pending' AND push_delivered_at IS NULL \
            AND expires_at > now() \
+         RETURNING id",
+    )
+    .bind(request_id)
+    .fetch_optional(db)
+    .await?;
+    Ok(claimed.is_some())
+}
+
+/// FYI counterpart of [`claim_for_push`]: increment `push_attempts` iff the
+/// notify-only row's FYI push is still undelivered. Shared with the create
+/// path's immediate FYI send, which races the sweeper.
+pub(crate) async fn claim_for_fyi_push(
+    db: &sqlx::PgPool,
+    request_id: Uuid,
+) -> anyhow::Result<bool> {
+    let claimed: Option<(Uuid,)> = sqlx::query_as(
+        "UPDATE access_requests SET push_attempts = push_attempts + 1 \
+         WHERE id = $1 AND notify_only AND push_delivered_at IS NULL \
          RETURNING id",
     )
     .bind(request_id)

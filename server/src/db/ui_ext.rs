@@ -264,10 +264,16 @@ pub async fn rotate_secret_version(
     Ok(row)
 }
 
-/// Grants that are still exercisable: not revoked, not past `not_after`.
+/// Grants that are still exercisable: not revoked, not past `not_after`, and
+/// with uses remaining — the same predicate `begin_grant_use` increments
+/// under, so the operator UI never lists (or offers to revoke) a grant that
+/// would already return `grant-exhausted`.
 pub async fn list_active_grants(db: &PgPool) -> anyhow::Result<Vec<GrantRow>> {
     Ok(sqlx::query_as::<_, GrantRow>(
-        "SELECT * FROM grants WHERE NOT revoked AND now() < not_after ORDER BY created_at DESC",
+        "SELECT * FROM grants \
+         WHERE NOT revoked AND now() < not_after \
+           AND (max_uses IS NULL OR use_count < max_uses) \
+         ORDER BY created_at DESC",
     )
     .fetch_all(db)
     .await?)

@@ -92,6 +92,10 @@ CREATE TABLE access_requests (
     expires_at timestamptz NOT NULL,
     push_delivered_at timestamptz,
     push_attempts int NOT NULL DEFAULT 0,
+    -- Rows created already-approved under a notify-only policy owe the
+    -- operator an FYI push; the row is the outbox and the sweeper retries
+    -- until push_delivered_at is set, same as approval pushes.
+    notify_only boolean NOT NULL DEFAULT false,
     idem_client text NOT NULL,
     idem_key text NOT NULL,
     idem_mac bytea NOT NULL,
@@ -99,6 +103,8 @@ CREATE TABLE access_requests (
 );
 
 CREATE INDEX access_requests_state_idx ON access_requests (state);
+CREATE INDEX access_requests_fyi_outbox_idx ON access_requests (created_at)
+    WHERE notify_only AND push_delivered_at IS NULL;
 
 CREATE TABLE grants (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),

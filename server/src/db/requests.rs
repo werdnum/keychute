@@ -28,6 +28,10 @@ pub struct AccessRequestRow {
     pub expires_at: DateTime<Utc>,
     pub push_delivered_at: Option<DateTime<Utc>>,
     pub push_attempts: i32,
+    /// True when the row was created already-approved under a notify-only
+    /// policy and therefore owes the operator an FYI push (migration 0006).
+    /// The row is the outbox: the sweeper retries until `push_delivered_at`.
+    pub notify_only: bool,
     pub idem_client: String,
     pub idem_key: String,
     pub idem_mac: Vec<u8>,
@@ -384,6 +388,25 @@ pub async fn increment_push_attempts(db: &PgPool, request_id: Uuid) -> anyhow::R
         .execute(db)
         .await?;
     Ok(())
+}
+
+/// Notify-only approved requests whose FYI push has not been delivered. Same
+/// row-as-outbox model as pending approval pushes; `cutoff` bounds how far
+/// back the sweeper keeps retrying, since an FYI has no expiry of its own and
+/// loses its value once it is stale.
+pub async fn list_notify_only_needing_push(
+    db: &PgPool,
+    cutoff: DateTime<Utc>,
+) -> anyhow::Result<Vec<AccessRequestRow>> {
+    Ok(sqlx::query_as::<_, AccessRequestRow>(
+        "SELECT * FROM access_requests \
+         WHERE notify_only AND state = 'approved' AND push_delivered_at IS NULL \
+           AND created_at > $1 \
+         ORDER BY created_at",
+    )
+    .bind(cutoff)
+    .fetch_all(db)
+    .await?)
 }
 
 /// Pending, unexpired requests whose approval push has not been delivered and

@@ -77,9 +77,9 @@ pub use grants::{
 pub use policies::{delete_policy, insert_policy, list_policies, NewPolicy, PolicyRow};
 pub use requests::{
     count_pending_for_client, expire_stale, get_request, increment_push_attempts,
-    insert_access_request, list_pending, list_pending_needing_push, mark_push_delivered,
-    purge_request_context, resolve_approve, resolve_deny, AccessRequestRow, GrantParams,
-    InsertedRequest, NewAccessRequest, PassthroughPayload,
+    insert_access_request, list_notify_only_needing_push, list_pending, list_pending_needing_push,
+    mark_push_delivered, purge_request_context, resolve_approve, resolve_deny, AccessRequestRow,
+    GrantParams, InsertedRequest, NewAccessRequest, PassthroughPayload,
 };
 pub use secrets::{
     create_secret, get_secret_by_name, get_secret_version, get_secret_version_by_id,

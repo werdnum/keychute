@@ -119,6 +119,14 @@ impl Config {
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| fail(EXIT_CONFIG, "KEYCHUTE_URL is not set"))?;
         let url = url.trim().trim_end_matches('/').to_string();
+        // Every request carries the bearer token, and a successful flow
+        // carries the released secret back: plaintext transport is the same
+        // exposure the server refuses for non-loopback binds, so refuse it
+        // here too unless explicitly opted in.
+        let allow_insecure = std::env::var("KEYCHUTE_INSECURE_HTTP")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        validate_api_url(&url, allow_insecure).map_err(|e| fail(EXIT_CONFIG, e))?;
         let external_url = std::env::var("KEYCHUTE_EXTERNAL_URL")
             .ok()
             .filter(|s| !s.trim().is_empty())
@@ -233,6 +241,45 @@ fn validate_idempotency_key(key: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Refuse a plaintext API URL that would send the bearer token and the
+/// released secret over the network. `http://` is allowed only for loopback
+/// hosts (local development) or with the explicit `KEYCHUTE_INSECURE_HTTP`
+/// opt-in — mirroring the server's own non-loopback plaintext refusal.
+fn validate_api_url(url: &str, allow_insecure: bool) -> Result<(), String> {
+    let parsed =
+        reqwest::Url::parse(url).map_err(|e| format!("invalid KEYCHUTE_URL {url:?}: {e}"))?;
+    match parsed.scheme() {
+        "https" => Ok(()),
+        "http" => {
+            let loopback = match parsed.host_str() {
+                Some(h) => {
+                    // IPv6 hosts serialize bracketed ("[::1]").
+                    let bare = h.trim_start_matches('[').trim_end_matches(']');
+                    bare.eq_ignore_ascii_case("localhost")
+                        || bare
+                            .parse::<std::net::IpAddr>()
+                            .map(|ip| ip.is_loopback())
+                            .unwrap_or(false)
+                }
+                None => false,
+            };
+            if loopback || allow_insecure {
+                Ok(())
+            } else {
+                Err(format!(
+                    "refusing plaintext http:// KEYCHUTE_URL to non-loopback host {:?}: \
+                     the bearer token and released secret would travel unencrypted. \
+                     Use https://, or set KEYCHUTE_INSECURE_HTTP=1 to override",
+                    parsed.host_str().unwrap_or("")
+                ))
+            }
+        }
+        other => Err(format!(
+            "unsupported KEYCHUTE_URL scheme {other:?}: use https:// (or http:// for loopback)"
+        )),
+    }
 }
 
 /// Assemble agent-asserted structured context: best-effort pipeline capture
@@ -698,6 +745,24 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn api_url_plaintext_rules() {
+        // https anywhere.
+        assert!(validate_api_url("https://keychute.example.dev", false).is_ok());
+        // http only on loopback.
+        assert!(validate_api_url("http://127.0.0.1:8080", false).is_ok());
+        assert!(validate_api_url("http://[::1]:8080", false).is_ok());
+        assert!(validate_api_url("http://localhost:8080", false).is_ok());
+        // Non-loopback plaintext leaks the bearer token and secret.
+        assert!(validate_api_url("http://keychute.example.dev", false).is_err());
+        assert!(validate_api_url("http://10.0.0.5:8080", false).is_err());
+        // ...unless explicitly opted in.
+        assert!(validate_api_url("http://10.0.0.5:8080", true).is_ok());
+        // Garbage and non-http schemes are config errors.
+        assert!(validate_api_url("not a url", false).is_err());
+        assert!(validate_api_url("ftp://keychute.example.dev", false).is_err());
     }
 
     #[test]

@@ -23,10 +23,13 @@ pub enum InitialResolution<'a> {
         resolved_by: &'a str,
     },
     /// Policy auto-approved: the row is created `approved` and the grant is
-    /// minted in the same transaction.
+    /// minted in the same transaction. `notify_only` flags the row as owing
+    /// the operator an FYI push (migration 0006): the flag commits with the
+    /// approval so a failed immediate push is retried by the sweeper.
     Approved {
         resolved_by: &'a str,
         grant: &'a GrantParams,
+        notify_only: bool,
     },
 }
 
@@ -186,14 +189,20 @@ pub async fn insert_access_request_with_id(
                 )
                 .await?;
             }
-            InitialResolution::Approved { resolved_by, grant } => {
+            InitialResolution::Approved {
+                resolved_by,
+                grant,
+                notify_only,
+            } => {
                 row = sqlx::query_as::<_, AccessRequestRow>(
                     "UPDATE access_requests \
-                     SET state = 'approved', resolved_by = $2, resolved_at = now() \
+                     SET state = 'approved', resolved_by = $2, resolved_at = now(), \
+                         notify_only = $3 \
                      WHERE id = $1 RETURNING *",
                 )
                 .bind(row.id)
                 .bind(resolved_by)
+                .bind(notify_only)
                 .fetch_one(&mut *tx)
                 .await?;
                 // See `requests::resolve_approve`: payloads are
