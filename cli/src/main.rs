@@ -210,12 +210,40 @@ fn read_idempotency_key(request_key: &str) -> String {
     format!("cli-{request_key}")
 }
 
+/// The server caps request idempotency keys at 128 bytes and read keys at
+/// 160; capping the request key at 124 keeps the derived `cli-` read key
+/// safely under both. Checked up front so the failure is a clear usage error.
+const MAX_REQUEST_IDEM_KEY_BYTES: usize = 124;
+
+fn validate_idempotency_key(key: &str) -> Result<(), String> {
+    if key.is_empty() {
+        return Err("idempotency key must not be empty".into());
+    }
+    if key.len() > MAX_REQUEST_IDEM_KEY_BYTES {
+        return Err(format!(
+            "idempotency key too long ({} bytes; max {MAX_REQUEST_IDEM_KEY_BYTES})",
+            key.len()
+        ));
+    }
+    Ok(())
+}
+
 /// Assemble agent-asserted structured context: best-effort pipeline capture
 /// plus $KEYCHUTE_CONTEXT verbatim under `extra`.
 fn build_structured_context() -> Option<serde_json::Value> {
     let mut map = serde_json::Map::new();
-    if let Some(chain) = pipeline::capture() {
-        map.insert("pipeline".to_string(), serde_json::json!(chain));
+    if let Some(captured) = pipeline::capture() {
+        // Agent-asserted: ancestor chain plus same-shell pipeline peers.
+        map.insert(
+            "pipeline".to_string(),
+            serde_json::json!(captured.ancestors),
+        );
+        if !captured.siblings.is_empty() {
+            map.insert(
+                "pipeline_siblings".to_string(),
+                serde_json::json!(captured.siblings),
+            );
+        }
     }
     if let Ok(extra) = std::env::var("KEYCHUTE_CONTEXT") {
         map.insert("extra".to_string(), serde_json::Value::String(extra));
@@ -257,6 +285,7 @@ async fn run_request(cfg: &Config, http: &reqwest::Client, args: RequestArgs) ->
         ));
     }
     let idem_key = idempotency_key.unwrap_or_else(|| Uuid::new_v4().to_string());
+    validate_idempotency_key(&idem_key).map_err(|e| fail(EXIT_CONFIG, e))?;
 
     let body = CreateAccessRequest {
         idempotency_key: idem_key.clone(),
@@ -408,6 +437,11 @@ async fn wait_for_resolution(
 
 /// Exercise the grant's single logical read. The idempotency key is stable
 /// across retries so a lost response replays instead of burning a second use.
+///
+/// The ENTIRE attempt (send + status + body read + parse) is inside the retry
+/// loop: a truncated or unreadable body retries with the same key and replays
+/// server-side. Only a fully parsed, definitive 4xx (including 410) stops the
+/// retries.
 async fn read_grant(
     cfg: &Config,
     http: &reqwest::Client,
@@ -417,58 +451,70 @@ async fn read_grant(
     let body = ReadGrantRequest {
         idempotency_key: idem_key.to_string(),
     };
-    let mut last_err: Option<reqwest::Error> = None;
+    let mut last_err = String::new();
     for attempt in 1..=READ_ATTEMPTS {
         if attempt > 1 {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
-        let resp = http
-            .post(format!("{}/v1/grants/{}/read", cfg.url, grant_id))
-            .bearer_auth(cfg.bearer()?)
-            .timeout(Duration::from_secs(HTTP_TIMEOUT_SECONDS))
-            .json(&body)
-            .send()
-            .await;
-        let resp = match resp {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("keychute: grant read attempt {attempt}/{READ_ATTEMPTS} failed: {e}");
-                last_err = Some(e);
-                continue;
+        // One attempt end-to-end; Err(msg) means "transient, retry".
+        let attempt_result: Result<CliResult<ReadGrantResponse>, String> = async {
+            let bearer = match cfg.bearer() {
+                Ok(b) => b,
+                // Config errors are definitive, not transient.
+                Err(f) => return Ok(Err(f)),
+            };
+            let resp = http
+                .post(format!("{}/v1/grants/{}/read", cfg.url, grant_id))
+                .bearer_auth(bearer)
+                .timeout(Duration::from_secs(HTTP_TIMEOUT_SECONDS))
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            let status = resp.status();
+            let text = resp
+                .text()
+                .await
+                .map_err(|e| format!("failed reading response body: {e}"))?;
+            if status == reqwest::StatusCode::GONE {
+                return Ok(Err(fail(
+                    EXIT_PAYLOAD_LOST,
+                    "the grant's payload was lost (server restarted before the read); \
+                     submit a new request for re-approval",
+                )));
             }
-        };
-        let status = resp.status();
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| fail(EXIT_OTHER, format!("failed reading read response: {e}")))?;
-        if status == reqwest::StatusCode::GONE {
-            return Err(fail(
-                EXIT_PAYLOAD_LOST,
-                "the grant's payload was lost (server restarted before the read); \
-                 submit a new request for re-approval",
-            ));
+            if status.is_client_error() {
+                // Definitive, fully parsed 4xx: retrying cannot change it.
+                return Ok(Err(fail(
+                    EXIT_OTHER,
+                    format!("grant read failed: {}", api_error_message(status, &text)),
+                )));
+            }
+            if !status.is_success() {
+                // 5xx and everything else: transient, retry (same idem key).
+                return Err(format!(
+                    "grant read failed: {}",
+                    api_error_message(status, &text)
+                ));
+            }
+            match serde_json::from_str::<ReadGrantResponse>(&text) {
+                Ok(released) => Ok(Ok(released)),
+                // Truncated/garbled success body: retry replays the release.
+                Err(e) => Err(format!("unexpected read response from server: {e}")),
+            }
         }
-        if !status.is_success() {
-            return Err(fail(
-                EXIT_OTHER,
-                format!("grant read failed: {}", api_error_message(status, &text)),
-            ));
+        .await;
+        match attempt_result {
+            Ok(done) => return done,
+            Err(msg) => {
+                eprintln!("keychute: grant read attempt {attempt}/{READ_ATTEMPTS} failed: {msg}");
+                last_err = msg;
+            }
         }
-        let released: ReadGrantResponse = serde_json::from_str(&text).map_err(|e| {
-            fail(
-                EXIT_OTHER,
-                format!("unexpected read response from server: {e}"),
-            )
-        })?;
-        return Ok(released);
     }
     Err(fail(
         EXIT_OTHER,
-        format!(
-            "grant read failed after {READ_ATTEMPTS} attempts: {}",
-            last_err.map(|e| e.to_string()).unwrap_or_default()
-        ),
+        format!("grant read failed after {READ_ATTEMPTS} attempts: {last_err}"),
     ))
 }
 
@@ -623,6 +669,18 @@ mod tests {
         assert_eq!(k1, "cli-abc-123");
         assert_eq!(k1, k2);
         assert_ne!(read_idempotency_key("other"), k1);
+    }
+
+    #[test]
+    fn idempotency_key_length_is_capped_below_server_limits() {
+        assert!(validate_idempotency_key(&"k".repeat(124)).is_ok());
+        assert!(validate_idempotency_key(&"k".repeat(125)).is_err());
+        assert!(validate_idempotency_key("").is_err());
+        // Generated keys (UUID, 36 bytes) are always valid, and the derived
+        // read key never exceeds the read endpoint's cap.
+        let uuid_key = Uuid::new_v4().to_string();
+        assert!(validate_idempotency_key(&uuid_key).is_ok());
+        assert!(read_idempotency_key(&"k".repeat(124)).len() <= 160);
     }
 
     #[test]

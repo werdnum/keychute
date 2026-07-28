@@ -49,7 +49,13 @@ pub async fn reconcile_clients(db: &PgPool, clients: &[ClientConfig]) -> anyhow:
         .bind(c.max_tier.as_int())
         .bind(&mechanisms)
         .bind(auth_kind)
-        .bind(&c.auth.api_token_sha256)
+        // Stored lowercase: authn compares against lowercase-hex digests.
+        .bind(
+            c.auth
+                .api_token_sha256
+                .as_ref()
+                .map(|h| h.trim().to_ascii_lowercase()),
+        )
         .bind(sa_audience)
         .bind(sa_subject)
         .execute(&mut *tx)

@@ -270,6 +270,13 @@ async fn handle_inner(
         .await?
         .ok_or(ApiFailure::PayloadLost)?;
 
+    // The write-ahead attempt row records where the credential is about to be
+    // sent (method/origin/path), before anything leaves the process.
+    let target = db::AuditTarget {
+        method: method.clone(),
+        origin: origin.to_display(),
+        path: canonical.clone(),
+    };
     match db::begin_grant_use(
         &state.db,
         grant_id,
@@ -277,6 +284,7 @@ async fn handle_inner(
         Some(version.id),
         kinds::PROXY_ATTEMPT,
         state.config.limits.replay_window_seconds,
+        Some(&target),
     )
     .await?
     {

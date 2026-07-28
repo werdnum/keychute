@@ -29,7 +29,7 @@ async fn wait_pending_request_id(env: &TestEnv) -> String {
     .await
 }
 
-fn wait_cli(mut child: std::process::Child) -> (i32, Vec<u8>, String) {
+fn wait_cli(child: std::process::Child) -> (i32, Vec<u8>, String) {
     let out = child.wait_with_output().expect("waiting for CLI");
     (
         out.status.code().unwrap_or(-1),

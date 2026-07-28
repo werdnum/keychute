@@ -169,8 +169,22 @@ impl Config {
         if let Ok(url) = std::env::var("KEYCHUTE_DATABASE_URL") {
             config.database_url = Some(url);
         }
+        config.normalize();
         config.validate()?;
         Ok(config)
+    }
+
+    /// Normalize post-parse: token hashes compare against lowercase-hex
+    /// SHA-256 digests, so uppercase config values would never authenticate.
+    pub fn normalize(&mut self) {
+        for c in &mut self.clients {
+            if let Some(h) = &mut c.auth.api_token_sha256 {
+                *h = h.trim().to_ascii_lowercase();
+            }
+        }
+        if let Some(s) = &mut self.human_auth.r#static {
+            s.token_sha256 = s.token_sha256.trim().to_ascii_lowercase();
+        }
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -258,5 +272,44 @@ impl Config {
 
     pub fn database_url(&self) -> &str {
         self.database_url.as_deref().expect("validated")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BASE_YAML: &str = r#"
+listen_addr: "127.0.0.1:8443"
+external_url: "https://keychute.example.dev"
+allow_insecure_http: true
+database_url: "postgres://x/y"
+kek_file: "/etc/keychute/keyset.json"
+human_auth:
+  mode: static
+  static:
+    token_sha256: "ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789"
+    subject: "andrew"
+clients:
+  - name: "agent"
+    max_tier: "cooperating-client"
+    mechanisms: ["cli-read"]
+    auth:
+      api_token_sha256: "  FFEE00112233445566778899AABBCCDDEEFF00112233445566778899AABBCC  "
+"#;
+
+    #[test]
+    fn normalize_lowercases_token_hashes() {
+        let mut cfg: Config = serde_yaml::from_str(BASE_YAML).unwrap();
+        cfg.normalize();
+        cfg.validate().unwrap();
+        assert_eq!(
+            cfg.clients[0].auth.api_token_sha256.as_deref(),
+            Some("ffee00112233445566778899aabbccddeeff00112233445566778899aabbcc")
+        );
+        assert_eq!(
+            cfg.human_auth.r#static.as_ref().unwrap().token_sha256,
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+        );
     }
 }

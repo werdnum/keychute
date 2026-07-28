@@ -76,7 +76,9 @@ pub async fn read(
     if req.idempotency_key.is_empty() {
         return Err(ApiFailure::InvalidRequest("idempotency_key is required"));
     }
-    if req.idempotency_key.len() > 128 {
+    // 160 leaves headroom over the request-key cap (128) for client-derived
+    // prefixes such as the CLI's `cli-` (which itself enforces <= 124 bytes).
+    if req.idempotency_key.len() > 160 {
         return Err(ApiFailure::RequestTooLarge("idempotency_key too long"));
     }
 
@@ -122,6 +124,7 @@ pub async fn read(
         Some(version_id),
         kinds::RELEASE_ATTEMPT,
         state.config.limits.replay_window_seconds,
+        None,
     )
     .await?;
 

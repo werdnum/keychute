@@ -1,21 +1,49 @@
 //! Store-layer additions owned by the client-API task. Keep API-specific
 //! queries here rather than editing the Phase-A modules.
 
+use crate::audit::{insert_audit, kinds, AuditEvent};
+
 use super::clients::ClientRow;
 use super::grants::GrantRow;
-use super::requests::{AccessRequestRow, InsertedRequest, NewAccessRequest};
+use super::requests::{AccessRequestRow, NewAccessRequest};
 use sqlx::PgPool;
 use uuid::Uuid;
+
+/// Outcome of [`insert_access_request_with_id`].
+#[derive(Debug, Clone)]
+pub enum InsertOutcome {
+    /// New row committed (with its `request-created` audit row in the same
+    /// transaction).
+    Created(AccessRequestRow),
+    /// An existing row for (idem_client, idem_key) was returned — an
+    /// idempotent retry. The caller decides 200-vs-409 by comparing
+    /// `idem_mac` with the MAC of the incoming payload. Never subject to the
+    /// pending cap.
+    Existing(AccessRequestRow),
+    /// The insert was rolled back: it would have pushed the client's pending
+    /// count over `pending_cap`. Nothing was written (no row, no audit).
+    PendingCapExceeded,
+}
 
 /// Idempotent insert with an app-generated request id. The id must be known
 /// before insert so the client context can be sealed with a
 /// `RequestContext { request_id }` AAD. Same `ON CONFLICT` semantics as
 /// [`super::requests::insert_access_request`].
+///
+/// One transaction: KEK shared advisory lock (when a wrapped DEK is stored,
+/// addendum #19), the insert, the pending-cap check (`pending_cap`, applied
+/// only to newly created rows so idempotent retries always succeed), and the
+/// `request-created` audit row.
 pub async fn insert_access_request_with_id(
     db: &PgPool,
     id: Uuid,
     req: &NewAccessRequest,
-) -> anyhow::Result<InsertedRequest> {
+    pending_cap: Option<i64>,
+) -> anyhow::Result<InsertOutcome> {
+    let mut tx = db.begin().await?;
+    if req.context_wrapped_dek.is_some() {
+        super::take_kek_shared_lock(&mut tx).await?;
+    }
     let inserted = sqlx::query_as::<_, AccessRequestRow>(
         "INSERT INTO access_requests \
          (id, client_name, secret_name, mechanism, constraints, \
@@ -38,11 +66,39 @@ pub async fn insert_access_request_with_id(
     .bind(&req.idem_client)
     .bind(&req.idem_key)
     .bind(&req.idem_mac)
-    .fetch_optional(db)
+    .fetch_optional(&mut *tx)
     .await?;
     if let Some(row) = inserted {
-        return Ok(InsertedRequest { row, created: true });
+        if let Some(cap) = pending_cap {
+            let pending: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM access_requests \
+                 WHERE client_name = $1 AND state = 'pending'",
+            )
+            .bind(&req.client_name)
+            .fetch_one(&mut *tx)
+            .await?;
+            // The count includes the row just inserted.
+            if pending > cap {
+                tx.rollback().await?;
+                return Ok(InsertOutcome::PendingCapExceeded);
+            }
+        }
+        insert_audit(
+            &mut *tx,
+            &AuditEvent {
+                kind: kinds::REQUEST_CREATED,
+                request_id: Some(row.id),
+                client_name: Some(req.client_name.clone()),
+                secret_name: Some(req.secret_name.clone()),
+                detail: Some(serde_json::json!({ "mechanism": req.mechanism })),
+                ..Default::default()
+            },
+        )
+        .await?;
+        tx.commit().await?;
+        return Ok(InsertOutcome::Created(row));
     }
+    tx.rollback().await?;
     let row = sqlx::query_as::<_, AccessRequestRow>(
         "SELECT * FROM access_requests WHERE idem_client = $1 AND idem_key = $2",
     )
@@ -50,10 +106,7 @@ pub async fn insert_access_request_with_id(
     .bind(&req.idem_key)
     .fetch_one(db)
     .await?;
-    Ok(InsertedRequest {
-        row,
-        created: false,
-    })
+    Ok(InsertOutcome::Existing(row))
 }
 
 /// The grant minted for a request, if any (unique on request_id).

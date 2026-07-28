@@ -2,7 +2,6 @@
 
 use crate::api::error::ApiFailure;
 use crate::api::{canonical, status_from_row};
-use crate::audit::{insert_audit, kinds, AuditEvent};
 use crate::authn::client::{authenticate_client, AuthedClient};
 use crate::crypto::{self, AadContext, SecretBytes};
 use crate::db;
@@ -252,13 +251,6 @@ pub async fn create(
         Utc::now(),
     );
 
-    if matches!(evaluation.decision, policy::Decision::RequireApproval) {
-        let pending = db::count_pending_for_client(&state.db, client.name()).await?;
-        if pending >= state.config.limits.max_pending_per_client {
-            return Err(ApiFailure::TooManyPending);
-        }
-    }
-
     // App-generated id so the encrypted context is AAD-bound to the row.
     let request_id = Uuid::new_v4();
     let sealed_context = if req.context.reason.is_empty() && req.context.structured.is_none() {
@@ -303,33 +295,31 @@ pub async fn create(
         idem_key: req.idempotency_key.clone(),
         idem_mac: idem_mac.to_vec(),
     };
-    let inserted =
-        db::api_ext::insert_access_request_with_id(&state.db, request_id, &new_row).await?;
-
-    if !inserted.created {
-        // Idempotent retry: same MAC returns the existing state; anything
-        // else is a key reuse.
-        if !crypto::ct_eq(&inserted.row.idem_mac, &idem_mac) {
-            return Err(ApiFailure::IdempotencyKeyReuse);
-        }
-        let status = status_from_row(&state, &inserted.row).await?;
-        return Ok((StatusCode::OK, Json(status)).into_response());
-    }
-    let row = inserted.row;
-
-    insert_audit(
+    // The pending cap is enforced inside the insert transaction, and only for
+    // newly created rows: an idempotent retry of an existing request must
+    // never 429. The `request-created` audit row commits with the insert.
+    let pending_cap = matches!(evaluation.decision, policy::Decision::RequireApproval)
+        .then_some(state.config.limits.max_pending_per_client);
+    let row = match db::api_ext::insert_access_request_with_id(
         &state.db,
-        &AuditEvent {
-            kind: kinds::REQUEST_CREATED,
-            request_id: Some(row.id),
-            client_name: Some(client.name().to_owned()),
-            secret_name: Some(req.secret_name.clone()),
-            detail: Some(serde_json::json!({ "mechanism": req.mechanism.as_str() })),
-            ..Default::default()
-        },
+        request_id,
+        &new_row,
+        pending_cap,
     )
-    .await
-    .map_err(|e| ApiFailure::Internal(e.into()))?;
+    .await?
+    {
+        db::api_ext::InsertOutcome::PendingCapExceeded => return Err(ApiFailure::TooManyPending),
+        db::api_ext::InsertOutcome::Existing(row) => {
+            // Idempotent retry: same MAC returns the existing state; anything
+            // else is a key reuse.
+            if !crypto::ct_eq(&row.idem_mac, &idem_mac) {
+                return Err(ApiFailure::IdempotencyKeyReuse);
+            }
+            let status = status_from_row(&state, &row).await?;
+            return Ok((StatusCode::OK, Json(status)).into_response());
+        }
+        db::api_ext::InsertOutcome::Created(row) => row,
+    };
 
     match evaluation.decision {
         policy::Decision::Deny { reason } => {
@@ -364,7 +354,7 @@ pub async fn create(
                     ApiFailure::Internal(anyhow::anyhow!("freshly created request not pending"))
                 })?;
             state.resolve_notify.notify_waiters();
-            if notify_only {
+            if notify_only && state.notifier.is_real() {
                 // FYI only: the release proceeds regardless of delivery.
                 let n = approval_notification(
                     &state,
@@ -388,19 +378,38 @@ pub async fn create(
             Ok((StatusCode::CREATED, Json(status)).into_response())
         }
         policy::Decision::RequireApproval => {
-            let n = approval_notification(
-                &state,
-                client.name(),
-                req.mechanism,
-                constraints.ttl_seconds,
-                secret.as_ref().map(|s| s.name.as_str()),
-                row.id,
-            );
-            match state.notifier.send(&n).await {
-                Ok(()) => db::mark_push_delivered(&state.db, row.id).await?,
-                Err(e) => {
-                    tracing::warn!(error = %e, "approval push failed; sweeper will retry");
-                    db::increment_push_attempts(&state.db, row.id).await?;
+            // No notifier configured: leave push_delivered_at NULL so the row
+            // honestly reads "undelivered" (the sweeper also skips it).
+            if state.notifier.is_real() {
+                // Same dedup as the sweeper (addendum #10: the key includes
+                // the normalized-constraints jsonb). A duplicate push within
+                // the window means the operator was just told about an
+                // identical pending request; mark this one delivered too so
+                // the sweeper does not re-send it seconds later.
+                let deduped = db::ui_ext::recent_duplicate_push(
+                    &state.db,
+                    &row,
+                    Utc::now() - Duration::seconds(crate::notify::PUSH_DEDUP_WINDOW_SECONDS),
+                )
+                .await?;
+                if deduped {
+                    db::mark_push_delivered(&state.db, row.id).await?;
+                } else {
+                    let n = approval_notification(
+                        &state,
+                        client.name(),
+                        req.mechanism,
+                        constraints.ttl_seconds,
+                        secret.as_ref().map(|s| s.name.as_str()),
+                        row.id,
+                    );
+                    match state.notifier.send(&n).await {
+                        Ok(()) => db::mark_push_delivered(&state.db, row.id).await?,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "approval push failed; sweeper will retry");
+                            db::increment_push_attempts(&state.db, row.id).await?;
+                        }
+                    }
                 }
             }
             let status = keychute_types::AccessRequestStatus {

@@ -3,9 +3,10 @@
 //!
 //! Rules: percent-decode exactly once; reject anything ambiguous (bad or
 //! partial escapes, encoded `/` or `\`, raw `\`, `.`/`..` segments, non-UTF8,
-//! control characters). Duplicate slashes (`//`) are *allowed* and treated
-//! literally: segments are compared byte-for-byte, never collapsed, so an
-//! empty segment is just an empty segment and cannot alias another path.
+//! control characters, duplicate slashes). Duplicate slashes (`//`) are
+//! rejected outright: an all-slash prefix would strip to the empty string in
+//! `prefix_matches` and become unconstrained, and upstream servers disagree on
+//! whether `//` aliases `/`, so the ambiguity is refused at the door.
 
 /// Canonicalize the raw path portion of a URL (no query string).
 ///
@@ -59,6 +60,12 @@ pub fn canonicalize(raw: &str) -> Result<String, &'static str> {
         return Err("dot segment in path");
     }
 
+    // Duplicate slashes create empty segments; an all-slash prefix would
+    // otherwise strip to nothing and match everything. Reject outright.
+    if s.contains("//") {
+        return Err("duplicate slash in path");
+    }
+
     Ok(s)
 }
 
@@ -81,8 +88,9 @@ pub fn prefix_matches(prefix: &str, path: &str) -> bool {
     }
     let p = prefix.trim_end_matches('/');
     if p.is_empty() {
-        // e.g. "//" — after stripping there is no segment content; treat like root.
-        return true;
+        // e.g. "//" — not canonical (canonicalize rejects duplicate slashes);
+        // fail closed rather than treating an all-slash prefix as root.
+        return false;
     }
     path == p || (path.len() > p.len() && path.as_bytes()[p.len()] == b'/' && path.starts_with(p))
 }

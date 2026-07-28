@@ -10,14 +10,7 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-/// Addendum #19: transactions inserting a wrapped DEK take the shared side of
-/// the KEK-retirement advisory lock.
-async fn take_kek_shared_lock(tx: &mut sqlx::PgConnection) -> Result<(), sqlx::Error> {
-    sqlx::query("SELECT pg_advisory_xact_lock_shared(hashtext('keychute-kek'))")
-        .execute(tx)
-        .await?;
-    Ok(())
-}
+use crate::db::take_kek_shared_lock;
 
 /// Secret created at approval time ("store this secret in Keychute",
 /// addendum #16). `secret_id` is app-generated so the payload can be sealed
@@ -30,8 +23,11 @@ pub struct StoreSecretParams {
     pub max_tier: i32,
     /// 'bearer' | 'header' | 'basic'.
     pub injection_kind: String,
-    /// Header name for 'header'; username for 'basic'; NULL for 'bearer'.
+    /// Header name for 'header'; NULL for 'bearer' and 'basic'.
     pub injection_header: Option<String>,
+    /// Username for 'basic' (migration 0003); NULL otherwise. The proxy also
+    /// falls back to `injection_header` for pre-0003 'basic' rows.
+    pub injection_username: Option<String>,
     /// Sealed under the durable keyset with AAD SecretVersion{secret_id, 1}.
     pub sealed: Sealed,
 }
@@ -71,8 +67,9 @@ pub async fn approve_request(
     if let Some(s) = store {
         sqlx::query(
             "INSERT INTO secrets \
-             (id, name, description, max_tier, injection_kind, injection_header, current_version) \
-             VALUES ($1, $2, $3, $4, $5, $6, 1)",
+             (id, name, description, max_tier, injection_kind, injection_header, \
+              injection_username, current_version) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 1)",
         )
         .bind(s.secret_id)
         .bind(&s.name)
@@ -80,6 +77,7 @@ pub async fn approve_request(
         .bind(s.max_tier)
         .bind(&s.injection_kind)
         .bind(&s.injection_header)
+        .bind(&s.injection_username)
         .execute(&mut *tx)
         .await?;
         sqlx::query(
@@ -165,8 +163,9 @@ pub async fn create_secret_with_version(
     take_kek_shared_lock(&mut tx).await?;
     sqlx::query(
         "INSERT INTO secrets \
-         (id, name, description, max_tier, injection_kind, injection_header, current_version) \
-         VALUES ($1, $2, $3, $4, $5, $6, 1)",
+         (id, name, description, max_tier, injection_kind, injection_header, \
+          injection_username, current_version) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 1)",
     )
     .bind(store.secret_id)
     .bind(&store.name)
@@ -174,6 +173,7 @@ pub async fn create_secret_with_version(
     .bind(store.max_tier)
     .bind(&store.injection_kind)
     .bind(&store.injection_header)
+    .bind(&store.injection_username)
     .execute(&mut *tx)
     .await?;
     sqlx::query(
@@ -431,6 +431,7 @@ mod tests {
             max_tier: 2,
             injection_kind: "bearer".into(),
             injection_header: None,
+            injection_username: None,
             sealed,
         };
         let grant_id = Uuid::new_v4();
@@ -595,6 +596,7 @@ mod tests {
                 max_tier: 0,
                 injection_kind: "header".into(),
                 injection_header: Some("X-Api-Key".into()),
+                injection_username: None,
                 sealed,
             },
             "andrew",

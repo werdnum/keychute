@@ -392,7 +392,6 @@ mod tests {
             ("/%41bc", "/Abc"),
             ("/a%20b", "/a b"),
             ("/a%25b", "/a%b"), // decoded once: literal '%' survives
-            ("/a//b", "/a//b"), // duplicate slashes kept literally
             ("/a/b/", "/a/b/"),
             ("/caf%C3%A9", "/café"),
             ("/...x", "/...x"), // not a dot segment
@@ -419,6 +418,10 @@ mod tests {
             "/a\u{7}b", // raw control char
             "/%00",     // NUL
             "/%FF%FE",  // non-UTF8 after decode
+            "//",       // all-slash: would strip to an unconstrained prefix
+            "///",      // all-slash
+            "/a//b",    // duplicate slash (empty segment)
+            "/a/b//",   // trailing duplicate slash
         ];
         for raw in bad {
             assert!(canonicalize(raw).is_err(), "expected reject: {raw:?}");
@@ -439,8 +442,10 @@ mod tests {
             ("/v1/account/", "/v1/account", true), // trailing slash stripped
             ("/v1/account/", "/v1/account/x", true),
             ("/v1", "/v2/x", false),
-            ("/a//b", "/a//b/c", true), // literal duplicate slashes
-            ("/a//b", "/a/b/c", false),
+            // Non-canonical all-slash prefixes fail closed (never match),
+            // and canonicalize() rejects them before they can be stored.
+            ("//", "/anything", false),
+            ("///", "/anything", false),
         ];
         for (prefix, path, want) in cases {
             assert_eq!(

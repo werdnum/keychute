@@ -18,10 +18,35 @@ pub mod ui_ext;
 #[cfg(test)]
 mod tests;
 
+/// Addendum #19: transactions inserting a wrapped DEK take the shared side of
+/// the KEK-retirement advisory lock, so KEK retirement (exclusive side) can
+/// verify no new references appear while it checks.
+pub(crate) async fn take_kek_shared_lock(tx: &mut sqlx::PgConnection) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_xact_lock_shared(hashtext('keychute-kek'))")
+        .execute(tx)
+        .await?;
+    Ok(())
+}
+
+/// Addendum #19 (`verify_no_references`): rows still wrapped under `kek_id`.
+/// Counts `secret_versions.kek_id` and `access_requests.context_kek_id`.
+/// Grant passthrough payloads carry no kek_id column: durable passthroughs are
+/// wrapped under the active KEK and short-lived, and ephemeral ones die with
+/// the process, so they are intentionally not counted here.
+pub async fn count_wrapped_dek_references(db: &sqlx::PgPool, kek_id: &str) -> anyhow::Result<i64> {
+    Ok(sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM secret_versions WHERE kek_id = $1) \
+              + (SELECT count(*) FROM access_requests WHERE context_kek_id = $1)",
+    )
+    .bind(kek_id)
+    .fetch_one(db)
+    .await?)
+}
+
 pub use clients::{get_client_by_name, list_clients, reconcile_clients, ClientRow};
 pub use grants::{
     begin_grant_use, get_grant, list_grants, purge_passthrough, revoke_grant,
-    sweep_purge_passthroughs, GrantRow, GrantUse,
+    sweep_purge_passthroughs, AuditTarget, GrantRow, GrantUse,
 };
 pub use policies::{delete_policy, insert_policy, list_policies, NewPolicy, PolicyRow};
 pub use requests::{

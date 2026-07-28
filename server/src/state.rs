@@ -45,7 +45,7 @@ impl AppState {
         sqlx::migrate!("../migrations").run(&db).await?;
         crate::db::reconcile_clients(&db, &config.clients).await?;
 
-        let notifier = crate::notify::build_notifier(&config);
+        let notifier = crate::notify::build_notifier(&config)?;
         let mut upstream_builder = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(std::time::Duration::from_secs(10));

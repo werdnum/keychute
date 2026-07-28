@@ -40,7 +40,16 @@ fn split_field(s: &str) -> Option<(&str, &str)> {
 
 /// Walk from `start` up the parent chain, collecting at most `max_levels`
 /// command lines (starting with `start` itself).
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn walk(table: &PsTable, start: u32, max_levels: usize) -> Vec<String> {
+    walk_pids(table, start, max_levels)
+        .into_iter()
+        .map(|(_, command)| command)
+        .collect()
+}
+
+/// Like [`walk`], but keeps the pids alongside the command lines.
+fn walk_pids(table: &PsTable, start: u32, max_levels: usize) -> Vec<(u32, String)> {
     let mut out = Vec::new();
     let mut pid = start;
     let mut seen = std::collections::HashSet::new();
@@ -51,7 +60,7 @@ pub fn walk(table: &PsTable, start: u32, max_levels: usize) -> Vec<String> {
         let Some((ppid, command)) = table.get(&pid) else {
             break;
         };
-        out.push(command.clone());
+        out.push((pid, command.clone()));
         if *ppid == 0 || *ppid == pid {
             break;
         }
@@ -60,10 +69,60 @@ pub fn walk(table: &PsTable, start: u32, max_levels: usize) -> Vec<String> {
     out
 }
 
+/// True when a command line looks like a shell (`-zsh`, `/bin/bash`, `sh -c`).
+/// A fixed name list avoids false positives such as `ssh`.
+fn looks_like_shell(command: &str) -> bool {
+    const SHELLS: &[&str] = &[
+        "sh", "bash", "zsh", "ksh", "dash", "ash", "csh", "tcsh", "fish",
+    ];
+    let first = command.split_whitespace().next().unwrap_or("");
+    let base = first.rsplit('/').next().unwrap_or(first);
+    SHELLS.contains(&base.trim_start_matches('-'))
+}
+
+/// Best-effort pipeline capture: ancestor command lines plus, when a shell
+/// ancestor is found, that shell's OTHER children from the same `ps` snapshot
+/// — the pipeline peers (e.g. the consumer after the `|`). Agent-asserted
+/// context only; the snapshot is agent-influenceable and never verified.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Capture {
+    pub ancestors: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub siblings: Vec<String>,
+}
+
+/// Analyze one `ps` snapshot. Returns `None` when nothing was captured.
+pub fn analyze(table: &PsTable, start: u32, max_levels: usize) -> Option<Capture> {
+    let chain = walk_pids(table, start, max_levels);
+    if chain.is_empty() {
+        return None;
+    }
+    let chain_pids: std::collections::HashSet<u32> = chain.iter().map(|(p, _)| *p).collect();
+    // First shell in the ancestor chain (excluding ourselves at index 0).
+    let shell_pid = chain
+        .iter()
+        .skip(1)
+        .find(|(_, cmd)| looks_like_shell(cmd))
+        .map(|(pid, _)| *pid);
+    let mut siblings: Vec<(u32, String)> = match shell_pid {
+        Some(shell) => table
+            .iter()
+            .filter(|(pid, (ppid, _))| *ppid == shell && !chain_pids.contains(pid))
+            .map(|(pid, (_, cmd))| (*pid, cmd.clone()))
+            .collect(),
+        None => Vec::new(),
+    };
+    siblings.sort(); // deterministic order (by pid)
+    Some(Capture {
+        ancestors: chain.into_iter().map(|(_, cmd)| cmd).collect(),
+        siblings: siblings.into_iter().map(|(_, cmd)| cmd).collect(),
+    })
+}
+
 /// Capture the invoking pipeline for the current process. Best-effort:
 /// returns `None` on any failure or when nothing was captured.
 #[cfg(unix)]
-pub fn capture() -> Option<Vec<String>> {
+pub fn capture() -> Option<Capture> {
     let out = std::process::Command::new("ps")
         .args(["-o", "pid=,ppid=,command=", "-ax"])
         .output()
@@ -73,16 +132,11 @@ pub fn capture() -> Option<Vec<String>> {
     }
     let text = String::from_utf8_lossy(&out.stdout);
     let table = parse_ps(&text);
-    let chain = walk(&table, std::process::id(), 5);
-    if chain.is_empty() {
-        None
-    } else {
-        Some(chain)
-    }
+    analyze(&table, std::process::id(), 5)
 }
 
 #[cfg(not(unix))]
-pub fn capture() -> Option<Vec<String>> {
+pub fn capture() -> Option<Capture> {
     None
 }
 
@@ -136,6 +190,52 @@ mod tests {
         let chain = walk(&table, 789, 2);
         assert_eq!(chain.len(), 2);
         assert_eq!(chain[1], "-zsh");
+    }
+
+    #[test]
+    fn analyze_includes_pipeline_siblings_from_the_shell() {
+        let table = parse_ps(CANNED);
+        let cap = analyze(&table, 789, 5).unwrap();
+        assert_eq!(
+            cap.ancestors,
+            vec![
+                "keychute request my-service-api-key --reason seal",
+                "-zsh",
+                "/usr/bin/login -f agent",
+                "/sbin/launchd",
+            ]
+        );
+        // kubeseal (pid 790) shares the -zsh parent: it is the downstream
+        // pipeline peer, not an ancestor.
+        assert_eq!(cap.siblings, vec!["kubeseal --format yaml"]);
+    }
+
+    #[test]
+    fn analyze_without_shell_ancestor_has_no_siblings() {
+        // launchd -> keychute directly: no shell in the chain.
+        let mut table = PsTable::new();
+        table.insert(1, (0, "/sbin/launchd".into()));
+        table.insert(50, (1, "keychute request x".into()));
+        table.insert(51, (1, "other-child".into()));
+        let cap = analyze(&table, 50, 5).unwrap();
+        assert_eq!(cap.ancestors, vec!["keychute request x", "/sbin/launchd"]);
+        assert!(cap.siblings.is_empty());
+        // Nothing captured at all -> None.
+        assert!(analyze(&table, 99999, 5).is_none());
+    }
+
+    #[test]
+    fn shell_detection() {
+        for s in ["-zsh", "/bin/bash", "sh -c 'x | y'", "/usr/bin/fish"] {
+            assert!(looks_like_shell(s), "{s:?}");
+        }
+        for s in [
+            "kubeseal --format yaml",
+            "/usr/bin/login -f agent",
+            "ssh host",
+        ] {
+            assert!(!looks_like_shell(s), "{s:?}");
+        }
     }
 
     #[test]

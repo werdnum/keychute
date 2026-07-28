@@ -109,11 +109,52 @@ impl Mechanism {
 }
 
 /// An HTTPS origin constraint. Scheme is fixed to https by construction.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// `Deserialize` is implemented by hand so that API-supplied `{host, port}`
+/// objects go through the same validation/normalization as [`Origin::parse`]:
+/// there is no way to smuggle an unvalidated host into a stored constraint.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct Origin {
     pub host: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
+}
+
+impl<'de> Deserialize<'de> for Origin {
+    fn deserialize<D>(deserializer: D) -> Result<Origin, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawOrigin {
+            host: String,
+            #[serde(default)]
+            port: Option<u16>,
+        }
+        let raw = RawOrigin::deserialize(deserializer)?;
+        // The object shape carries the port separately; a ':' inside the host
+        // field is always invalid (it would be re-parsed as host:port).
+        if raw.host.contains(':') {
+            return Err(serde::de::Error::custom(format!(
+                "invalid origin host {:?}: ':' not allowed (use the port field)",
+                raw.host
+            )));
+        }
+        if raw.port == Some(0) {
+            return Err(serde::de::Error::custom(
+                "port 0 is not a valid origin port",
+            ));
+        }
+        // Reuse Origin::parse for host validation and normalization
+        // (userinfo/path/query/fragment/wildcard/bad chars rejected;
+        // lowercased; trailing dot stripped).
+        let parsed = Origin::parse(&raw.host).map_err(serde::de::Error::custom)?;
+        debug_assert!(parsed.port.is_none());
+        Ok(Origin {
+            host: parsed.host,
+            port: raw.port,
+        })
+    }
 }
 
 impl Origin {
@@ -333,6 +374,35 @@ mod tests {
         let a = Origin::parse("x.com").unwrap();
         let b = Origin::parse("x.com:443").unwrap();
         assert!(a.same_target(&b));
+    }
+
+    #[test]
+    fn origin_deserialize_validates_and_normalizes() {
+        // Userinfo smuggled into the host field must fail.
+        assert!(serde_json::from_value::<Origin>(serde_json::json!({
+            "host": "trusted.example@attacker.example"
+        }))
+        .is_err());
+        // Normalization matches Origin::parse: lowercase, trailing dot gone.
+        let o: Origin =
+            serde_json::from_value(serde_json::json!({"host": "API.Example.com."})).unwrap();
+        assert_eq!(o.host, "api.example.com");
+        assert_eq!(o.port, None);
+        // Port carried through; port 0 rejected.
+        let o: Origin =
+            serde_json::from_value(serde_json::json!({"host": "x.com", "port": 8443})).unwrap();
+        assert_eq!(o.port, Some(8443));
+        assert!(
+            serde_json::from_value::<Origin>(serde_json::json!({"host": "x.com", "port": 0}))
+                .is_err()
+        );
+        // Bad shapes: empty, wildcard, path, colon-in-host, bad chars.
+        for bad in ["", "*.example.com", "x.com/path", "x.com:443", "a b"] {
+            assert!(
+                serde_json::from_value::<Origin>(serde_json::json!({"host": bad})).is_err(),
+                "expected reject: {bad:?}"
+            );
+        }
     }
 
     #[test]

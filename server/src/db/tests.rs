@@ -253,6 +253,7 @@ async fn begin_grant_use_single_use_semantics() -> anyhow::Result<()> {
                 Some(version_id),
                 audit::kinds::RELEASE_ATTEMPT,
                 60,
+                None,
             )
             .await
             .expect("db error");
@@ -283,6 +284,7 @@ async fn begin_grant_use_single_use_semantics() -> anyhow::Result<()> {
         Some(Uuid::new_v4()), // deliberately different: pinned id must win
         audit::kinds::RELEASE_ATTEMPT,
         60,
+        None,
     )
     .await?
     {
@@ -306,6 +308,7 @@ async fn begin_grant_use_single_use_semantics() -> anyhow::Result<()> {
         Some(version_id),
         audit::kinds::RELEASE_ATTEMPT,
         60,
+        None,
     )
     .await?
     {
@@ -334,6 +337,7 @@ async fn begin_grant_use_single_use_semantics() -> anyhow::Result<()> {
         None,
         audit::kinds::RELEASE_ATTEMPT,
         60,
+        None,
     )
     .await?
     {
@@ -350,6 +354,7 @@ async fn begin_grant_use_single_use_semantics() -> anyhow::Result<()> {
         None,
         audit::kinds::RELEASE_ATTEMPT,
         60,
+        None,
     )
     .await?
     {

@@ -95,8 +95,9 @@ async fn brokered_proxy_injects_credential_and_strips_caller_headers() {
     assert_eq!(r.header("x-custom-passthrough"), Some("keep-me"));
 
     // Audit rows carry method/path/status.
+    type AuditRow = (String, Option<String>, Option<String>, Option<i32>);
     let rid: uuid::Uuid = request_id.parse().unwrap();
-    let rows: Vec<(String, Option<String>, Option<String>, Option<i32>)> = sqlx::query_as(
+    let rows: Vec<AuditRow> = sqlx::query_as(
         "SELECT kind, method, path, status FROM audit_log \
          WHERE request_id = $1 AND kind IN ('proxy-attempt', 'proxy-completed') ORDER BY id",
     )
@@ -107,6 +108,12 @@ async fn brokered_proxy_injects_credential_and_strips_caller_headers() {
     let kinds: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
     assert!(kinds.contains(&"proxy-attempt"), "{kinds:?}");
     assert!(kinds.contains(&"proxy-completed"), "{kinds:?}");
+    // The write-ahead attempt row also records where the credential was about
+    // to be sent (no status yet: it commits before the upstream exchange).
+    let attempt = rows.iter().find(|r| r.0 == "proxy-attempt").unwrap();
+    assert_eq!(attempt.1.as_deref(), Some("POST"));
+    assert_eq!(attempt.2.as_deref(), Some("/v1/echo"));
+    assert_eq!(attempt.3, None);
     let completed = rows.iter().find(|r| r.0 == "proxy-completed").unwrap();
     assert_eq!(completed.1.as_deref(), Some("POST"));
     assert_eq!(completed.2.as_deref(), Some("/v1/echo"));

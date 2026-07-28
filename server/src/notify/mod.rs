@@ -24,15 +24,27 @@ pub struct Notification {
 #[async_trait::async_trait]
 pub trait Notifier: Send + Sync {
     async fn send(&self, n: &Notification) -> anyhow::Result<()>;
+
+    /// False for the no-op notifier: callers must not record a "delivered"
+    /// push (or bother retrying) when nothing can actually be sent.
+    fn is_real(&self) -> bool {
+        true
+    }
 }
 
-/// No-op notifier used when pushover is not configured.
+/// No-op notifier used when pushover is not configured. `send` succeeds so
+/// callers need no special-casing, but `is_real()` is false: requests keep
+/// `push_delivered_at` NULL and the sweeper skips resend attempts.
 pub struct NullNotifier;
 
 #[async_trait::async_trait]
 impl Notifier for NullNotifier {
     async fn send(&self, _n: &Notification) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    fn is_real(&self) -> bool {
+        false
     }
 }
 
@@ -104,18 +116,20 @@ fn build_pushover(cfg: &PushoverConfig) -> anyhow::Result<PushoverNotifier> {
     Ok(PushoverNotifier::new(cfg.base_url.clone(), token, user_key))
 }
 
-pub fn build_notifier(config: &Config) -> Arc<dyn Notifier> {
+/// Build the notifier. A pushover section that is present but broken
+/// (unreadable token file, missing credentials) fails startup rather than
+/// silently degrading to no notifications; an absent section is an explicit
+/// choice and gets the (loudly logged) NullNotifier.
+pub fn build_notifier(config: &Config) -> anyhow::Result<Arc<dyn Notifier>> {
     match &config.pushover {
-        Some(cfg) => match build_pushover(cfg) {
-            Ok(n) => Arc::new(n),
-            Err(err) => {
-                tracing::warn!(error = %err, "pushover misconfigured; notifications disabled");
-                Arc::new(NullNotifier)
-            }
-        },
+        Some(cfg) => {
+            let n =
+                build_pushover(cfg).map_err(|e| anyhow::anyhow!("pushover misconfigured: {e}"))?;
+            Ok(Arc::new(n))
+        }
         None => {
             tracing::warn!("pushover not configured; approval notifications disabled");
-            Arc::new(NullNotifier)
+            Ok(Arc::new(NullNotifier))
         }
     }
 }
@@ -156,7 +170,8 @@ pub async fn secret_push_label(db: &sqlx::PgPool, secret_name: &str) -> anyhow::
 }
 
 const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
-const PUSH_DEDUP_WINDOW_SECONDS: i64 = 60;
+/// Shared with the create-request handler's initial-push dedup.
+pub(crate) const PUSH_DEDUP_WINDOW_SECONDS: i64 = 60;
 const CONTEXT_RETENTION_HOURS: i64 = 24;
 
 /// Spawn the background sweeper: every 30 s — (a) expire stale pending
@@ -188,8 +203,14 @@ async fn sweep_once(state: &AppState) -> anyhow::Result<()> {
     }
 
     // (b) Push retry. Every pending request without a recorded delivery is
-    // retried each sweep (attempts counter is telemetry only).
-    let pending = db::list_pending_needing_push(&state.db, i32::MAX).await?;
+    // retried each sweep (attempts counter is telemetry only). With no real
+    // notifier nothing can be delivered: skip the loop entirely rather than
+    // spinning on rows that will never be marked delivered.
+    let pending = if state.notifier.is_real() {
+        db::list_pending_needing_push(&state.db, i32::MAX).await?
+    } else {
+        Vec::new()
+    };
     for row in pending {
         let dedup = db::ui_ext::recent_duplicate_push(
             &state.db,
@@ -234,6 +255,35 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::Mutex;
+
+    #[test]
+    fn null_notifier_is_not_real_and_pushover_is() {
+        assert!(!NullNotifier.is_real());
+        let p = PushoverNotifier::new("https://api.pushover.net".into(), "t".into(), "u".into());
+        assert!(p.is_real());
+    }
+
+    #[test]
+    fn broken_pushover_config_is_an_error() {
+        // Unreadable token_path: startup must fail, not degrade to NullNotifier.
+        let cfg = PushoverConfig {
+            base_url: "https://api.pushover.net".into(),
+            token: None,
+            token_path: Some("/nonexistent/keychute-pushover-token".into()),
+            user_key: Some("u".into()),
+            user_key_path: None,
+        };
+        assert!(build_pushover(&cfg).is_err());
+        // Missing credentials entirely is also an error.
+        let cfg = PushoverConfig {
+            base_url: "https://api.pushover.net".into(),
+            token: None,
+            token_path: None,
+            user_key: None,
+            user_key_path: None,
+        };
+        assert!(build_pushover(&cfg).is_err());
+    }
 
     #[test]
     fn notification_vocabulary() {

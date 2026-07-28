@@ -6,6 +6,15 @@ use chrono::{DateTime, Duration, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+/// Where the credential is about to be sent (proxy leg): recorded on the
+/// write-ahead audit row. The read path has no target and passes `None`.
+#[derive(Debug, Clone)]
+pub struct AuditTarget {
+    pub method: String,
+    pub origin: String,
+    pub path: String,
+}
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct GrantRow {
     pub id: Uuid,
@@ -66,6 +75,7 @@ pub async fn begin_grant_use(
     secret_version_id: Option<Uuid>,
     audit_kind: &'static str,
     replay_window_seconds: i64,
+    target: Option<&AuditTarget>,
 ) -> anyhow::Result<GrantUse> {
     let mut tx = db.begin().await?;
     let grant = sqlx::query_as::<_, GrantRow>("SELECT * FROM grants WHERE id = $1 FOR UPDATE")
@@ -75,22 +85,32 @@ pub async fn begin_grant_use(
     let Some(grant) = grant else {
         return Ok(GrantUse::NotFound);
     };
-    let now = Utc::now();
-    if grant.revoked || now >= grant.not_after {
+    // Revocation/expiry evaluated in SQL (DB clock), inside the row lock.
+    // This gates both the replay path and the fresh-use path.
+    let live: bool =
+        sqlx::query_scalar("SELECT NOT revoked AND now() < not_after FROM grants WHERE id = $1")
+            .bind(grant_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    if !live {
         return Ok(GrantUse::ExpiredOrRevoked);
     }
 
     if let Some(key) = idem_key {
-        let prior: Option<(Option<Uuid>, bool, DateTime<Utc>)> = sqlx::query_as(
-            "SELECT secret_version_id, passthrough, first_read_at \
+        // Replay-window check as a DB-time predicate: `in_window` is computed
+        // by Postgres against `first_read_at`, never the process clock.
+        let prior: Option<(Option<Uuid>, bool, bool)> = sqlx::query_as(
+            "SELECT secret_version_id, passthrough, \
+                    first_read_at > now() - make_interval(secs => $3::double precision) \
              FROM grant_reads WHERE grant_id = $1 AND idem_key = $2",
         )
         .bind(grant_id)
         .bind(key)
+        .bind(replay_window_seconds as f64)
         .fetch_optional(&mut *tx)
         .await?;
-        if let Some((pinned_version, passthrough, first_read_at)) = prior {
-            if now - first_read_at <= Duration::seconds(replay_window_seconds) {
+        if let Some((pinned_version, passthrough, in_window)) = prior {
+            if in_window {
                 insert_audit(
                     &mut *tx,
                     &AuditEvent {
@@ -100,6 +120,9 @@ pub async fn begin_grant_use(
                         client_name: Some(grant.client_name.clone()),
                         secret_name: Some(grant.secret_name.clone()),
                         secret_version_id: pinned_version,
+                        method: target.map(|t| t.method.clone()),
+                        origin: target.map(|t| t.origin.clone()),
+                        path: target.map(|t| t.path.clone()),
                         detail: Some(serde_json::json!({ "replay": true })),
                         ..Default::default()
                     },
@@ -152,6 +175,9 @@ pub async fn begin_grant_use(
             client_name: Some(grant.client_name.clone()),
             secret_name: Some(grant.secret_name.clone()),
             secret_version_id,
+            method: target.map(|t| t.method.clone()),
+            origin: target.map(|t| t.origin.clone()),
+            path: target.map(|t| t.path.clone()),
             ..Default::default()
         },
     )

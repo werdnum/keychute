@@ -57,11 +57,16 @@ pub struct InsertedRequest {
 }
 
 /// Idempotent insert: `ON CONFLICT (idem_client, idem_key) DO NOTHING`, then
-/// select the surviving row.
+/// select the surviving row. Rows storing a wrapped context DEK take the KEK
+/// shared advisory lock for the insert transaction (addendum #19).
 pub async fn insert_access_request(
     db: &PgPool,
     req: &NewAccessRequest,
 ) -> anyhow::Result<InsertedRequest> {
+    let mut tx = db.begin().await?;
+    if req.context_wrapped_dek.is_some() {
+        super::take_kek_shared_lock(&mut tx).await?;
+    }
     let inserted = sqlx::query_as::<_, AccessRequestRow>(
         "INSERT INTO access_requests \
          (client_name, secret_name, mechanism, constraints, \
@@ -83,11 +88,13 @@ pub async fn insert_access_request(
     .bind(&req.idem_client)
     .bind(&req.idem_key)
     .bind(&req.idem_mac)
-    .fetch_optional(db)
+    .fetch_optional(&mut *tx)
     .await?;
     if let Some(row) = inserted {
+        tx.commit().await?;
         return Ok(InsertedRequest { row, created: true });
     }
+    tx.rollback().await?;
     let row = sqlx::query_as::<_, AccessRequestRow>(
         "SELECT * FROM access_requests WHERE idem_client = $1 AND idem_key = $2",
     )

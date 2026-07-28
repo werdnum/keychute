@@ -567,7 +567,16 @@ fn parse_narrow_u64(input: Option<&str>, requested: u64, what: &str) -> UiResult
 }
 
 /// Addendum #4/#17 subset: validate operator-supplied injection template.
-fn validate_injection(kind: &str, header: Option<&str>) -> UiResult<(String, Option<String>)> {
+/// Returns `(injection_kind, injection_header, injection_username)`: the form
+/// has one free-text field (named `injection_header`), routed to the header
+/// column for kind 'header' and to `injection_username` for kind 'basic'
+/// (migration 0003). 'basic-password' is accepted as an alias for 'basic'
+/// (both spellings are also valid in the DB CHECK since migration 0004).
+#[allow(clippy::type_complexity)]
+fn validate_injection(
+    kind: &str,
+    header: Option<&str>,
+) -> UiResult<(String, Option<String>, Option<String>)> {
     const RESERVED: &[&str] = &[
         "host",
         "authorization",
@@ -592,7 +601,7 @@ fn validate_injection(kind: &str, header: Option<&str>) -> UiResult<(String, Opt
         "expect",
     ];
     match kind {
-        "bearer" => Ok(("bearer".into(), None)),
+        "bearer" => Ok(("bearer".into(), None, None)),
         "header" => {
             let name = header.ok_or_else(|| {
                 UiError::bad_request("injection kind 'header' requires a header name")
@@ -627,16 +636,18 @@ fn validate_injection(kind: &str, header: Option<&str>) -> UiResult<(String, Opt
             if RESERVED.contains(&lower.as_str()) || lower.starts_with("x-forwarded-") {
                 return Err(UiError::bad_request("injection header is reserved"));
             }
-            Ok(("header".into(), Some(name.to_owned())))
+            Ok(("header".into(), Some(name.to_owned()), None))
         }
-        "basic" => {
+        "basic" | "basic-password" => {
             let username = header.ok_or_else(|| {
                 UiError::bad_request("injection kind 'basic-password' requires a username")
             })?;
             if username.contains(':') || username.chars().any(|c| c.is_control()) {
                 return Err(UiError::bad_request("invalid basic-auth username"));
             }
-            Ok(("basic".into(), Some(username.to_owned())))
+            // Username goes to injection_username; injection_header stays NULL
+            // (the proxy still falls back to injection_header for old rows).
+            Ok(("basic".into(), None, Some(username.to_owned())))
         }
         _ => Err(UiError::bad_request("unknown injection kind")),
     }
@@ -735,7 +746,7 @@ async fn approve(
                     ));
                 }
                 let kind = non_empty(&form.injection_kind).unwrap_or("bearer");
-                let (injection_kind, injection_header) =
+                let (injection_kind, injection_header, injection_username) =
                     validate_injection(kind, non_empty(&form.injection_header))?;
                 let secret_id = Uuid::new_v4();
                 let sealed = state
@@ -755,6 +766,7 @@ async fn approve(
                     max_tier: max_tier.as_int(),
                     injection_kind,
                     injection_header,
+                    injection_username,
                     sealed,
                 });
             } else {
@@ -1333,7 +1345,7 @@ async fn save_secret(
                 }
             };
             let kind = non_empty(&form.injection_kind).unwrap_or("bearer");
-            let (injection_kind, injection_header) =
+            let (injection_kind, injection_header, injection_username) =
                 validate_injection(kind, non_empty(&form.injection_header))?;
             let secret_id = Uuid::new_v4();
             let sealed = state
@@ -1355,6 +1367,7 @@ async fn save_secret(
                     max_tier: max_tier.as_int(),
                     injection_kind,
                     injection_header,
+                    injection_username,
                     sealed,
                 },
                 &op.subject,
@@ -1370,6 +1383,33 @@ async fn save_secret(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_injection_routes_basic_username_to_username_column() {
+        let Ok((kind, header, username)) = validate_injection("basic", Some("svc")) else {
+            panic!("basic injection should validate");
+        };
+        assert_eq!(kind, "basic");
+        assert_eq!(header, None);
+        assert_eq!(username.as_deref(), Some("svc"));
+        // 'basic-password' is an accepted alias, normalized to 'basic'.
+        let Ok((kind, header, username)) = validate_injection("basic-password", Some("svc")) else {
+            panic!("basic-password alias should validate");
+        };
+        assert_eq!(kind, "basic");
+        assert_eq!(header, None);
+        assert_eq!(username.as_deref(), Some("svc"));
+        // 'header' keeps using the header column; no username.
+        let Ok((kind, header, username)) = validate_injection("header", Some("X-Api-Key")) else {
+            panic!("header injection should validate");
+        };
+        assert_eq!(kind, "header");
+        assert_eq!(header.as_deref(), Some("X-Api-Key"));
+        assert_eq!(username, None);
+        // Bad usernames still rejected.
+        assert!(validate_injection("basic", Some("a:b")).is_err());
+        assert!(validate_injection("basic", None).is_err());
+    }
 
     #[test]
     fn client_context_is_escaped() {
@@ -1430,11 +1470,11 @@ mod tests {
     fn injection_validation() {
         assert_eq!(
             validate_injection("bearer", None).unwrap(),
-            ("bearer".into(), None)
+            ("bearer".into(), None, None)
         );
         assert_eq!(
             validate_injection("header", Some("X-Api-Key")).unwrap(),
-            ("header".into(), Some("X-Api-Key".into()))
+            ("header".into(), Some("X-Api-Key".into()), None)
         );
         assert!(validate_injection("header", None).is_err());
         assert!(validate_injection("header", Some("Authorization")).is_err());
@@ -1444,7 +1484,7 @@ mod tests {
         assert!(validate_injection("header", Some("Transfer-Encoding")).is_err());
         assert_eq!(
             validate_injection("basic", Some("svc-user")).unwrap(),
-            ("basic".into(), Some("svc-user".into()))
+            ("basic".into(), None, Some("svc-user".into()))
         );
         assert!(validate_injection("basic", Some("user:name")).is_err());
         assert!(validate_injection("basic", None).is_err());
