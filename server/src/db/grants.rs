@@ -2,7 +2,7 @@
 //! replay. See docs/IMPLEMENTATION.md §Atomicity requirements.
 
 use crate::audit::{insert_audit, AuditEvent};
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -257,24 +257,28 @@ pub async fn purge_passthrough(db: &PgPool, grant_id: Uuid) -> anyhow::Result<()
 /// Sweep: purge passthrough payloads from grants that are revoked, expired,
 /// or fully consumed with no replay still open (no read newer than the replay
 /// window). Returns rows purged.
+///
+/// Expiry and the replay window are evaluated on the DATABASE clock:
+/// `begin_grant_use` decides "still in the replay window" with SQL `now()`
+/// against `first_read_at`, so a purge cutoff computed from the process clock
+/// could destroy a payload (or a version pin) that a replay is still entitled
+/// to whenever the server clock runs ahead of Postgres.
 pub async fn sweep_purge_passthroughs(
     db: &PgPool,
-    now: DateTime<Utc>,
     replay_window_seconds: i64,
 ) -> anyhow::Result<u64> {
-    let window_start = now - Duration::seconds(replay_window_seconds);
     let res = sqlx::query(
         "UPDATE grants g SET passthrough_ciphertext = NULL, passthrough_nonce = NULL, \
              passthrough_wrapped_dek = NULL \
          WHERE g.passthrough_ciphertext IS NOT NULL \
            AND (g.revoked \
-                OR g.not_after < $1 \
+                OR g.not_after < now() \
                 OR (g.max_uses IS NOT NULL AND g.use_count >= g.max_uses \
                     AND NOT EXISTS (SELECT 1 FROM grant_reads r \
-                                    WHERE r.grant_id = g.id AND r.first_read_at > $2)))",
+                                    WHERE r.grant_id = g.id \
+                                      AND r.first_read_at > now() - make_interval(secs => $1::double precision))))",
     )
-    .bind(now)
-    .bind(window_start)
+    .bind(replay_window_seconds as f64)
     .execute(db)
     .await?;
     Ok(res.rows_affected())

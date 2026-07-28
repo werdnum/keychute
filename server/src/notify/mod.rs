@@ -115,21 +115,28 @@ impl Notifier for PushoverNotifier {
 }
 
 /// Resolve a credential from an inline value or a file path. Trailing
-/// whitespace/newlines in files are trimmed.
+/// whitespace/newlines in files are trimmed. An empty (or whitespace-only)
+/// credential fails startup like a missing one: it would build a "real"
+/// notifier whose every send fails authentication — a healthy-looking pod
+/// that never alerts the operator.
 fn load_credential(
     what: &str,
     value: &Option<String>,
     path: &Option<std::path::PathBuf>,
 ) -> anyhow::Result<String> {
-    if let Some(v) = value {
-        return Ok(v.clone());
-    }
-    if let Some(p) = path {
+    let (resolved, source) = if let Some(v) = value {
+        (v.clone(), "value".to_owned())
+    } else if let Some(p) = path {
         let raw = std::fs::read_to_string(p)
             .map_err(|e| anyhow::anyhow!("reading {what} from {}: {e}", p.display()))?;
-        return Ok(raw.trim().to_owned());
+        (raw.trim().to_owned(), p.display().to_string())
+    } else {
+        anyhow::bail!("pushover {what} missing (value or *_path)")
+    };
+    if resolved.trim().is_empty() {
+        anyhow::bail!("pushover {what} from {source} is empty");
     }
-    anyhow::bail!("pushover {what} missing (value or *_path)")
+    Ok(resolved)
 }
 
 fn build_pushover(cfg: &PushoverConfig) -> anyhow::Result<PushoverNotifier> {
@@ -283,16 +290,18 @@ async fn sweep_once(state: &AppState) -> anyhow::Result<()> {
     // replay rows in the database well past their retention windows, which is
     // precisely what splitting the sweep into phases was meant to prevent.
     //
-    // Each phase also takes its OWN `Utc::now()`: a timestamp captured before a
-    // minutes-long phase would produce stale retention cutoffs (and a stale
-    // push-dedup window). And EVERY phase runs on every sweep — failures are
-    // collected and reported together rather than `?`-ed out early, so one
-    // broken phase can never skip a later one.
+    // Every expiry/retention cutoff is evaluated on the DATABASE clock inside
+    // the queries themselves (matching the replay predicate in
+    // `begin_grant_use`), so there is no process-clock timestamp to go stale
+    // across a minutes-long phase and no skew window in which a purge could
+    // destroy state a replay is still entitled to. And EVERY phase runs on
+    // every sweep — failures are collected and reported together rather than
+    // `?`-ed out early, so one broken phase can never skip a later one.
     let mut errors: Vec<String> = Vec::new();
-    if let Err(err) = expire_phase(state, Utc::now()).await {
+    if let Err(err) = expire_phase(state).await {
         errors.push(format!("expiry phase: {err:#}"));
     }
-    if let Err(err) = purge_phase(state, Utc::now()).await {
+    if let Err(err) = purge_phase(state).await {
         errors.push(format!("purge phase: {err:#}"));
     }
     if let Err(err) = push_phase(state).await {
@@ -307,8 +316,8 @@ async fn sweep_once(state: &AppState) -> anyhow::Result<()> {
 
 /// (a) Expire pending requests past their deadline; waiting clients must
 /// observe the transition.
-async fn expire_phase(state: &AppState, now: chrono::DateTime<Utc>) -> anyhow::Result<()> {
-    let expired = db::expire_stale(&state.db, now).await?;
+async fn expire_phase(state: &AppState) -> anyhow::Result<()> {
+    let expired = db::expire_stale(&state.db).await?;
     if expired > 0 {
         tracing::info!(count = expired, "expired stale access requests");
         state.resolve_notify.notify_waiters();
@@ -501,11 +510,11 @@ pub(crate) async fn claim_for_fyi_push(
 
 /// (b) Purge lifecycle (addendum #11). Runs before the push phase so network
 /// trouble at the notifier can never delay ciphertext deletion.
-async fn purge_phase(state: &AppState, now: chrono::DateTime<Utc>) -> anyhow::Result<()> {
+async fn purge_phase(state: &AppState) -> anyhow::Result<()> {
     let replay_window = state.config.limits.replay_window_seconds;
-    db::sweep_purge_passthroughs(&state.db, now, replay_window).await?;
-    db::purge_request_context(&state.db, now - Duration::hours(CONTEXT_RETENTION_HOURS)).await?;
-    db::ui_ext::unpin_stale_grant_reads(&state.db, now - Duration::seconds(replay_window)).await?;
+    db::sweep_purge_passthroughs(&state.db, replay_window).await?;
+    db::purge_request_context(&state.db, CONTEXT_RETENTION_HOURS * 3600).await?;
+    db::ui_ext::unpin_stale_grant_reads(&state.db, replay_window).await?;
     Ok(())
 }
 
@@ -542,6 +551,30 @@ mod tests {
             user_key_path: None,
         };
         assert!(build_pushover(&cfg).is_err());
+        // Empty/whitespace-only credentials (e.g. an empty mounted Secret)
+        // must fail startup too, not build a notifier that can never send.
+        let cfg = PushoverConfig {
+            base_url: "https://api.pushover.net".into(),
+            token: Some("  ".into()),
+            token_path: None,
+            user_key: Some("u".into()),
+            user_key_path: None,
+        };
+        assert!(build_pushover(&cfg).is_err());
+        let empty_file = std::env::temp_dir().join("keychute-test-empty-pushover-user-key");
+        std::fs::write(&empty_file, "\n").unwrap();
+        let cfg = PushoverConfig {
+            base_url: "https://api.pushover.net".into(),
+            token: Some("t".into()),
+            user_key: None,
+            token_path: None,
+            user_key_path: Some(empty_file.clone()),
+        };
+        let err = build_pushover(&cfg)
+            .err()
+            .expect("empty user_key file must fail");
+        assert!(err.to_string().contains("empty"), "{err}");
+        std::fs::remove_file(&empty_file).ok();
     }
 
     #[test]

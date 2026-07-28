@@ -325,17 +325,20 @@ pub async fn resolve_deny(
 /// Expire pending requests past their deadline. Encrypted context is purged
 /// with the transition (the request is terminal; the approval page will never
 /// render it). Returns the number of requests expired.
-pub async fn expire_stale(db: &PgPool, now: DateTime<Utc>) -> anyhow::Result<u64> {
+///
+/// Deadline and `resolved_at` are both on the DATABASE clock, matching every
+/// other predicate that reads `expires_at` (`claim_for_push`, the pending-cap
+/// count, the approve/deny transitions).
+pub async fn expire_stale(db: &PgPool) -> anyhow::Result<u64> {
     let mut tx = db.begin().await?;
     let expired: Vec<(Uuid, String, String)> = sqlx::query_as(
         "UPDATE access_requests \
-         SET state = 'expired', resolved_at = $1, \
+         SET state = 'expired', resolved_at = now(), \
              context_ciphertext = NULL, context_nonce = NULL, \
              context_wrapped_dek = NULL, context_kek_id = NULL \
-         WHERE state = 'pending' AND expires_at < $1 \
+         WHERE state = 'pending' AND expires_at < now() \
          RETURNING id, client_name, secret_name",
     )
-    .bind(now)
     .fetch_all(&mut *tx)
     .await?;
     for (id, client_name, secret_name) in &expired {
@@ -357,15 +360,19 @@ pub async fn expire_stale(db: &PgPool, now: DateTime<Utc>) -> anyhow::Result<u64
 
 /// Purge encrypted context from requests that reached a terminal state before
 /// `cutoff` (retention decided by the sweeper). Returns rows purged.
-pub async fn purge_request_context(db: &PgPool, cutoff: DateTime<Utc>) -> anyhow::Result<u64> {
+/// Retention is measured on the DATABASE clock (`resolved_at` is written with
+/// SQL `now()`), same as the other purge cutoffs: the process clock plays no
+/// part in deciding what is old enough to destroy.
+pub async fn purge_request_context(db: &PgPool, retention_seconds: i64) -> anyhow::Result<u64> {
     let res = sqlx::query(
         "UPDATE access_requests \
          SET context_ciphertext = NULL, context_nonce = NULL, \
              context_wrapped_dek = NULL, context_kek_id = NULL \
-         WHERE state <> 'pending' AND resolved_at IS NOT NULL AND resolved_at < $1 \
+         WHERE state <> 'pending' AND resolved_at IS NOT NULL \
+           AND resolved_at < now() - make_interval(secs => $1::double precision) \
            AND context_ciphertext IS NOT NULL",
     )
-    .bind(cutoff)
+    .bind(retention_seconds as f64)
     .execute(db)
     .await?;
     Ok(res.rows_affected())

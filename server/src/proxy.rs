@@ -321,7 +321,7 @@ fn proxy_suffix(raw_path: &str) -> Option<&str> {
 /// Cap on the post-upstream completion-audit insert. That work is deliberately
 /// outside the stream deadline (see [`handle`]), but it still needs a bound of
 /// its own so a wedged database cannot hold the caller's response open.
-const COMPLETION_AUDIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+pub(crate) const COMPLETION_AUDIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 async fn handle(state: AppState, grant_id: Uuid, req: Request) -> Result<Response, ApiFailure> {
     // ONE deadline covers the whole proxied lifetime: request handling, the

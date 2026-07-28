@@ -198,26 +198,40 @@ pub async fn read(
         secret_version_id: released_version_id,
     };
 
-    // Best-effort, like the proxy path's completion audit: `begin_grant_use`
-    // committed the use and the write-ahead `release-attempt` row above. A 500
-    // here would deny the caller the secret while the use stays spent — after
-    // the replay window that reads as `grant-exhausted` with nothing released.
-    if let Err(e) = insert_audit(
-        &state.db,
-        &AuditEvent {
-            kind: kinds::RELEASE_COMPLETED,
-            request_id: Some(grant_row.request_id),
-            grant_id: Some(grant_row.id),
-            client_name: Some(grant_row.client_name.clone()),
-            secret_name: Some(grant_row.secret_name.clone()),
-            secret_version_id: Some(released_version_id),
-            status: Some(200),
-            ..Default::default()
-        },
+    // Best-effort AND time-bounded, like the proxy path's completion audit:
+    // `begin_grant_use` committed the use and the write-ahead `release-attempt`
+    // row above. A 500 here would deny the caller the secret while the use
+    // stays spent — after the replay window that reads as `grant-exhausted`
+    // with nothing released — and an unbounded await against a wedged database
+    // strands the already-decrypted secret the same way once the caller's own
+    // timeout fires.
+    let audited = tokio::time::timeout(
+        crate::proxy::COMPLETION_AUDIT_TIMEOUT,
+        insert_audit(
+            &state.db,
+            &AuditEvent {
+                kind: kinds::RELEASE_COMPLETED,
+                request_id: Some(grant_row.request_id),
+                grant_id: Some(grant_row.id),
+                client_name: Some(grant_row.client_name.clone()),
+                secret_name: Some(grant_row.secret_name.clone()),
+                secret_version_id: Some(released_version_id),
+                status: Some(200),
+                ..Default::default()
+            },
+        ),
     )
-    .await
-    {
-        tracing::warn!(grant_id = %grant_row.id, error = %e, "release-completed audit insert failed");
+    .await;
+    let audit_error: Option<String> = match audited {
+        Ok(Ok(())) => None,
+        Ok(Err(e)) => Some(e.to_string()),
+        Err(_) => Some(format!(
+            "timed out after {:?}",
+            crate::proxy::COMPLETION_AUDIT_TIMEOUT
+        )),
+    };
+    if let Some(error) = audit_error {
+        tracing::warn!(grant_id = %grant_row.id, error = %error, "release-completed audit insert failed");
     }
 
     Ok((

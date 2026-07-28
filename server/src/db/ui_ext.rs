@@ -309,12 +309,20 @@ pub async fn recent_duplicate_push(
 /// silently burn a fresh use on a multi-use grant after the next sweep, and
 /// release a newer secret version under a key the caller believes is spent.
 /// Tombstones die with their grant (`ON DELETE CASCADE`).
-pub async fn unpin_stale_grant_reads(db: &PgPool, cutoff: DateTime<Utc>) -> anyhow::Result<u64> {
+///
+/// The window is evaluated on the DATABASE clock, matching the replay
+/// predicate in [`crate::db::grants::begin_grant_use`]: a cutoff from the
+/// process clock could drop a pin that an in-window replay still needs.
+pub async fn unpin_stale_grant_reads(
+    db: &PgPool,
+    replay_window_seconds: i64,
+) -> anyhow::Result<u64> {
     let res = sqlx::query(
         "UPDATE grant_reads SET secret_version_id = NULL \
-         WHERE first_read_at < $1 AND secret_version_id IS NOT NULL",
+         WHERE first_read_at < now() - make_interval(secs => $1::double precision) \
+           AND secret_version_id IS NOT NULL",
     )
-    .bind(cutoff)
+    .bind(replay_window_seconds as f64)
     .execute(db)
     .await?;
     Ok(res.rows_affected())
@@ -580,13 +588,10 @@ mod tests {
         .bind(now)
         .execute(db)
         .await?;
-        let unpinned = unpin_stale_grant_reads(db, now - Duration::seconds(60)).await?;
+        let unpinned = unpin_stale_grant_reads(db, 60).await?;
         assert_eq!(unpinned, 1);
         // A second sweep touches nothing (tombstones are not rewritten).
-        assert_eq!(
-            unpin_stale_grant_reads(db, now - Duration::seconds(60)).await?,
-            0
-        );
+        assert_eq!(unpin_stale_grant_reads(db, 60).await?, 0);
         // The stale row survives as a tombstone (key stays burned) with its
         // version pin dropped; the in-window row keeps its pin.
         let rows: Vec<(String, Option<Uuid>)> = sqlx::query_as(
