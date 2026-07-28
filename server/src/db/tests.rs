@@ -215,6 +215,94 @@ async fn reconcile_clients_moves_credentials_off_removed_clients() -> anyhow::Re
 }
 
 #[tokio::test]
+async fn reconcile_clients_swaps_credentials_between_configured_clients() -> anyhow::Result<()> {
+    let Some(t) = setup().await? else {
+        return Ok(());
+    };
+    // Both clients stay in config and trade credentials with each other in a
+    // single reconcile. Neither is absent, so releasing only the removed
+    // clients' bindings leaves both unique indexes populated and whichever
+    // client is upserted first collides with the other's still-live binding —
+    // rolling back the transaction and failing startup, order-dependently.
+    let mut a = token_client("agent-a");
+    a.auth.api_token_sha256 = Some("aa".repeat(32));
+    let mut b = token_client("agent-b");
+    b.auth.api_token_sha256 = Some("bb".repeat(32));
+    reconcile_clients(&t.pool, &[a.clone(), b.clone()]).await?;
+
+    let mut a_swapped = a.clone();
+    a_swapped.auth.api_token_sha256 = Some("bb".repeat(32));
+    let mut b_swapped = b.clone();
+    b_swapped.auth.api_token_sha256 = Some("aa".repeat(32));
+    reconcile_clients(&t.pool, &[a_swapped, b_swapped]).await?;
+
+    let a_row = get_client_by_name(&t.pool, "agent-a").await?.unwrap();
+    let b_row = get_client_by_name(&t.pool, "agent-b").await?.unwrap();
+    assert_eq!(a_row.api_token_sha256.as_deref(), Some(&*"bb".repeat(32)));
+    assert_eq!(b_row.api_token_sha256.as_deref(), Some(&*"aa".repeat(32)));
+    assert!(a_row.enabled && b_row.enabled);
+
+    // Same swap across service-account bindings, which have their own unique
+    // index over (audience, subject). The token clients stay in config
+    // throughout: dropping them would retire them and clear their bindings,
+    // which is the separate behavior covered above.
+    let a_now = {
+        let mut c = a.clone();
+        c.auth.api_token_sha256 = Some("bb".repeat(32));
+        c
+    };
+    let b_now = {
+        let mut c = b.clone();
+        c.auth.api_token_sha256 = Some("aa".repeat(32));
+        c
+    };
+    let sa_a = sa_client("k8s-a");
+    let sa_b = sa_client("k8s-b");
+    reconcile_clients(
+        &t.pool,
+        &[a_now.clone(), b_now.clone(), sa_a.clone(), sa_b.clone()],
+    )
+    .await?;
+    let mut sa_a_swapped = sa_a.clone();
+    sa_a_swapped.auth.service_account = sa_b.auth.service_account.clone();
+    let mut sa_b_swapped = sa_b.clone();
+    sa_b_swapped.auth.service_account = sa_a.auth.service_account.clone();
+    reconcile_clients(
+        &t.pool,
+        &[a_now.clone(), b_now.clone(), sa_a_swapped, sa_b_swapped],
+    )
+    .await?;
+    let a_row = get_client_by_name(&t.pool, "k8s-a").await?.unwrap();
+    let b_row = get_client_by_name(&t.pool, "k8s-b").await?.unwrap();
+    assert_eq!(
+        a_row.sa_subject.as_deref(),
+        Some("system:serviceaccount:k8s-b:k8s-b")
+    );
+    assert_eq!(
+        b_row.sa_subject.as_deref(),
+        Some("system:serviceaccount:k8s-a:k8s-a")
+    );
+
+    // Reconcile is still atomic: a config that genuinely duplicates a binding
+    // across two clients must fail and leave the prior state intact, not a
+    // half-applied one with cleared credentials.
+    let mut dup_a = token_client("agent-a");
+    dup_a.auth.api_token_sha256 = Some("cc".repeat(32));
+    let mut dup_b = token_client("agent-b");
+    dup_b.auth.api_token_sha256 = Some("cc".repeat(32));
+    assert!(reconcile_clients(&t.pool, &[dup_a, dup_b]).await.is_err());
+    // The failed reconcile rolled back whole: the bindings cleared at the top
+    // of that transaction are restored, not left NULL.
+    let a_row = get_client_by_name(&t.pool, "agent-a").await?.unwrap();
+    let b_row = get_client_by_name(&t.pool, "agent-b").await?.unwrap();
+    assert_eq!(a_row.api_token_sha256.as_deref(), Some(&*"bb".repeat(32)));
+    assert_eq!(b_row.api_token_sha256.as_deref(), Some(&*"aa".repeat(32)));
+
+    t.teardown().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn insert_access_request_idempotency() -> anyhow::Result<()> {
     let Some(t) = setup().await? else {
         return Ok(());
