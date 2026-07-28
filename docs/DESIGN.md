@@ -256,7 +256,9 @@ k8s-agent image).
   key once no row references its `kek_id`. Because both keys coexist in the file
   during rotation and every row names its wrapping key, a crash at any point
   leaves every secret decryptable on restart. Secret rotation = new version row;
-  old versions retained (visible in audit trail) until purged.
+  old versions retained (visible in audit trail) until purged — and never purged
+  while referenced by live idempotency state or an unexpired grant, so a pinned
+  replay can always return its promised plaintext.
 - Plaintext exists only transiently in Keychute memory during a release or proxy
   call, and is never logged, never in error messages, never in the DB (enforced
   by types, reviewed as an invariant). Application-owned buffers zeroize on drop;
@@ -291,6 +293,12 @@ the ciphertext-only design removes the main reason to isolate.
   the queried key columns (§ crypto above).
 - `clients` — id, name (`family-assistant`, `k8s-agent`), authn binding (SA
   audience+subject, or API-key hash), max_tier, allowed mechanisms, enabled.
+  Client rows are provisioned **declaratively**: a config file (Helm values →
+  mounted config) lists each client's name, tier, and authn binding and is
+  reconciled at startup, so a fresh deployment has its first client identities
+  without imperative bootstrap or direct DB edits. API tokens are generated
+  out-of-band by the operator; only their hashes appear in config (a hash of a
+  high-entropy token is safe to commit).
 - `policies` — (client, secret | secret-tag) → mechanism, tier, constraints
   (HTTPS origins, methods, path prefixes, autofill page origin), outcome
   (`auto-approve` / `notify-only` / `require-approval` / `deny`), expiry.
@@ -328,7 +336,9 @@ the ciphertext-only design removes the main reason to isolate.
   constraint verbatim in the approval UI. Creation is idempotent: the client
   supplies a creation idempotency key, and a retry after a lost response
   returns the original request id instead of minting a second pending request
-  (and a second push).
+  (and a second push). The key is bound to the authenticated client and a hash
+  of the normalized request payload; reuse with a different payload is rejected
+  rather than silently returning some other request's id.
 - `grants` — issued capability: request_id, constraints, TTL, max_uses, use_count,
   revoked. (One-shot releases are grants with max_uses = 1.) A passthrough secret
   entered at approval time but not stored is encrypted and attached to its grant,
@@ -367,7 +377,11 @@ the ciphertext-only design removes the main reason to isolate.
   actually decrypted — the `secret_version_id`, or the grant-scoped passthrough
   payload id for approval-time-entered secrets that were not stored — so
   incident response can tell exactly which credential was exposed even across
-  rotations.
+  rotations. Ordering is write-ahead: the release-attempt event commits
+  atomically with the use-accounting update *before* plaintext delivery or
+  proxy forwarding, with completion status recorded afterwards — a crash
+  mid-release can leave an attempt without a completion, never a release
+  without a record.
 
 ---
 
@@ -500,14 +514,17 @@ In `werdnum/kube-config` (a later PR, once the service exists):
   `BackendTLSPolicy` naming the service DNS name, with the internal CA bundle
   available in the gateway namespace). Optional Cloudflare-tunnel exposure so
   Pushover links work away from home (tunnel hostname + external-dns target
-  annotation, per repo docs) — with one boundary made explicit: the tunnel makes
-  Cloudflare a TLS-terminating party, so anything typed into a tunnel-served
-  page — approval-time secret *entry* in particular — transits Cloudflare in
-  plaintext. Approve/deny clicks over the tunnel are fine. The recommended route
-  for entering secrets is the cluster's Tailscale ingress, which stays
-  end-to-end; entering one via the tunnel is a documented decision to trust
-  Cloudflare with that plaintext, made in the same explicit-risk spirit as the
-  delivery tiers.
+  annotation, per repo docs) — with the boundary stated honestly and in full:
+  the tunnel makes Cloudflare a TLS-terminating party for *all* approval
+  traffic, not just typed secrets — it can observe the operator's gateway
+  session cookie, CSRF token, and decrypted client context, and a party in that
+  position could in principle forge or modify an approval. Using the tunnel is
+  therefore an explicit decision to trust Cloudflare with approval authority
+  and secret-bearing page content alike — the same trust this cluster already
+  extends to Cloudflare Access on every tunneled service, sudo-service
+  approvals included. The Tailscale ingress remains the end-to-end alternative
+  for anyone declining that trust, and is the recommended route for
+  approval-time secret entry either way.
 - The chart binds the Keychute ServiceAccount to `system:auth-delegator`
   (ClusterRoleBinding) so the server may create `TokenReview`s — without it every
   SA-token authn attempt is rejected by the API server.
@@ -577,7 +594,8 @@ calendar estimates.
   (store-or-passthrough), durable grants with a single-use read endpoint
   including grant TTL and an expiry purge (a passthrough payload must not outlive
   its grant, so this cannot defer to a later milestone), audit log, client authn
-  (API tokens + TokenReview), `keychute` CLI, and a minimal abuse guard — a
+  (API tokens + TokenReview, clients provisioned declaratively from config),
+  `keychute` CLI, and a minimal abuse guard — a
   per-client cap on open pending requests and on concurrent wait connections
   (bounded stream lifetimes, cleanup on disconnect), plus dedup/throttling of
   Pushover notifications for repeated identical requests — since M1 is deployed and the
