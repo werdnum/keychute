@@ -56,7 +56,8 @@ stdout inside the agent's container; the agent can read it"*.
    notification: *"family-assistant requests 1 h of brokered access to
    api.example.com using 'Example API token'. Purpose: ⟨client-supplied context⟩."*
    The push links to the approval page (OIDC-protected).
-3. I approve. FA's pending request resolves with a `grant_id` (never the credential).
+3. I approve, which stores a durable grant. FA's wait resolves with the `grant_id`
+   (never the credential).
 4. FA makes requests through `POST /v1/grants/{grant_id}/proxy`. Keychute validates
    each request against the grant's constraints, injects the credential (e.g.
    `Authorization: Bearer …`), forwards, and streams the response back. Every proxied
@@ -66,16 +67,18 @@ stdout inside the agent's container; the agent can read it"*.
 
 1. Inside its container, the agent runs
    `keychute request my-service-api-key --reason "seal into my-service ns" | ./scripts/create-sealed-secret.sh …`.
-2. The CLI authenticates with an audience-bound projected service-account token
-   (the sudo-service pattern) and opens an SSE wait on the request.
+2. The CLI authenticates (in-cluster: an audience-bound projected service-account
+   token; authn is pluggable, §6), creates the access request, and blocks on the
+   wait endpoint until it resolves.
 3. I get a Pushover push. The approval page shows the requester identity, the reason,
    the tier warning ("the agent can read this from stdout"), and — if the secret is
    **not** yet stored — an input field where I type/paste the secret, with an
    "also store this in Keychute" checkbox. Approval-time entry doubles as the
    ingestion path, so credentials never have to transit an LLM chat to get into the
    system.
-4. On approval the plaintext is delivered once over the SSE channel; the CLI writes
-   it to stdout and exits. The pipe consumes it. Nothing lands in the agent
+4. Approval writes a durable single-use grant. The CLI's wait returns, it fetches
+   the plaintext from the grant's read endpoint, writes it to stdout and exits.
+   The pipe consumes it. Nothing lands in the agent
    transcript unless the agent deliberately captures it — which is exactly the
    residual risk tier 2 declares.
 
@@ -148,8 +151,9 @@ platform access to the real password-manager account.
 
 One binary, several logical components:
 
-- **Client API** (`/v1/…`): create access requests, wait for resolution (SSE),
-  exercise grants (proxy calls, one-shot fetch). Authn per §6.
+- **Client API** (`/v1/…`): create access requests; optionally block on a wait
+  endpoint (long-poll/SSE) until resolution; exercise grants through server-side
+  access endpoints — `read` for releasing tiers, `proxy` for brokered. Authn per §6.
 - **Approval UI**: minimal server-rendered (or tiny static SPA) pages behind
   Envoy Gateway OIDC (`id.andrewgarrett.dev` Keycloak, the cluster's standard
   `SecurityPolicy` pattern). Shows request context verbatim, tier in plain language,
@@ -159,11 +163,22 @@ One binary, several logical components:
 - **Notifier**: Pushover, using the cluster's existing convention (secret with
   `token` + `user_key`, same as alertmanager and sudo-service). Pluggable trait so
   ntfy/webhook can be added later.
-- **Release engine**: executes the approved delivery — brokered proxying with
-  constraint checks, or one-shot plaintext delivery over the requester's SSE/fetch
-  channel with single-use semantics.
+- **Release engine**: serves grant access — brokered proxying with constraint
+  checks, or plaintext reads with TTL/use-count enforcement (single-use by default
+  for releasing tiers).
 - **Crypto**: envelope encryption (§5).
 - **Audit log**: append-only record of every request, decision, and release/use.
+
+**Approvals are durable state; delivery is pull.** An approval does nothing but
+write a grant row — nothing is delivered over the approval or wait channel itself.
+The wait endpoint is a pure convenience; a client can equally poll, crash and
+retry, or come back later, then access the grant through ordinary server-side
+endpoints (`…/read` or `…/proxy`) that enforce TTL and use counts idempotently at
+access time. This keeps the request/grant/delivery model independent of connection
+lifetime and of Kubernetes: k8s contributes one pluggable authn method
+(TokenReview) and the deployment substrate, nothing in the protocol. (Deliberate
+departure from sudo-service's output-in-a-short-TTL-Secret pattern, which couples
+result delivery to cluster primitives.)
 
 ### Rust stack (proposed)
 
@@ -223,7 +238,9 @@ the ciphertext-only design removes the main reason to isolate.
   client-supplied context (freeform + structured), state
   (`pending`/`approved`/`denied`/`expired`), resolved_by, timestamps.
 - `grants` — issued capability: request_id, constraints, TTL, max_uses, use_count,
-  revoked. (One-shot releases are grants with max_uses = 1.)
+  revoked. (One-shot releases are grants with max_uses = 1.) A passthrough secret
+  entered at approval time but not stored is encrypted and attached to its grant,
+  and purged when the grant is consumed or expires.
 - `audit_log` — append-only: every request, decision, release, and each individual
   proxied call (method, host, path, status — never bodies or credentials).
 
@@ -362,9 +379,10 @@ calendar estimates.
   build), migrations, envelope-encryption module with KEK-file loading and
   rotation-rewrap, `secrets`/`secret_versions` CRUD behind an admin API. Property
   tests on the crypto seams; no network delivery yet.
-- **M1 — CUJ 2 end-to-end (CLI + approval).** Access requests, SSE wait, Pushover
-  notifier, approval UI with OIDC, approval-time secret entry (store-or-passthrough),
-  one-shot release, audit log, TokenReview authn, `keychute` CLI. Deployed to the
+- **M1 — CUJ 2 end-to-end (CLI + approval).** Access requests, wait endpoint,
+  Pushover notifier, approval UI with OIDC, approval-time secret entry
+  (store-or-passthrough), durable grants with a single-use read endpoint, audit
+  log, TokenReview authn, `keychute` CLI. Deployed to the
   cluster; k8s-agent image gains the CLI. *This is the first real value: agents stop
   needing credentials pasted into transcripts.*
 - **M2 — Policy engine & standing grants.** Policy rows, outcomes
@@ -387,11 +405,10 @@ calendar estimates.
 1. **Approval-time secret entry retention** (CUJ 2): default the "store this
    secret" checkbox on or off? Off is safer-by-default; on matches the likely
    workflow (you'll be asked again).
-2. **FA request UX for tier-0 grants**: when Keychute requires approval, should the
-   FA agent's tool call block on SSE (minutes-long tool call, matches FA's deferred
-   confirmation machinery poorly?) or return "pending, retry" and let FA's durable
-   confirmation/task system resume? I lean *blocking with a generous timeout* for
-   v1, durable resume in M3 if it chafes.
+2. **FA request UX for tier-0 grants**: grants being durable, both styles are cheap
+   on the Keychute side — the FA tool call can block on the wait endpoint with a
+   generous timeout, or return "pending" and re-check the request later. I lean
+   *blocking* for v1, with pending/re-check in M3 if it chafes.
 3. **Tier names**: `brokered` / `trusted-client` / `cooperating-client` / `direct`
    — happy with these? They appear in UI copy and policy config, so worth settling
    early.
