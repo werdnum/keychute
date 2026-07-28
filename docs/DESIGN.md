@@ -285,19 +285,26 @@ the ciphertext-only design removes the main reason to isolate.
   (HTTPS origins, methods, path prefixes, autofill page origin), outcome
   (`auto-approve` / `notify-only` / `require-approval` / `deny`), expiry.
   Standing grants (CUJ 3 pre-approval) are rows here with an expiry, created from
-  the approval UI. Resolution over overlapping rows is deterministic: `deny`
-  overrides any other matching outcome; otherwise the most specific match wins
-  (exact secret over tag, specific client over wildcard), with an explicit
-  integer priority as a tiebreaker; a residual tie resolves to the most
-  restrictive matching outcome (`require-approval` over `notify-only` over
-  `auto-approve`), so ambiguity can never widen access. A row only yields its
-  non-approval outcome when the requested constraints are a **subset** of the
-  row's (methods, path prefix, TTL, use limit); a request broader than every
-  matching row falls through to `require-approval` — a narrowly pre-approved
-  client cannot silently obtain a wider grant.
+  the approval UI. Resolution over overlapping rows is deterministic and total:
+  `deny` overrides any other matching outcome; otherwise rows are ordered
+  lexicographically by specificity — client dimension first (specific client
+  over wildcard), then secret dimension (exact secret over tag) — then by
+  explicit integer priority, and a residual tie resolves to the most restrictive
+  matching outcome (`require-approval` over `notify-only` over `auto-approve`),
+  so no pair of rows is incomparable and ambiguity can never widen access. A row
+  only yields its non-approval outcome when the requested constraints are a
+  **subset** of the row's across *every* dimension — origins (HTTPS target or
+  autofill frame origin) as well as methods, path prefix, TTL, and use limit; a
+  request broader than every matching row falls through to `require-approval` —
+  a narrowly pre-approved client cannot silently obtain a wider grant.
 - `access_requests` — client, secret, requested mechanism+tier+constraints,
   client-supplied context (freeform + structured), state
   (`pending`/`approved`/`denied`/`expired`), resolved_by, timestamps.
+  Client-supplied context is **encrypted at rest** under the same envelope
+  machinery as secret payloads: a tier-2/3 client may have credential bytes in a
+  reason or script source, and context must not become a plaintext side channel
+  into the DB and its backups. It is decrypted only to render the approval page,
+  never copied into plaintext audit rows, and purged with the request.
 - `grants` — issued capability: request_id, constraints, TTL, max_uses, use_count,
   revoked. (One-shot releases are grants with max_uses = 1.) A passthrough secret
   entered at approval time but not stored is encrypted and attached to its grant,
@@ -430,7 +437,14 @@ In `werdnum/kube-config` (a later PR, once the service exists):
   `BackendTLSPolicy` naming the service DNS name, with the internal CA bundle
   available in the gateway namespace). Optional Cloudflare-tunnel exposure so
   Pushover links work away from home (tunnel hostname + external-dns target
-  annotation, per repo docs).
+  annotation, per repo docs) — with one boundary made explicit: the tunnel makes
+  Cloudflare a TLS-terminating party, so anything typed into a tunnel-served
+  page — approval-time secret *entry* in particular — transits Cloudflare in
+  plaintext. Approve/deny clicks over the tunnel are fine. The recommended route
+  for entering secrets is the cluster's Tailscale ingress, which stays
+  end-to-end; entering one via the tunnel is a documented decision to trust
+  Cloudflare with that plaintext, made in the same explicit-risk spirit as the
+  delivery tiers.
 - The chart binds the Keychute ServiceAccount to `system:auth-delegator`
   (ClusterRoleBinding) so the server may create `TokenReview`s — without it every
   SA-token authn attempt is rejected by the API server.
