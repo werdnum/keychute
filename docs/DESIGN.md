@@ -69,8 +69,11 @@ and is agent-influenceable. The approval UI therefore renders tier-2 context as
    (never the credential).
 4. FA makes requests through `POST /v1/grants/{grant_id}/proxy`. Keychute validates
    each request against the grant's constraints, injects the credential (e.g.
-   `Authorization: Bearer …`), forwards, and streams the response back. Every proxied
-   call is audit-logged. The grant expires by TTL and/or request count.
+   `Authorization: Bearer …`), forwards, and streams the response back. **Redirects
+   are never followed server-side**: 3xx responses are returned to the client, so a
+   redirect target only ever gets the credential if the client re-requests it
+   through the proxy and it passes constraint validation itself. Every proxied call
+   is audit-logged. The grant expires by TTL and/or request count.
 
 ### CUJ 2 — k8s-agent needs a secret for a SealedSecret (tier 2)
 
@@ -253,7 +256,12 @@ the ciphertext-only design removes the main reason to isolate.
 - `grants` — issued capability: request_id, constraints, TTL, max_uses, use_count,
   revoked. (One-shot releases are grants with max_uses = 1.) A passthrough secret
   entered at approval time but not stored is encrypted and attached to its grant,
-  and purged when the grant is consumed or expires.
+  and purged when the grant is consumed or expires. "Single-use" means one
+  *logical* read: the first read binds the grant to a client-supplied idempotency
+  key, and retries with the same key within a short replay window return the same
+  plaintext — otherwise a connection lost between the use-count increment and
+  delivery would strand an approved grant. The window closing (or the TTL) is what
+  purges the payload.
 - `audit_log` — append-only: every request, decision, release, and each individual
   proxied call (method, host, path, status — never bodies or credentials).
 
@@ -316,7 +324,11 @@ will consume the secret is a first-class goal of the UI.
 - **Humans** (approval UI): Envoy Gateway `SecurityPolicy` OIDC against Keycloak
   with `forwardAccessToken` enabled, so Keychute receives the JWT and validates it
   itself (issuer, audience, signature) rather than trusting proxy headers; the
-  validated identity is what the audit log records as the approver. Cluster-
+  validated identity is what the audit log records as the approver.
+  Authentication alone never suffices: all human routes additionally require an
+  **authorization allowlist** — membership of a configured operator group claim
+  (the sudo-service `adminGroup` pattern) or an explicit subject list — since the
+  Keycloak realm admits principals who must not approve releases. Cluster-
   internal client API routes bypass OIDC (the sudo-service shape: internal service
   URL for machines, OIDC-fronted external URL for me).
 
@@ -346,11 +358,20 @@ In `werdnum/kube-config` (a later PR, once the service exists):
   already enabled).
 - Sealed secrets: `keychute-kek` (the master key), `keychute-pushover`
   (`token`/`user_key`, cluster convention).
-- Ingress `keychute.andrewgarrett.dev` (nginx class, `letsencrypt-prod`), OIDC
-  `SecurityPolicy` on the approval routes, optional Cloudflare-tunnel exposure so
+- Ingress `keychute.andrewgarrett.dev` (nginx class, `letsencrypt-prod`). In this
+  cluster Ingresses are materialized as Envoy Gateway HTTPRoutes (generated name
+  `<ingress>-<host-with-dashes>`), and the OIDC `SecurityPolicy` targets that
+  HTTPRoute — the exact shape of the existing `oidc-security-policy.yaml` examples
+  (ansible-drift-ui, notes, webslicer). Optional Cloudflare-tunnel exposure so
   Pushover links work away from home (tunnel hostname + external-dns target
-  annotation, per repo docs). Internal clients use
-  `http://keychute.keychute.svc.cluster.local`.
+  annotation, per repo docs).
+- The chart binds the Keychute ServiceAccount to `system:auth-delegator`
+  (ClusterRoleBinding) so the server may create `TokenReview`s — without it every
+  SA-token authn attempt is rejected by the API server.
+- Internal clients use `https://keychute.keychute.svc.cluster.local` with a
+  cert-manager-issued certificate served by the Rust process (rustls); plaintext
+  HTTP is not offered, since static API tokens and tier-1/2 plaintext reads
+  transit this connection and the cluster network is not in the trusted base.
 - k8s-agent: add the `keychute` CLI to the image (renovate-pinned ref, like the
   sudo-service CLI), and a projected token volume with
   `audience: keychute.andrewgarrett.dev`.
@@ -403,8 +424,10 @@ calendar estimates.
   tests on the crypto seams; no network delivery yet.
 - **M1 — CUJ 2 end-to-end (CLI + approval).** Access requests, wait endpoint,
   Pushover notifier, approval UI with OIDC, approval-time secret entry
-  (store-or-passthrough), durable grants with a single-use read endpoint, audit
-  log, client authn (API tokens + TokenReview), `keychute` CLI. Deployed to the
+  (store-or-passthrough), durable grants with a single-use read endpoint
+  including grant TTL and an expiry purge (a passthrough payload must not outlive
+  its grant, so this cannot defer to a later milestone), audit log, client authn
+  (API tokens + TokenReview), `keychute` CLI. Deployed to the
   cluster; k8s-agent image gains the CLI. *This is the first real value: agents stop
   needing credentials pasted into transcripts.*
 - **M2 — Policy engine & standing grants.** Policy rows, outcomes
@@ -416,9 +439,8 @@ calendar estimates.
 - **M4 — CUJ 3 secure autofill.** `autofill` mechanism + origin constraints
   server-side; FA `browser_fill_credential` with the masking/containment work in
   the browser tools.
-- **M5 — Hardening.** Rate limits per client, request expiry sweeps, KEK rotation
-  runbook, `notify-only` digests, threat-model review against the implementation,
-  docs (user + operator).
+- **M5 — Hardening.** Rate limits per client, KEK rotation runbook, `notify-only`
+  digests, threat-model review against the implementation, docs (user + operator).
 
 ---
 
