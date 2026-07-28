@@ -23,3 +23,9 @@ sha2 = { workspace = true }
 rand = { workspace = true }
 tempfile = "3"
 futures = { workspace = true }
+# TLS fake upstream: the proxy only speaks https to origins, so the harness
+# serves its recording upstream over TLS with a self-signed cert.
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rcgen = "0.13"
+# Both ring and aws-lc-rs end up in the dep graph; pick one explicitly.
+rustls = { version = "0.23", features = ["ring"] }

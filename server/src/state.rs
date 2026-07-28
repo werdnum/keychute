@@ -3,6 +3,7 @@
 use crate::config::Config;
 use crate::crypto::{EphemeralKek, Keyset};
 use crate::notify::Notifier;
+use anyhow::Context;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
@@ -45,10 +46,20 @@ impl AppState {
         crate::db::reconcile_clients(&db, &config.clients).await?;
 
         let notifier = crate::notify::build_notifier(&config);
-        let upstream = reqwest::Client::builder()
+        let mut upstream_builder = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .build()?;
+            .connect_timeout(std::time::Duration::from_secs(10));
+        // Internal-CA trust for upstream origins (config `upstream_ca_path`).
+        if let Some(ca_path) = &config.upstream_ca_path {
+            let pem = std::fs::read(ca_path)
+                .with_context(|| format!("reading upstream_ca_path {}", ca_path.display()))?;
+            for cert in reqwest::Certificate::from_pem_bundle(&pem)
+                .context("parsing upstream_ca_path PEM bundle")?
+            {
+                upstream_builder = upstream_builder.add_root_certificate(cert);
+            }
+        }
+        let upstream = upstream_builder.build()?;
 
         Ok(AppState(Arc::new(Inner {
             config,

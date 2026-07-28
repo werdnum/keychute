@@ -88,6 +88,12 @@ pub async fn read(
     }
     let secret = revalidate_grant(&state, &grant).await?;
 
+    // Revocation/expiry outrank payload state: a revoked grant purges its
+    // passthrough immediately, and must report "revoked", not "payload-lost".
+    if grant.revoked || chrono::Utc::now() >= grant.not_after {
+        return Err(ApiFailure::GrantExpired);
+    }
+
     // Resolve the payload source BEFORE use-accounting so the released
     // version id is pinned into replay state.
     enum Source {

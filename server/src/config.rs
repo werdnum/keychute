@@ -30,6 +30,11 @@ pub struct Config {
     pub tokenreview_token_path: Option<PathBuf>,
     #[serde(default)]
     pub tokenreview_ca_path: Option<PathBuf>,
+    /// Optional PEM bundle of additional root CAs trusted by the outbound
+    /// (brokered-proxy) HTTP client — for upstream origins behind an internal
+    /// CA. System roots remain trusted.
+    #[serde(default)]
+    pub upstream_ca_path: Option<PathBuf>,
     #[serde(default)]
     pub pushover: Option<PushoverConfig>,
     #[serde(default)]
