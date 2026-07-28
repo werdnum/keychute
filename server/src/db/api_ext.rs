@@ -44,6 +44,14 @@ pub async fn insert_access_request_with_id(
     if req.context_wrapped_dek.is_some() {
         super::take_kek_shared_lock(&mut tx).await?;
     }
+    if pending_cap.is_some() {
+        // Serialize per-client creation so concurrent inserts cannot each see
+        // only themselves under READ COMMITTED and collectively exceed the cap.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext('keychute-pending-' || $1))")
+            .bind(&req.client_name)
+            .execute(&mut *tx)
+            .await?;
+    }
     let inserted = sqlx::query_as::<_, AccessRequestRow>(
         "INSERT INTO access_requests \
          (id, client_name, secret_name, mechanism, constraints, \

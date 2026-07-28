@@ -64,6 +64,8 @@ pub async fn insert_secret_version(
     created_by_request: Option<Uuid>,
 ) -> anyhow::Result<SecretVersionRow> {
     let mut tx = db.begin().await?;
+    // Addendum #19: every wrapped-DEK writer holds the shared KEK lock.
+    super::take_kek_shared_lock(&mut tx).await?;
     let version: i32 = sqlx::query_scalar(
         "UPDATE secrets SET current_version = current_version + 1, updated_at = now() \
          WHERE id = $1 RETURNING current_version",

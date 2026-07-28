@@ -187,6 +187,20 @@ impl Origin {
         {
             return Err(format!("invalid origin host {host:?}"));
         }
+        // The host must be exactly what a URL parser will target: noncanonical
+        // numeric IPv4 forms (`2130706433`, `127.1`, `0x7f000001`) pass the
+        // character checks above but are normalized to a different host by
+        // `url::Url` at proxy time — the operator would approve one string and
+        // the credential would be sent to another. Reject anything the URL
+        // parser does not round-trip verbatim.
+        let parsed = url::Url::parse(&format!("https://{host}"))
+            .map_err(|_| format!("invalid origin host {host:?}"))?;
+        if parsed.host_str() != Some(host.as_str()) {
+            return Err(format!(
+                "noncanonical origin host {host:?} (URL parsers would target {:?})",
+                parsed.host_str().unwrap_or("")
+            ));
+        }
         Ok(Origin { host, port })
     }
 
@@ -367,6 +381,13 @@ mod tests {
         assert!(Origin::parse("a b").is_err());
         assert!(Origin::parse("x.com:0").is_err());
         assert!(Origin::parse("user@x.com").is_err());
+        // Noncanonical numeric IPv4 forms would silently retarget at proxy
+        // time (url::Url normalizes them to dotted-quad); reject.
+        assert!(Origin::parse("2130706433").is_err());
+        assert!(Origin::parse("127.1").is_err());
+        assert!(Origin::parse("0x7f000001").is_err());
+        // Canonical dotted-quad round-trips and stays valid.
+        assert_eq!(Origin::parse("127.0.0.1").unwrap().host, "127.0.0.1");
     }
 
     #[test]

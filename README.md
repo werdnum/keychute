@@ -3,5 +3,38 @@
 Secrets storage and delivery broker for AI agents, with human approval in the loop
 and an explicit, operator-chosen risk tier for every delivery path.
 
-Currently in planning — see [docs/DESIGN.md](docs/DESIGN.md) for the design and
-project plan.
+- **Design & project plan:** [docs/DESIGN.md](docs/DESIGN.md)
+- **Implementation contract:** [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md)
+
+## Status
+
+v1 server-side implementation (design milestones M0–M3, minus cluster wiring):
+
+- `server/` — the `keychute-server` binary: envelope crypto (KEK keyset +
+  process-local ephemeral KEK), Postgres store, policy engine, client API
+  (idempotent access requests, wait endpoint, grant read with idempotent
+  replay, brokered proxy), server-rendered approval UI with CSRF, Pushover
+  notifier with request-row outbox, audit log.
+- `cli/` — the `keychute` CLI (`keychute request <secret> | consumer…`).
+- `types/` — shared API types.
+- `e2e/` — black-box end-to-end suite: each test boots a fresh Postgres
+  database, a real server process, a TLS recording upstream, a fake Pushover,
+  and drives the REST API, the real approval UI (CSRF flow included), and the
+  real CLI binary.
+
+## Development
+
+Requires Rust (stable) and PostgreSQL 16.
+
+```sh
+# unit + store-layer tests (needs a local Postgres; trust auth)
+KEYCHUTE_TEST_DB=postgres://postgres@127.0.0.1:5432/postgres cargo test --workspace --exclude keychute-e2e
+
+# e2e: prebuild first (test binaries must not race cargo), then run
+cargo build -p keychute-server -p keychute-cli
+E2E_DATABASE_URL=postgres://postgres@127.0.0.1:5432/postgres cargo test -p keychute-e2e -- --test-threads=2
+cargo test -p keychute-e2e -- --ignored --test-threads=1   # slow sweeper tests
+```
+
+Not yet in-tree: Helm chart, image build workflow, kube-config wiring, and the
+family-assistant integration (see DESIGN §7–8).

@@ -43,21 +43,63 @@ pub fn ensure_built() {
         rustls::crypto::ring::default_provider()
             .install_default()
             .ok();
-        // Concurrent test binaries must NOT each spawn `cargo build`: cargo's
-        // file locking is broken on some shared filesystems (flock →
-        // "Inappropriate ioctl for device"), so concurrent builds corrupt
-        // artifacts. Build only if the binaries are missing; CI/test runners
-        // should prebuild with `cargo build -p keychute-server -p keychute-cli`.
-        if server_bin().exists() && cli_bin().exists() {
-            return;
-        }
-        let status = std::process::Command::new("cargo")
-            .args(["build", "-p", "keychute-server", "-p", "keychute-cli"])
-            .current_dir(workspace_root())
-            .status()
-            .expect("running cargo build");
-        assert!(status.success(), "cargo build failed");
+        // The binaries under test must be prebuilt. Spawning `cargo build`
+        // from inside `cargo test` nests cargo invocations against the same
+        // target dir, which corrupts artifacts on filesystems with broken
+        // flock ("failed to map object file"). So: verify freshness and fail
+        // loudly with the command to run, rather than building here.
+        assert_fresh_binaries();
     });
+}
+
+const PREBUILD_HINT: &str =
+    "run `cargo build -p keychute-server -p keychute-cli` before `cargo test -p keychute-e2e`";
+
+/// Newest mtime under a source directory (`.rs`, `.sql`, `Cargo.toml`).
+fn newest_source_mtime(dir: &Path, newest: &mut std::time::SystemTime) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            newest_source_mtime(&path, newest);
+            continue;
+        }
+        let interesting = path.extension().is_some_and(|e| e == "rs" || e == "sql")
+            || path.file_name().is_some_and(|n| n == "Cargo.toml");
+        if !interesting {
+            continue;
+        }
+        if let Ok(m) = entry.metadata().and_then(|m| m.modified()) {
+            if m > *newest {
+                *newest = m;
+            }
+        }
+    }
+}
+
+/// Both binaries must exist and be at least as new as every source file they
+/// are built from — otherwise the suite would silently test stale code.
+fn assert_fresh_binaries() {
+    for bin in [server_bin(), cli_bin()] {
+        assert!(bin.exists(), "{} missing: {PREBUILD_HINT}", bin.display());
+    }
+    let root = workspace_root();
+    let mut newest_src = std::time::UNIX_EPOCH;
+    for sub in ["server", "cli", "types", "migrations"] {
+        newest_source_mtime(&root.join(sub), &mut newest_src);
+    }
+    for bin in [server_bin(), cli_bin()] {
+        let built = std::fs::metadata(&bin)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        assert!(
+            built >= newest_src,
+            "{} is older than its sources — {PREBUILD_HINT}",
+            bin.display()
+        );
+    }
 }
 
 pub fn server_bin() -> PathBuf {

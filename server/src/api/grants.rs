@@ -92,7 +92,15 @@ pub async fn read(
 
     // Revocation/expiry outrank payload state: a revoked grant purges its
     // passthrough immediately, and must report "revoked", not "payload-lost".
-    if grant.revoked || chrono::Utc::now() >= grant.not_after {
+    // DB clock, not process clock — the authoritative deadline is SQL `now()`.
+    let dead: bool =
+        sqlx::query_scalar("SELECT revoked OR now() >= not_after FROM grants WHERE id = $1")
+            .bind(grant.id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| ApiFailure::Internal(e.into()))?
+            .unwrap_or(true);
+    if dead {
         return Err(ApiFailure::GrantExpired);
     }
 

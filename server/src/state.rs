@@ -19,6 +19,9 @@ pub struct Inner {
     pub notifier: Arc<dyn Notifier>,
     /// Wakes wait-endpoint pollers when a request resolves.
     pub resolve_notify: tokio::sync::Notify,
+    /// Serializes push dedup-check + send (single replica by design, §5), so
+    /// concurrent identical creates cannot both pass the dedup query.
+    pub push_lock: tokio::sync::Mutex<()>,
     /// Per-client concurrency accounting (waits and proxy streams).
     pub wait_counts: Mutex<HashMap<String, usize>>,
     pub proxy_counts: Mutex<HashMap<String, usize>>,
@@ -68,6 +71,7 @@ impl AppState {
             ephemeral_kek: EphemeralKek::generate(),
             notifier,
             resolve_notify: tokio::sync::Notify::new(),
+            push_lock: tokio::sync::Mutex::new(()),
             wait_counts: Mutex::new(HashMap::new()),
             proxy_counts: Mutex::new(HashMap::new()),
             upstream,

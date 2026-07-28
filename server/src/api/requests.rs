@@ -381,6 +381,10 @@ pub async fn create(
             // No notifier configured: leave push_delivered_at NULL so the row
             // honestly reads "undelivered" (the sweeper also skips it).
             if state.notifier.is_real() {
+                // Serialize dedup-check + send: two concurrent identical
+                // creates must not both pass the dedup query (single replica
+                // by design, so an in-process lock suffices).
+                let _push_guard = state.push_lock.lock().await;
                 // Same dedup as the sweeper (addendum #10: the key includes
                 // the normalized-constraints jsonb). A duplicate push within
                 // the window means the operator was just told about an

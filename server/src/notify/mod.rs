@@ -212,6 +212,9 @@ async fn sweep_once(state: &AppState) -> anyhow::Result<()> {
         Vec::new()
     };
     for row in pending {
+        // Same serialization as the create path (state.push_lock): the sweep
+        // must not race a concurrent create's dedup-check + send.
+        let _push_guard = state.push_lock.lock().await;
         let dedup = db::ui_ext::recent_duplicate_push(
             &state.db,
             &row,
