@@ -118,8 +118,11 @@ and is agent-influenceable. The approval UI therefore renders tier-2 context as
    policy can constrain releases to matching origins (e.g. only when the page
    origin is `hellofresh.com`). Verifying the fill target against that origin,
    and keeping the value away from the agent afterwards, is enforced by
-   family-assistant's deterministic client code — the browser-side enforcement
-   design exists on the FA side and is deliberately not specified here (§8).
+   family-assistant's deterministic client code, per FA's browser credential
+   broker design ([werdnum/family-assistant#833][fa-833], not yet finalized) —
+   deliberately not re-specified here (§8).
+
+[fa-833]: https://github.com/werdnum/family-assistant/pull/833
 
 This is "Secure Agentic Autofill" like 1Password's, but without granting an agent
 platform access to the real password-manager account.
@@ -591,9 +594,14 @@ Research findings that shape this (all verified against the current tree):
   field directly, the value never entering LLM context, tool results, or logs.
   Browser-side containment — verifying the fill target against the grant's
   origin, and keeping the agent's tools away from the value once filled — is
-  **enforced by family-assistant's deterministic client code**; that enforcement
-  design already exists on the FA side and is deliberately not re-specified in
-  this document. Registering FA at tier 1 is the operator's statement that they
+  **enforced by family-assistant's deterministic client code**, per FA's
+  browser credential broker design ([werdnum/family-assistant#833][fa-833],
+  `docs/design/browser-credential-broker.md`, not yet finalized): the broker
+  fills and submits credentials in an isolated page the agent never touches,
+  and the agent's browser profile only receives a fresh page in the same
+  context after the credential-holding page is closed and the authenticated
+  session verified. That design is deliberately not re-specified in this
+  document. Registering FA at tier 1 is the operator's statement that they
   trust that enforcement (§6, "mechanism honesty").
 - Context enrichment: when a Keychute request originates inside `execute_script`
   (the Monty sandbox), FA attaches the script source as structured context so the
@@ -639,7 +647,8 @@ calendar estimates.
   unbounded slow streams open.
 - **M4 — CUJ 3 secure autofill.** `autofill` mechanism + origin constraints
   server-side; FA `browser_fill_credential`, with browser-side containment
-  enforced by FA's deterministic code per its own design.
+  enforced by FA's deterministic code per its browser credential broker design
+  ([werdnum/family-assistant#833][fa-833]).
 - **M5 — Hardening.** Rate limits per client, KEK rotation runbook, `notify-only`
   digests, threat-model review against the implementation, docs (user + operator).
 
