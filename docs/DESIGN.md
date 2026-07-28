@@ -265,7 +265,12 @@ k8s-agent image).
   secrets — and the AAD is never stored: it is reconstructed canonically from the
   row's queried `secret_id` and `version` at decrypt time, so ciphertext moved to
   another row fails AEAD verification instead of decrypting under a relocated
-  stored context.
+  stored context. The same rule applies to every ciphertext category, each with
+  its own domain-separation label in the AAD: a grant-attached passthrough
+  payload binds its `grant_id`, and encrypted request context binds its
+  `request_id` — so a row-copy or write that moves ciphertext, nonce, and
+  wrapped DEK together between grants (or across categories) fails verification
+  rather than delivering one principal's plaintext to another.
 - KEK rotation = add the new key to the keyset, mark it active, rewrap rows to it
   (cheap — no payload re-encryption, each row update atomic), then retire the old
   key once no row references its `kek_id`. Retirement serializes with ciphertext
@@ -289,6 +294,16 @@ k8s-agent image).
   logical backups). Backups therefore contain ciphertext only — losing the KEK
   Secret loses the data, so the KEK's sealed form in git plus the sealed-secrets
   controller key is the recovery chain. This is documented in the runbook.
+  That recovery chain is deliberately long-lived, which would let a backup copy
+  of a purged passthrough payload be decrypted after a restore — outliving the
+  grant it was scoped to. So passthrough payloads don't use it: their DEKs are
+  wrapped under a **process-local ephemeral KEK**, generated at startup and held
+  only in memory — never in the KEK file, Postgres, or any backup. Backup copies
+  of those rows are crypto-erased by construction, and a Keychute restart loses
+  live passthrough payloads, which fails closed: the grant read returns a clear
+  "payload lost — re-request" error and the client starts a fresh approval.
+  Acceptable, because passthrough payloads are minutes-lived by design; durable
+  secrets belong in the store.
 
 A dedicated `postgresql` CR is possible (the `lake-system` precedent) but overkill;
 the ciphertext-only design removes the main reason to isolate.
@@ -367,7 +382,8 @@ the ciphertext-only design removes the main reason to isolate.
   other request's id.
 - `grants` — issued capability: request_id, constraints, TTL, max_uses, use_count,
   revoked. (One-shot releases are grants with max_uses = 1.) A passthrough secret
-  entered at approval time but not stored is encrypted and attached to its grant,
+  entered at approval time but not stored is encrypted and attached to its grant
+  (under the process-local ephemeral KEK, with `grant_id`-bound AAD — § crypto),
   and purged when the grant is consumed or expires. "Single-use" means one
   *logical* read: the first read binds the grant to a client-supplied idempotency
   key, and retries with the same key within a short replay window return the same
@@ -537,8 +553,10 @@ In `werdnum/kube-config` (a later PR, once the service exists):
   HTTPRoute — the exact shape of the existing `oidc-security-policy.yaml` examples
   (ansible-drift-ui, notes, webslicer). Because the backend refuses plaintext,
   the gateway-to-service hop needs explicit backend TLS (Gateway API
-  `BackendTLSPolicy` naming the service DNS name, with the internal CA bundle
-  available in the gateway namespace). Optional Cloudflare-tunnel exposure so
+  `BackendTLSPolicy` naming the service DNS name). Both the policy's target ref
+  and its `caCertificateRefs` are namespace-local, so the policy and the
+  internal CA bundle ConfigMap live in the `keychute` namespace beside the
+  Service — not in the gateway namespace. Optional Cloudflare-tunnel exposure so
   Pushover links work away from home (tunnel hostname + external-dns target
   annotation, per repo docs) — with the boundary stated honestly and in full:
   the tunnel makes Cloudflare a TLS-terminating party for *all* approval
