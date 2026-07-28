@@ -125,6 +125,56 @@ async fn brokered_proxy_injects_credential_and_strips_caller_headers() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn brokered_proxy_never_forwards_trace() {
+    let env = TestEnv::spawn(SpawnOpts::default()).await.unwrap();
+    env.seed_secret("example-api-token", "tok-abc", "brokered", "bearer", "")
+        .await
+        .unwrap();
+    // Even a grant that explicitly lists TRACE must not proxy it: a
+    // TRACE-capable upstream would echo the injected credential header back
+    // into the response body.
+    let (status, body) = env
+        .fa()
+        .create_request(brokered_request(
+            "cuj1-trace",
+            "example-api-token",
+            "localhost",
+            env.upstream_port,
+            &["GET", "TRACE"],
+            &["/v1"],
+            600,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(status, 201, "{body}");
+    let request_id = body["request_id"].as_str().unwrap().to_owned();
+    env.approve(&request_id, &[]).await.unwrap();
+    let resp = env
+        .fa()
+        .get(&format!("/v1/access-requests/{request_id}"))
+        .send()
+        .await
+        .unwrap();
+    let st: serde_json::Value = resp.json().await.unwrap();
+    let grant_id = st["grant_id"].as_str().unwrap().to_owned();
+
+    let resp = env
+        .fa()
+        .request(
+            reqwest::Method::TRACE,
+            &format!("/v1/grants/{grant_id}/proxy/v1/echo"),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "policy-denied");
+    // The upstream never saw the request (no credential ever left).
+    assert!(env.upstream_requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn brokered_proxy_enforces_method_and_path_constraints() {
     let env = TestEnv::spawn(SpawnOpts::default()).await.unwrap();
     let (_request_id, grant_id) = approved_brokered_grant(&env).await;

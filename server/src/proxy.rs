@@ -402,6 +402,15 @@ async fn handle_inner(
 
     // Method must be one of the grant's (uppercase compare).
     let method = parts.method.as_str().to_ascii_uppercase();
+    // TRACE is refused unconditionally, even when a grant lists it: a
+    // TRACE-capable upstream echoes the request message back — including the
+    // credential header injected below — turning brokered access into
+    // plaintext secret disclosure to the caller.
+    if method == "TRACE" {
+        return Err(ApiFailure::PolicyDenied(
+            "TRACE is never proxied (it would reflect the injected credential)".into(),
+        ));
+    }
     if !constraints.methods.is_empty()
         && !constraints
             .methods

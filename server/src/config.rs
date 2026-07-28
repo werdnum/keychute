@@ -324,6 +324,19 @@ impl Config {
         if l.max_proxy_streams_per_client == 0 {
             bail!("limits.max_proxy_streams_per_client must be positive");
         }
+        // Zero here is never a usable configuration, only a quiet outage:
+        // waits that return immediately, a body cap every nonempty payload
+        // trips, and a proxy deadline that has elapsed before the upstream
+        // send.
+        if l.wait_max_seconds == 0 {
+            bail!("limits.wait_max_seconds must be positive");
+        }
+        if l.proxy_max_body_bytes == 0 {
+            bail!("limits.proxy_max_body_bytes must be positive");
+        }
+        if l.proxy_stream_deadline_seconds == 0 {
+            bail!("limits.proxy_stream_deadline_seconds must be positive");
+        }
         let names: std::collections::HashSet<_> = self.clients.iter().map(|c| &c.name).collect();
         if names.len() != self.clients.len() {
             bail!("duplicate client names in config");
@@ -431,6 +444,13 @@ clients:
         check(
             |l| l.max_proxy_streams_per_client = 0,
             "max_proxy_streams_per_client",
+        );
+        // Zero-valued wait/proxy limits are a quiet outage, not a config.
+        check(|l| l.wait_max_seconds = 0, "wait_max_seconds");
+        check(|l| l.proxy_max_body_bytes = 0, "proxy_max_body_bytes");
+        check(
+            |l| l.proxy_stream_deadline_seconds = 0,
+            "proxy_stream_deadline_seconds",
         );
         // The defaults themselves must pass.
         let mut cfg: Config = serde_yaml::from_str(BASE_YAML).unwrap();

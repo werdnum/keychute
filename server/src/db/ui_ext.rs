@@ -58,13 +58,19 @@ pub async fn approve_request(
     if store.is_some() {
         take_kek_shared_lock(&mut tx).await?;
     }
+    // `$3` is the proposed grant deadline (requested TTL already capped at
+    // `policy_not_after` by the handler), rechecked on the DB clock inside
+    // this transaction: the handler computed it before waiting on the KEK
+    // advisory lock and sealing, and approving past it would hand the client
+    // an approved status whose grant can only ever return `grant-expired`.
     let updated = sqlx::query(
         "UPDATE access_requests \
          SET state = 'approved', resolved_by = $2, resolved_at = now() \
-         WHERE id = $1 AND state = 'pending' AND now() < expires_at",
+         WHERE id = $1 AND state = 'pending' AND now() < expires_at AND now() < $3",
     )
     .bind(request_id)
     .bind(resolved_by)
+    .bind(grant.not_after)
     .execute(&mut *tx)
     .await?;
     if updated.rows_affected() != 1 {
@@ -433,6 +439,27 @@ mod tests {
             max_uses: Some(1),
             passthrough,
         }
+    }
+
+    #[tokio::test]
+    async fn approve_refuses_an_already_elapsed_grant_deadline() -> anyhow::Result<()> {
+        let Some(t) = setup().await? else {
+            return Ok(());
+        };
+        let db = &t.pool;
+        // The handler computed the deadline before the transaction; if it has
+        // already passed (short TTL, expired policy cap), approving would mint
+        // a grant that can only ever return grant-expired.
+        let row =
+            insert_pending(db, "s-late", "late-1", Utc::now() + Duration::seconds(600)).await?;
+        let mut params = grant_params(None);
+        params.not_after = Utc::now() - Duration::seconds(1);
+        let got = approve_request(db, row.id, "andrew", Uuid::new_v4(), &params, None).await?;
+        assert!(got.is_none());
+        // Nothing was written: the request is still pending and approvable.
+        let r = crate::db::get_request(db, row.id).await?.unwrap();
+        assert_eq!(r.state, "pending");
+        Ok(())
     }
 
     #[tokio::test]
