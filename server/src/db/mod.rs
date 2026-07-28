@@ -7,11 +7,13 @@
 //!   explicit transactions; audit rows join the same transaction.
 //! - Row structs mirror columns 1:1; higher layers convert to domain types.
 
+pub mod api_ext;
 pub mod clients;
 pub mod grants;
 pub mod policies;
 pub mod requests;
 pub mod secrets;
+pub mod ui_ext;
 
 #[cfg(test)]
 mod tests;

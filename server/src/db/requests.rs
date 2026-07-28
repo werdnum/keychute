@@ -165,7 +165,7 @@ pub async fn resolve_approve(
     let updated = sqlx::query(
         "UPDATE access_requests \
          SET state = 'approved', resolved_by = $2, resolved_at = now() \
-         WHERE id = $1 AND state = 'pending'",
+         WHERE id = $1 AND state = 'pending' AND now() < expires_at",
     )
     .bind(request_id)
     .bind(resolved_by)
@@ -232,7 +232,7 @@ pub async fn resolve_deny(
     let row: Option<(String, String)> = sqlx::query_as(
         "UPDATE access_requests \
          SET state = 'denied', deny_reason = $2, resolved_by = $3, resolved_at = now() \
-         WHERE id = $1 AND state = 'pending' \
+         WHERE id = $1 AND state = 'pending' AND now() < expires_at \
          RETURNING client_name, secret_name",
     )
     .bind(request_id)
