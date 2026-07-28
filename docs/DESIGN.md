@@ -325,7 +325,10 @@ the ciphertext-only design removes the main reason to isolate.
   ciphertext-only guarantee is explicitly scoped to secret payloads and
   freeform context. A URL is not a place for a secret — that is already true
   end-to-end (upstream access logs see it too), and the operator sees every
-  constraint verbatim in the approval UI.
+  constraint verbatim in the approval UI. Creation is idempotent: the client
+  supplies a creation idempotency key, and a retry after a lost response
+  returns the original request id instead of minting a second pending request
+  (and a second push).
 - `grants` — issued capability: request_id, constraints, TTL, max_uses, use_count,
   revoked. (One-shot releases are grants with max_uses = 1.) A passthrough secret
   entered at approval time but not stored is encrypted and attached to its grant,
@@ -349,16 +352,22 @@ the ciphertext-only design removes the main reason to isolate.
   expiry/revocation check, idempotency-key binding (where applicable), and the
   `use_count < max_uses` increment happen in one conditional
   `UPDATE … RETURNING`, so concurrent accesses can neither exceed the approved
-  count nor both be treated as the first read. The `pending → approved`
+  count nor both be treated as the first read. A same-key replay is recognized
+  inside that same atomic step and returns the pinned payload **without** a
+  further increment — replay is the one exception to `use_count < max_uses`,
+  bounded by the replay window, and it still revalidates caller, expiry, and
+  revocation. The `pending → approved`
   transition and grant insertion likewise happen in one transaction, with a
   conditional state update and a unique constraint on `grants.request_id` — a
   double-submitted approval, or an approval racing expiry, cannot mint two
   grants or resurrect an expired request.
 - `audit_log` — append-only: every request, decision, release, and each individual
   proxied call (method, host, path, status — never bodies or credentials). Each
-  release or proxy event records the immutable `secret_version_id` actually
-  decrypted, so incident response can tell exactly which credential was exposed
-  even across rotations.
+  release or proxy event records the immutable identifier of the payload
+  actually decrypted — the `secret_version_id`, or the grant-scoped passthrough
+  payload id for approval-time-entered secrets that were not stored — so
+  incident response can tell exactly which credential was exposed even across
+  rotations.
 
 ---
 
@@ -424,8 +433,12 @@ grant is thereby visible.
   either way resolving to a `clients` row carrying the name and tier:
   - **Static API tokens** (hash stored server-side): the operator generates a
     token, drops it into the client's environment (e.g. family-assistant's
-    config), and records "this token is client `family-assistant`, tier 1". Works
-    anywhere; no Kubernetes dependency.
+    config), and records "this token is client `family-assistant`, tier 1". No
+    Kubernetes dependency in the protocol — though today every machine client is
+    in-cluster and reaches the internal TLS service directly; an out-of-cluster
+    client would additionally need a separately routed machine hostname that
+    bypasses the human OIDC gateway, which is deferred until such a client
+    exists.
   - **Audience-bound projected service-account tokens**
     (`audience: keychute.andrewgarrett.dev`) validated via TokenReview —
     convenient for in-cluster clients like k8s-agent (no secret distribution; the
@@ -565,8 +578,9 @@ calendar estimates.
   including grant TTL and an expiry purge (a passthrough payload must not outlive
   its grant, so this cannot defer to a later milestone), audit log, client authn
   (API tokens + TokenReview), `keychute` CLI, and a minimal abuse guard — a
-  per-client cap on open pending requests and dedup/throttling of Pushover
-  notifications for repeated identical requests — since M1 is deployed and the
+  per-client cap on open pending requests and on concurrent wait connections
+  (bounded stream lifetimes, cleanup on disconnect), plus dedup/throttling of
+  Pushover notifications for repeated identical requests — since M1 is deployed and the
   threat model already assumes prompt-injected clients (full per-client rate
   limiting remains M5). Deployed to the
   cluster; k8s-agent image gains the CLI. *This is the first real value: agents stop
