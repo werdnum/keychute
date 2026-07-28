@@ -623,6 +623,8 @@ impl TestEnv {
         let token = extract_csrf(&page, &action).context("approve form csrf token not found")?;
         // Hidden field recording whether the secret was stored when the page
         // rendered; a browser submits it, and the handler 409s if it went stale.
+        // It is also part of the token's MAC input, so it must come from the
+        // same render as the token above — the two cannot be mixed and matched.
         let present = extract_form_field(&page, &action, "secret_present")
             .context("approve form secret_present marker not found")?;
         let mut form: Vec<(&str, &str)> =

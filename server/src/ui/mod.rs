@@ -137,6 +137,7 @@ fn check_post(
     route: &str,
     action_id: &str,
     subject: &str,
+    form_state: &str,
     token: &str,
 ) -> UiResult<()> {
     if !csrf::browser_metadata_ok(
@@ -149,7 +150,15 @@ fn check_post(
             "cross-origin request rejected",
         ));
     }
-    if !csrf::verify_token(&state.keyset, route, action_id, subject, token, Utc::now()) {
+    if !csrf::verify_token(
+        &state.keyset,
+        route,
+        action_id,
+        subject,
+        form_state,
+        token,
+        Utc::now(),
+    ) {
         return Err(UiError::new(
             StatusCode::FORBIDDEN,
             "invalid or expired form token; reload the page and retry",
@@ -479,9 +488,20 @@ async fn render_request_detail(
         },
     };
 
-    let approve_token =
-        csrf::issue_token(&state.keyset, R_APPROVE, &id.to_string(), &op.subject, now);
-    let deny_token = csrf::issue_token(&state.keyset, R_DENY, &id.to_string(), &op.subject, now);
+    // The marker is folded into the approve token's MAC, so the token is only
+    // valid for the state this page was rendered against and the hidden field
+    // cannot be swapped independently of it.
+    let secret_present = secret_present_marker(secret.is_some());
+    let approve_token = csrf::issue_token(
+        &state.keyset,
+        R_APPROVE,
+        &id.to_string(),
+        &op.subject,
+        secret_present,
+        now,
+    );
+    let deny_token =
+        csrf::issue_token(&state.keyset, R_DENY, &id.to_string(), &op.subject, "", now);
     let default_tier = mechanism.tier();
 
     Ok(html_page(
@@ -500,8 +520,7 @@ async fn render_request_detail(
 
             form method="post" action={ "/ui/requests/" (id) "/approve" } {
                 input type="hidden" name="csrf_token" value=(approve_token);
-                input type="hidden" name=(F_SECRET_PRESENT)
-                    value=(if secret.is_some() { "1" } else { "0" });
+                input type="hidden" name=(F_SECRET_PRESENT) value=(secret_present);
                 fieldset {
                     legend { "Narrow the grant (optional — values may only shrink the request)" }
                     label {
@@ -702,14 +721,24 @@ fn validate_injection(
     }
 }
 
-/// Does the approval form's render-time assumption about the secret still
-/// hold? `Some(true)` = yes, `Some(false)` = the secret was created or removed
-/// under the operator (409), `None` = no usable marker (malformed form).
-fn secret_state_still_matches(rendered: Option<&str>, present_now: bool) -> Option<bool> {
+/// Parse the approval form's render-time marker: `Some(true)` = the page was
+/// rendered against a stored secret, `Some(false)` = against an absent one,
+/// `None` = no usable marker (malformed form).
+fn parse_secret_present(rendered: Option<&str>) -> Option<bool> {
     match rendered {
-        Some("1") => Some(present_now),
-        Some("0") => Some(!present_now),
+        Some("1") => Some(true),
+        Some("0") => Some(false),
         _ => None,
+    }
+}
+
+/// Canonical spelling of the marker, used both for the hidden field and as the
+/// CSRF token's form-state binding so the two can never disagree.
+fn secret_present_marker(present: bool) -> &'static str {
+    if present {
+        "1"
+    } else {
+        "0"
     }
 }
 
@@ -738,14 +767,25 @@ async fn approve(
     Form(mut form): Form<ApproveForm>,
 ) -> UiResult<Response> {
     let op = operator(&state, &headers).await?;
+    // The marker is part of the token's MAC input, so it is read before the
+    // guard runs — the CSRF check stays the outermost gate, and a submission
+    // that drops, edits, or swaps the marker simply fails it (403).
+    let submitted_marker = non_empty(&form.secret_present).unwrap_or("");
     check_post(
         &state,
         &headers,
         R_APPROVE,
         &id.to_string(),
         &op.subject,
+        submitted_marker,
         &form.csrf_token,
     )?;
+    // Past the guard the marker is provably one this server rendered, but parse
+    // rather than assume: never guess a branch from an unrecognised value.
+    let rendered_present =
+        parse_secret_present(non_empty(&form.secret_present)).ok_or_else(|| {
+            UiError::bad_request("malformed approval form; reload the page and retry")
+        })?;
     let row = db::get_request(&state.db, id)
         .await?
         .ok_or_else(|| UiError::new(StatusCode::NOT_FOUND, "no such request"))?;
@@ -800,18 +840,12 @@ async fn approve(
     // either way would release a credential they did not choose. Refuse and
     // re-render so they decide against the new state (same 409 shape as the
     // "resolved concurrently" case below).
-    match secret_state_still_matches(non_empty(&form.secret_present), secret.is_some()) {
-        None => {
-            return Err(UiError::bad_request(
-                "malformed approval form; reload the page and retry",
-            ))
-        }
-        Some(false) => {
-            let page =
-                render_request_detail(&state, &op, &row, now, Some(SECRET_STATE_CHANGED)).await?;
-            return Ok((StatusCode::CONFLICT, page).into_response());
-        }
-        Some(true) => {}
+    // The marker is authenticated (it is part of the token's MAC input), so a
+    // mismatch here can only mean the world moved, never a doctored field.
+    if rendered_present != secret.is_some() {
+        let page =
+            render_request_detail(&state, &op, &row, now, Some(SECRET_STATE_CHANGED)).await?;
+        return Ok((StatusCode::CONFLICT, page).into_response());
     }
 
     let secret_value = take_secret_value(&mut form);
@@ -950,6 +984,7 @@ async fn deny(
         R_DENY,
         &id.to_string(),
         &op.subject,
+        "",
         &form.csrf_token,
     )?;
     let denied = db::resolve_deny(&state.db, id, &op.subject, "denied by operator").await?;
@@ -997,7 +1032,7 @@ async fn grants_page(State(state): State<AppState>, headers: HeaderMap) -> UiRes
                             td {
                                 form method="post" action={ "/ui/grants/" (g.id) "/revoke" } .inline {
                                     input type="hidden" name="csrf_token"
-                                        value=(csrf::issue_token(&state.keyset, R_REVOKE, &g.id.to_string(), &op.subject, now));
+                                        value=(csrf::issue_token(&state.keyset, R_REVOKE, &g.id.to_string(), &op.subject, "", now));
                                     button type="submit" { "Revoke" }
                                 }
                             }
@@ -1022,6 +1057,7 @@ async fn revoke(
         R_REVOKE,
         &id.to_string(),
         &op.subject,
+        "",
         &form.csrf_token,
     )?;
     // No matching live grant means nothing was revoked and nothing audited
@@ -1046,7 +1082,7 @@ async fn policies_page(
     let op = operator(&state, &headers).await?;
     let now = Utc::now();
     let policies = db::list_policies(&state.db).await?;
-    let create_token = csrf::issue_token(&state.keyset, R_POLICY_CREATE, "", &op.subject, now);
+    let create_token = csrf::issue_token(&state.keyset, R_POLICY_CREATE, "", &op.subject, "", now);
     Ok(html_page(
         "Policies",
         html! {
@@ -1083,7 +1119,7 @@ async fn policies_page(
                             td {
                                 form method="post" action={ "/ui/policies/" (p.id) "/delete" } .inline {
                                     input type="hidden" name="csrf_token"
-                                        value=(csrf::issue_token(&state.keyset, R_POLICY_DELETE, &p.id.to_string(), &op.subject, now));
+                                        value=(csrf::issue_token(&state.keyset, R_POLICY_DELETE, &p.id.to_string(), &op.subject, "", now));
                                     button type="submit" { "Delete" }
                                 }
                             }
@@ -1191,6 +1227,7 @@ async fn create_policy(
         R_POLICY_CREATE,
         "",
         &op.subject,
+        "",
         &form.csrf_token,
     )?;
 
@@ -1300,6 +1337,7 @@ async fn delete_policy(
         R_POLICY_DELETE,
         &id.to_string(),
         &op.subject,
+        "",
         &form.csrf_token,
     )?;
     // Deletion and its audit row commit together (same reasoning as creation).
@@ -1321,7 +1359,7 @@ async fn secrets_page(State(state): State<AppState>, headers: HeaderMap) -> UiRe
     let op = operator(&state, &headers).await?;
     let now = Utc::now();
     let secrets = db::list_secrets(&state.db).await?;
-    let token = csrf::issue_token(&state.keyset, R_SECRET_SAVE, "", &op.subject, now);
+    let token = csrf::issue_token(&state.keyset, R_SECRET_SAVE, "", &op.subject, "", now);
     Ok(html_page(
         "Secrets",
         html! {
@@ -1412,6 +1450,7 @@ async fn save_secret(
         R_SECRET_SAVE,
         "",
         &op.subject,
+        "",
         &form.csrf_token,
     )?;
     let name = form.name.trim().to_owned();
@@ -1635,17 +1674,57 @@ mod tests {
     fn stale_approval_form_is_detected_in_both_directions() {
         // Rendered against an absent secret, still absent: the form means what
         // it said (operator's typed value is the one released).
-        assert_eq!(secret_state_still_matches(Some("0"), false), Some(true));
-        // ...but one appeared in the meantime: approving would release the
-        // stored credential instead of the one the operator typed.
-        assert_eq!(secret_state_still_matches(Some("0"), true), Some(false));
-        // Rendered against a stored secret, still stored.
-        assert_eq!(secret_state_still_matches(Some("1"), true), Some(true));
-        // ...and the mirror case, if a delete path ever exists.
-        assert_eq!(secret_state_still_matches(Some("1"), false), Some(false));
+        assert_eq!(parse_secret_present(Some("0")), Some(false));
+        // Rendered against a stored secret.
+        assert_eq!(parse_secret_present(Some("1")), Some(true));
         // No usable marker: never guess a branch.
-        assert_eq!(secret_state_still_matches(None, false), None);
-        assert_eq!(secret_state_still_matches(Some("yes"), true), None);
+        assert_eq!(parse_secret_present(None), None);
+        assert_eq!(parse_secret_present(Some("yes")), None);
+        // The marker round-trips through the spelling used for both the hidden
+        // field and the CSRF binding, so the two can never disagree.
+        for present in [true, false] {
+            assert_eq!(
+                parse_secret_present(Some(secret_present_marker(present))),
+                Some(present)
+            );
+        }
+        // A rendered marker that no longer matches reality is the 409 case: a
+        // secret appeared under an "absent" form, or vanished under a "stored"
+        // one. The handler compares exactly these two booleans.
+        assert_ne!(parse_secret_present(Some("0")), Some(true));
+        assert_ne!(parse_secret_present(Some("1")), Some(false));
+    }
+
+    /// The approve token is minted against the render-time secret state, so a
+    /// token from the "absent" page cannot be replayed with the "stored"
+    /// marker (or vice versa) — the guard is tamper-evident, not advisory.
+    #[test]
+    fn approve_token_is_bound_to_the_rendered_secret_state() {
+        let ks = csrf::test_keyset();
+        let now = Utc::now();
+        let (route, id, subj) = (R_APPROVE, "req-1", "andrew");
+        for present in [true, false] {
+            let token =
+                csrf::issue_token(&ks, route, id, subj, secret_present_marker(present), now);
+            assert!(csrf::verify_token(
+                &ks,
+                route,
+                id,
+                subj,
+                secret_present_marker(present),
+                &token,
+                now
+            ));
+            assert!(!csrf::verify_token(
+                &ks,
+                route,
+                id,
+                subj,
+                secret_present_marker(!present),
+                &token,
+                now
+            ));
+        }
     }
 
     #[test]

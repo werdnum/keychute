@@ -139,14 +139,21 @@ async fn expired_request_cannot_be_approved() {
         .ui_get(&format!("/ui/requests/{request_id}"))
         .await
         .unwrap();
-    let token = extract_csrf(&page, &format!("/ui/requests/{request_id}/approve"))
-        .expect("approve form present before expiry");
+    let action = format!("/ui/requests/{request_id}/approve");
+    let token = extract_csrf(&page, &action).expect("approve form present before expiry");
+    // The token is bound to the render-time secret-state marker, so a browser's
+    // submission carries both from the same render.
+    let present = extract_form_field(&page, &action, "secret_present").expect("state marker");
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
     let (status, _body) = env
         .ui_post(
-            &format!("/ui/requests/{request_id}/approve"),
-            &[("csrf_token", &token), ("secret_value", "too-late")],
+            &action,
+            &[
+                ("csrf_token", &token),
+                ("secret_present", &present),
+                ("secret_value", "too-late"),
+            ],
         )
         .await
         .unwrap();
@@ -506,4 +513,109 @@ async fn stale_approval_form_is_refused_when_the_secret_appears_underneath() {
     let (status, body) = env.k8s().read_grant(&grant_id, "stale-read").await.unwrap();
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["secret"], "stored-credential-A");
+}
+
+/// The render-time marker is authenticated: it is folded into the approve
+/// token's MAC, so a token minted against one secret-state does not validate
+/// when submitted with the other marker value. Without that binding the marker
+/// was advisory — flippable independently of the token — and a doctored form
+/// could quietly re-acquire the meaning the operator never saw.
+#[tokio::test(flavor = "multi_thread")]
+async fn approve_token_is_bound_to_the_rendered_secret_state() {
+    let env = TestEnv::spawn(SpawnOpts::default()).await.unwrap();
+
+    // (1) Page rendered against an ABSENT secret: token is bound to "0".
+    let (status, body) = env
+        .k8s()
+        .create_request(cli_read_request("bind-1", "unstored", 600, "why"))
+        .await
+        .unwrap();
+    assert_eq!(status, 201, "{body}");
+    let absent_id = body["request_id"].as_str().unwrap().to_owned();
+    let absent_action = format!("/ui/requests/{absent_id}/approve");
+    let page = env
+        .ui_get(&format!("/ui/requests/{absent_id}"))
+        .await
+        .unwrap();
+    let absent_token = extract_csrf(&page, &absent_action).expect("approve csrf token");
+    assert_eq!(
+        extract_form_field(&page, &absent_action, "secret_present").as_deref(),
+        Some("0")
+    );
+
+    // Claiming "1" with that token is rejected before any state is consulted.
+    let (status, body) = env
+        .ui_post(
+            &absent_action,
+            &[("csrf_token", &absent_token), ("secret_present", "1")],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        status, 403,
+        "swapped marker must fail the token check: {body}"
+    );
+    assert!(body.contains("invalid or expired form token"), "{body}");
+
+    // (2) Page rendered against a STORED secret: token is bound to "1".
+    env.seed_secret("bound", "stored-value", "cooperating-client", "bearer", "")
+        .await
+        .unwrap();
+    let (status, body) = env
+        .k8s()
+        .create_request(cli_read_request("bind-2", "bound", 600, "why"))
+        .await
+        .unwrap();
+    assert_eq!(status, 201, "{body}");
+    let stored_id = body["request_id"].as_str().unwrap().to_owned();
+    let stored_action = format!("/ui/requests/{stored_id}/approve");
+    let page = env
+        .ui_get(&format!("/ui/requests/{stored_id}"))
+        .await
+        .unwrap();
+    let stored_token = extract_csrf(&page, &stored_action).expect("approve csrf token");
+    assert_eq!(
+        extract_form_field(&page, &stored_action, "secret_present").as_deref(),
+        Some("1")
+    );
+
+    // Downgrading the marker to "0" (which would open the operator-supplied
+    // value branch) is rejected the same way.
+    let (status, body) = env
+        .ui_post(
+            &stored_action,
+            &[
+                ("csrf_token", &stored_token),
+                ("secret_present", "0"),
+                ("secret_value", "attacker-supplied"),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        status, 403,
+        "swapped marker must fail the token check: {body}"
+    );
+
+    // Dropping the marker entirely breaks the same binding: the token was
+    // minted over "1" and no longer verifies without it.
+    let (status, body) = env
+        .ui_post(&stored_action, &[("csrf_token", &stored_token)])
+        .await
+        .unwrap();
+    assert_eq!(status, 403, "{body}");
+    assert!(body.contains("invalid or expired form token"), "{body}");
+
+    // Neither request was approved.
+    for id in [&absent_id, &stored_id] {
+        let state: String = sqlx::query_scalar("SELECT state FROM access_requests WHERE id = $1")
+            .bind(id.parse::<uuid::Uuid>().unwrap())
+            .fetch_one(&env.db)
+            .await
+            .unwrap();
+        assert_eq!(state, "pending", "request {id} must not have been approved");
+    }
+
+    // The honest submissions still work.
+    env.approve(&stored_id, &[]).await.unwrap();
 }
