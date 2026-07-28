@@ -268,7 +268,11 @@ k8s-agent image).
   stored context.
 - KEK rotation = add the new key to the keyset, mark it active, rewrap rows to it
   (cheap — no payload re-encryption, each row update atomic), then retire the old
-  key once no row references its `kek_id`. Because both keys coexist in the file
+  key once no row references its `kek_id`. Retirement serializes with ciphertext
+  writers: the zero-reference check and key removal run under an advisory lock
+  that every wrapped-DEK writer holds in shared mode, so an in-flight write that
+  selected the old key cannot commit after retirement declares it unreferenced.
+  Because both keys coexist in the file
   during rotation and every row names its wrapping key, a crash at any point
   leaves every secret decryptable on restart. Secret rotation = new version row;
   old versions retained (visible in audit trail) until purged — and never purged
@@ -305,7 +309,11 @@ the ciphertext-only design removes the main reason to isolate.
   immediately changes which policies match it.
 - `secret_versions` — secret_id, version, ciphertext, nonce, wrapped_dek,
   created_by (approval that ingested it). No stored AAD — it is derived from
-  the queried key columns (§ crypto above).
+  the queried key columns (§ crypto above). Rows are **append-only**: rotation
+  inserts a new version, and nothing ever rewrites the ciphertext behind an
+  existing `secret_version_id` — pinned replays and audit records depend on that
+  immutability. The one in-place update is the KEK rewrap of `wrapped_dek`,
+  which changes the wrapping, never the payload.
 - `clients` — id, name (`family-assistant`, `k8s-agent`), authn binding (SA
   audience+subject, or API-key hash), max_tier, allowed mechanisms, enabled.
   Client rows are provisioned **declaratively**: a config file (Helm values →
@@ -588,7 +596,14 @@ Research findings that shape this (all verified against the current tree):
   operator-overridden per credential); and subsequent `browser_snapshot` /
   `browser_extract` / screenshots must mask the filled field's value, since the
   agent could otherwise read it back off the page. That masking work is part of the
-  integration, not optional. (`browser_request_handoff` remains the fallback for
+  integration, not optional. And masking alone is insufficient while an
+  arbitrary-JS path exists: `browser_exec` (or any raw script evaluation) can
+  read `document.querySelector(…).value` directly, so from
+  `browser_fill_credential` until the next navigation or form submission the
+  integration must withhold script-evaluation tools from the agent. A profile
+  that keeps raw JS available while a credential is live does not get tier-1
+  treatment — Keychute classifies the mechanism as tier 2 for that client and
+  the approval UI says so. (`browser_request_handoff` remains the fallback for
   sites where masking can't be made sound.)
 - Context enrichment: when a Keychute request originates inside `execute_script`
   (the Monty sandbox), FA attaches the script source as structured context so the
@@ -603,7 +618,8 @@ calendar estimates.
 
 - **M0 — Skeleton & crypto core.** Rust workspace, CI (fmt/clippy/test, ARM64 image
   build), migrations, envelope-encryption module with KEK-file loading and
-  rotation-rewrap, `secrets`/`secret_versions` CRUD behind an admin API that is
+  rotation-rewrap, `secrets` CRUD and append-only `secret_versions` behind an
+  admin API that is
   **loopback/test-only in this milestone** — nothing network-reachable is
   deployed until M1's authn and TLS exist. Property tests on the crypto seams;
   no network delivery yet.
