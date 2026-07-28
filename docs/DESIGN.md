@@ -247,7 +247,10 @@ k8s-agent image).
 - Each secret *version* gets a fresh random **DEK**; plaintext is encrypted with
   XChaCha20-Poly1305 under the DEK; the DEK is wrapped under the KEK. AAD binds
   ciphertext to `(secret_id, version)` so rows can't be swapped or replayed across
-  secrets.
+  secrets — and the AAD is never stored: it is reconstructed canonically from the
+  row's queried `secret_id` and `version` at decrypt time, so ciphertext moved to
+  another row fails AEAD verification instead of decrypting under a relocated
+  stored context.
 - KEK rotation = add the new key to the keyset, mark it active, rewrap rows to it
   (cheap — no payload re-encryption, each row update atomic), then retire the old
   key once no row references its `kek_id`. Because both keys coexist in the file
@@ -283,8 +286,9 @@ the ciphertext-only design removes the main reason to isolate.
 - `secret_tags` — (secret_id, tag) associations backing tag-scoped policy rows.
   Tag membership is evaluated at request time, so re-tagging a secret
   immediately changes which policies match it.
-- `secret_versions` — secret_id, version, ciphertext, nonce, wrapped_dek, aad
-  context, created_by (approval that ingested it).
+- `secret_versions` — secret_id, version, ciphertext, nonce, wrapped_dek,
+  created_by (approval that ingested it). No stored AAD — it is derived from
+  the queried key columns (§ crypto above).
 - `clients` — id, name (`family-assistant`, `k8s-agent`), authn binding (SA
   audience+subject, or API-key hash), max_tier, allowed mechanisms, enabled.
 - `policies` — (client, secret | secret-tag) → mechanism, tier, constraints
@@ -329,8 +333,10 @@ the ciphertext-only design removes the main reason to isolate.
   *logical* read: the first read binds the grant to a client-supplied idempotency
   key, and retries with the same key within a short replay window return the same
   plaintext — otherwise a connection lost between the use-count increment and
-  delivery would strand an approved grant. The window closing (or the TTL) is what
-  purges the payload. A grant is not a transferable bearer capability: every
+  delivery would strand an approved grant. The first use persists the resolved
+  `secret_version_id` in the idempotency state and replays decrypt exactly that
+  version, so a rotation during the window cannot leak a second version through
+  one grant. The window closing (or the TTL) is what purges the payload. A grant is not a transferable bearer capability: every
   grant operation — `read`, `proxy`, and idempotent replay — authorizes the
   caller against the client on the originating access request, so a leaked
   `grant_id` is useless to any other client identity. A grant issued under a
@@ -339,10 +345,15 @@ the ciphertext-only design removes the main reason to isolate.
   additionally revalidates current state — client enabled, secret and client max
   tiers, allowed mechanism — so tightening a cap or disabling a client takes
   effect immediately for already-issued grants rather than waiting for their
-  expiry. Consumption of a single-use grant is atomic: the expiry/revocation
-  check, idempotency-key binding, and use-count increment happen in one
-  conditional `UPDATE … RETURNING`, so racing first reads cannot both be
-  treated as the first.
+  expiry. Every grant use — single- or multi-use — is accounted atomically: the
+  expiry/revocation check, idempotency-key binding (where applicable), and the
+  `use_count < max_uses` increment happen in one conditional
+  `UPDATE … RETURNING`, so concurrent accesses can neither exceed the approved
+  count nor both be treated as the first read. The `pending → approved`
+  transition and grant insertion likewise happen in one transaction, with a
+  conditional state update and a unique constraint on `grants.request_id` — a
+  double-submitted approval, or an approval racing expiry, cannot mint two
+  grants or resurrect an expired request.
 - `audit_log` — append-only: every request, decision, release, and each individual
   proxied call (method, host, path, status — never bodies or credentials). Each
   release or proxy event records the immutable `secret_version_id` actually
@@ -435,7 +446,9 @@ grant is thereby visible.
   browser sends. Human pages are served with
   `Content-Security-Policy: frame-ancestors 'none'` (plus `X-Frame-Options:
   DENY`) so an authenticated approval page cannot be clickjacked from a framing
-  site. Cluster-
+  site, and — like every endpoint that returns secret material — with
+  `Cache-Control: no-store`, so transient rendering never leaves a plaintext
+  copy in a browser or intermediary cache. Cluster-
   internal client API routes bypass OIDC (the sudo-service shape: internal service
   URL for machines, OIDC-fronted external URL for me).
 
@@ -542,8 +555,10 @@ calendar estimates.
 
 - **M0 — Skeleton & crypto core.** Rust workspace, CI (fmt/clippy/test, ARM64 image
   build), migrations, envelope-encryption module with KEK-file loading and
-  rotation-rewrap, `secrets`/`secret_versions` CRUD behind an admin API. Property
-  tests on the crypto seams; no network delivery yet.
+  rotation-rewrap, `secrets`/`secret_versions` CRUD behind an admin API that is
+  **loopback/test-only in this milestone** — nothing network-reachable is
+  deployed until M1's authn and TLS exist. Property tests on the crypto seams;
+  no network delivery yet.
 - **M1 — CUJ 2 end-to-end (CLI + approval).** Access requests, wait endpoint,
   Pushover notifier, approval UI with OIDC, approval-time secret entry
   (store-or-passthrough), durable grants with a single-use read endpoint
