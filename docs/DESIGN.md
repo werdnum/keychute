@@ -67,8 +67,10 @@ and is agent-influenceable. The approval UI therefore renders tier-2 context as
    same host.
 2. Keychute matches this against policy. No standing grant → it sends a Pushover
    notification: *"family-assistant requests 1 h of brokered access to
-   api.example.com using 'Example API token'. Purpose: ⟨client-supplied context⟩."*
-   The push links to the approval page (OIDC-protected).
+   api.example.com using 'Example API token'."* Pushes carry only
+   server-controlled metadata (client, secret name, tier, target) plus the link
+   to the approval page (OIDC-protected) — client-supplied context may contain
+   credential bytes and is shown only there.
 3. I approve, which stores a durable grant. FA's wait resolves with the `grant_id`
    (never the credential).
 4. FA makes requests through `POST /v1/grants/{grant_id}/proxy`. Keychute validates
@@ -313,7 +315,12 @@ the ciphertext-only design removes the main reason to isolate.
   key, and retries with the same key within a short replay window return the same
   plaintext — otherwise a connection lost between the use-count increment and
   delivery would strand an approved grant. The window closing (or the TTL) is what
-  purges the payload.
+  purges the payload. A grant is not a transferable bearer capability: every
+  grant operation — `read`, `proxy`, and idempotent replay — authorizes the
+  caller against the client on the originating access request, so a leaked
+  `grant_id` is useless to any other client identity. A grant issued under a
+  standing policy row also expires no later than that row does — a request made
+  minutes before a policy lapses cannot extend access past it.
 - `audit_log` — append-only: every request, decision, release, and each individual
   proxied call (method, host, path, status — never bodies or credentials).
 
@@ -325,8 +332,10 @@ The user-visible question an approval answers has two parts, and policy treats t
 separately:
 
 1. **The thing being done, minus mechanism** — *"family-assistant wants to log into
-   HelloFresh"*. Matched against standing grants, recency ("did I recently approve
-   this same intent?"), and per-secret rules.
+   HelloFresh"*. Matched against standing grants and per-secret rules. Recency
+   ("you approved a similar request minutes ago") is surfaced to the approver as
+   advisory context only — it never produces an automatic release, which keeps
+   the inherently fuzzy notion of "same intent" out of the enforcement path.
 2. **The mechanism / tier** — *"…and it will handle the password with deterministic
    autofill code (tier 1)"*. Matched against the secret's max tier and the client's
    max tier.
