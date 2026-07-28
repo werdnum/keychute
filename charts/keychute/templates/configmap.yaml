@@ -81,4 +81,5 @@ data:
       proxy_max_body_bytes: {{ .Values.limits.proxyMaxBodyBytes | int64 }}
       proxy_stream_deadline_seconds: {{ .Values.limits.proxyStreamDeadlineSeconds | int64 }}
       replay_window_seconds: {{ .Values.limits.replayWindowSeconds | int64 }}
+      drain_seconds: {{ .Values.limits.drainSeconds | int64 }}
       max_proxy_streams_per_client: {{ .Values.limits.maxProxyStreamsPerClient | int64 }}

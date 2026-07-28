@@ -144,6 +144,19 @@ pub struct Limits {
     pub proxy_stream_deadline_seconds: u64,
     pub replay_window_seconds: i64,
     pub max_proxy_streams_per_client: usize,
+    /// How long the server keeps draining in-flight responses after a
+    /// shutdown signal before closing what is left. 0 disables draining.
+    ///
+    /// Must fit INSIDE the pod's `terminationGracePeriodSeconds` (Kubernetes
+    /// default 30 s), or the kubelet SIGKILLs us mid-drain and the drain was
+    /// pointless — the default 25 s leaves ~5 s of headroom. Draining matters
+    /// more than usual here: the chart pins `replicas: 1` + `Recreate`
+    /// because an approval-time passthrough payload is wrapped under the
+    /// PROCESS-LOCAL ephemeral KEK (DESIGN §5), so an in-flight passthrough
+    /// read that is cut off is permanently unrecoverable — and a finite-use
+    /// grant that already committed its use-accounting would lose that use
+    /// without ever returning a response.
+    pub drain_seconds: u64,
 }
 
 impl Default for Limits {
@@ -157,6 +170,7 @@ impl Default for Limits {
             proxy_stream_deadline_seconds: 300,
             replay_window_seconds: 60,
             max_proxy_streams_per_client: 8,
+            drain_seconds: 25,
         }
     }
 }

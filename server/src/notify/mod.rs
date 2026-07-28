@@ -228,39 +228,69 @@ pub(crate) const PUSH_DEDUP_WINDOW_SECONDS: i64 = 60;
 const CONTEXT_RETENTION_HOURS: i64 = 24;
 
 /// Spawn the background sweeper: every 30 s — (a) expire stale pending
-/// requests (waking wait-endpoint pollers), (b) retry undelivered approval
-/// pushes with dedup, (c) purge lifecycle (passthrough payloads, terminal
-/// request context, stale grant_reads).
-pub fn spawn_sweeper(state: AppState) {
+/// requests (waking wait-endpoint pollers), (b) purge lifecycle (passthrough
+/// payloads, terminal request context, stale grant_reads), (c) retry
+/// undelivered approval pushes with dedup.
+///
+/// Stops cleanly when `shutdown` flips to `true` (or its sender is dropped),
+/// so a graceful shutdown is not held up by the next tick. Returns the join
+/// handle so the caller can wait for the loop to exit.
+pub fn spawn_sweeper(
+    state: AppState,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(SWEEP_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            ticker.tick().await;
-            if let Err(err) = sweep_once(&state).await {
-                tracing::warn!(error = %err, "sweep failed");
+            tokio::select! {
+                _ = ticker.tick() => {
+                    if let Err(err) = sweep_once(&state).await {
+                        tracing::warn!(error = %err, "sweep failed");
+                    }
+                }
+                // `changed()` also resolves (with an error) once the sender is
+                // dropped; either way the process is going away.
+                _ = shutdown.changed() => {
+                    tracing::info!("background sweeper stopping");
+                    break;
+                }
             }
         }
-    });
+    })
 }
 
 async fn sweep_once(state: &AppState) -> anyhow::Result<()> {
-    use anyhow::Context;
-
-    let now = Utc::now();
-
-    // The phases are independent and EVERY phase runs on every sweep. A slow
-    // or failing push must never skip the purge lifecycle — that is what
-    // actually deletes passthrough ciphertext and stale replay rows — so the
-    // results are collected first and only reported afterwards.
-    let expiry = expire_phase(state, now).await;
-    let push = push_phase(state, now).await;
-    let purge = purge_phase(state, now).await;
-
-    expiry.context("expiry phase")?;
-    push.context("push phase")?;
-    purge.context("purge phase")?;
-    Ok(())
+    // ORDERING. The phases are independent, but they are NOT interchangeable:
+    // the push phase is the only network-bound one, it walks the pending queue
+    // serially, and each row can burn up to `PUSH_SEND_TIMEOUT`. With Pushover
+    // slow or unreachable a single sweep can therefore run for minutes. So the
+    // two DB-only phases (expiry, purge) run FIRST and the push queue LAST —
+    // otherwise a stalled push would postpone the purge lifecycle, leaving
+    // consumed passthrough ciphertext, terminal request context and stale
+    // replay rows in the database well past their retention windows, which is
+    // precisely what splitting the sweep into phases was meant to prevent.
+    //
+    // Each phase also takes its OWN `Utc::now()`: a timestamp captured before a
+    // minutes-long phase would produce stale retention cutoffs (and a stale
+    // push-dedup window). And EVERY phase runs on every sweep — failures are
+    // collected and reported together rather than `?`-ed out early, so one
+    // broken phase can never skip a later one.
+    let mut errors: Vec<String> = Vec::new();
+    if let Err(err) = expire_phase(state, Utc::now()).await {
+        errors.push(format!("expiry phase: {err:#}"));
+    }
+    if let Err(err) = purge_phase(state, Utc::now()).await {
+        errors.push(format!("purge phase: {err:#}"));
+    }
+    if let Err(err) = push_phase(state).await {
+        errors.push(format!("push phase: {err:#}"));
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("{}", errors.join("; "))
+    }
 }
 
 /// (a) Expire pending requests past their deadline; waiting clients must
@@ -274,33 +304,32 @@ async fn expire_phase(state: &AppState, now: chrono::DateTime<Utc>) -> anyhow::R
     Ok(())
 }
 
-/// (b) Push retry. Every pending request without a recorded delivery is
+/// (c) Push retry. Every pending request without a recorded delivery is
 /// retried each sweep (attempts counter is telemetry only). With no real
 /// notifier nothing can be delivered: skip the loop entirely rather than
 /// spinning on rows that will never be marked delivered.
-async fn push_phase(state: &AppState, now: chrono::DateTime<Utc>) -> anyhow::Result<()> {
+async fn push_phase(state: &AppState) -> anyhow::Result<()> {
     if !state.notifier.is_real() {
         return Ok(());
     }
     let pending = db::list_pending_needing_push(&state.db, i32::MAX).await?;
     for row in pending {
         // One bad row must not abandon the rest of the queue.
-        if let Err(err) = push_one(state, now, &row).await {
+        if let Err(err) = push_one(state, &row).await {
             tracing::warn!(request_id = %row.id, error = %err, "push retry failed");
         }
     }
     Ok(())
 }
 
-async fn push_one(
-    state: &AppState,
-    now: chrono::DateTime<Utc>,
-    row: &db::AccessRequestRow,
-) -> anyhow::Result<()> {
+async fn push_one(state: &AppState, row: &db::AccessRequestRow) -> anyhow::Result<()> {
     // Same serialization as the create path (state.push_lock): the sweep
     // must not race a concurrent create's dedup-check + send. The send below
     // is timeout-bounded, so the lock is held for a bounded time.
     let _push_guard = state.push_lock.lock().await;
+    // Per-row `now`: a queue of slow pushes can take minutes, and the dedup
+    // window must be measured against the moment THIS row is considered.
+    let now = Utc::now();
     let dedup = db::ui_ext::recent_duplicate_push(
         &state.db,
         row,
@@ -346,7 +375,8 @@ async fn push_one(
     Ok(())
 }
 
-/// (c) Purge lifecycle (addendum #11).
+/// (b) Purge lifecycle (addendum #11). Runs before the push phase so network
+/// trouble at the notifier can never delay ciphertext deletion.
 async fn purge_phase(state: &AppState, now: chrono::DateTime<Utc>) -> anyhow::Result<()> {
     let replay_window = state.config.limits.replay_window_seconds;
     db::sweep_purge_passthroughs(&state.db, now, replay_window).await?;

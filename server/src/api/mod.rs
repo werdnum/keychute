@@ -9,15 +9,60 @@ pub mod requests;
 use crate::authn::client::AuthedClient;
 use crate::db;
 use crate::state::AppState;
+use axum::extract::State;
+use axum::http::{header, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::Router;
 use error::ApiFailure;
 use keychute_types::{AccessRequestStatus, Mechanism, RequestState, Tier};
 use uuid::Uuid;
 
+/// Upper bound on the readiness database probe. Must stay comfortably below a
+/// sensible probe `timeoutSeconds` so the endpoint answers rather than hangs.
+const READINESS_DB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// `GET /readyz` — readiness. Unlike `/healthz` (process liveness only) this
+/// verifies the dependency without which every meaningful operation fails: the
+/// database. A pod whose Postgres is unreachable must leave the Service
+/// endpoints instead of accepting requests it cannot serve.
+///
+/// The check is bounded (`SELECT 1` under a short timeout) so a hung
+/// connection reports not-ready instead of stalling the probe until kubelet's
+/// own timeout. The body is a fixed generic string — connection strings and
+/// driver errors (which can carry credentials) are logged, never returned.
+async fn readyz(State(state): State<AppState>) -> Response {
+    let probe = sqlx::query_scalar::<_, i32>("SELECT 1").fetch_one(&state.db);
+    let unready = |detail: String| {
+        tracing::warn!(target: "keychute::readiness", %detail, "readiness probe failed");
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::CACHE_CONTROL, "no-store")],
+            "database unavailable\n",
+        )
+            .into_response()
+    };
+    match tokio::time::timeout(READINESS_DB_TIMEOUT, probe).await {
+        Ok(Ok(_)) => (
+            StatusCode::OK,
+            [(header::CACHE_CONTROL, "no-store")],
+            "ready\n",
+        )
+            .into_response(),
+        Ok(Err(e)) => unready(e.to_string()),
+        Err(_) => unready(format!(
+            "database probe timed out after {}s",
+            READINESS_DB_TIMEOUT.as_secs()
+        )),
+    }
+}
+
 pub fn router(state: AppState) -> Router {
     Router::new()
+        // Liveness only: the process is up and the runtime is scheduling.
+        // Dependency health belongs on /readyz.
         .route("/healthz", get(|| async { "ok" }))
+        .route("/readyz", get(readyz))
         .route("/v1/access-requests", post(requests::create))
         .route("/v1/access-requests/{id}", get(requests::status))
         .route("/v1/access-requests/{id}/wait", get(requests::wait))

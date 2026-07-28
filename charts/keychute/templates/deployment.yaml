@@ -29,6 +29,11 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
     spec:
+      # Must exceed limits.drainSeconds so the drain completes before the
+      # kubelet SIGKILLs the pod: an in-flight passthrough read cut off here is
+      # unrecoverable, since its payload is wrapped under the process-local
+      # ephemeral KEK (DESIGN §5).
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       serviceAccountName: {{ include "keychute.serviceAccountName" . }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
@@ -82,6 +87,8 @@ spec:
             readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
+          # Liveness: process-only. /healthz never touches the database, so a
+          # Postgres outage does not get "fixed" by restarting the pod.
           livenessProbe:
             httpGet:
               path: /healthz
@@ -89,13 +96,20 @@ spec:
               scheme: HTTPS
             initialDelaySeconds: 15
             periodSeconds: 30
+          # Readiness: /readyz runs a bounded `SELECT 1`, so a pod that cannot
+          # reach the database leaves the Service endpoints instead of
+          # accepting requests every one of which would fail.
           readinessProbe:
             httpGet:
-              path: /healthz
+              path: /readyz
               port: https
               scheme: HTTPS
             initialDelaySeconds: 5
             periodSeconds: 10
+            # Above the server's own 2s database-probe bound so the endpoint
+            # answers 503 rather than being cut off mid-check.
+            timeoutSeconds: 3
+            failureThreshold: 3
           volumeMounts:
             - name: config
               mountPath: /etc/keychute/config

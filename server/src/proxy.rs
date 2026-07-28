@@ -2,8 +2,9 @@
 //!
 //! The outbound request is built fresh: caller headers are copied minus the
 //! pinned strip list, `Host` and the credential header are synthesized, the
-//! path is the validated canonical form re-encoded conservatively, and
-//! redirects are never followed (3xx passes through to the caller).
+//! path is the validated canonical form handed to `Url::set_path` (see
+//! [`outbound_url`]), and redirects are never followed (3xx passes through to
+//! the caller).
 
 use crate::api::error::ApiFailure;
 use crate::api::{owned_grant, revalidate_grant};
@@ -170,6 +171,50 @@ pub(crate) fn injection_header(
             Ok((AUTHORIZATION, value(bytes)?))
         }
     }
+}
+
+/// Build the outbound URL from the approved origin and the **canonical**
+/// (percent-decoded) path (addendum #12) — parsed URL mutation, never string
+/// concatenation.
+///
+/// `Url::set_path` percent-encodes its argument itself, so the canonical path
+/// is handed over decoded. Pre-encoding it first (as an earlier revision did
+/// with `paths::encode_for_forwarding`) double-encodes: `/a%20b` canonicalizes
+/// to `/a b`, re-encodes to `/a%20b`, and `set_path` would then emit
+/// `/a%2520b` — a *different* upstream resource than the one the grant
+/// authorized and the audit row recorded.
+///
+/// Why handing `set_path` a decoded path is safe: `paths::canonicalize` has
+/// already rejected every input whose decoded form could change the path's
+/// STRUCTURE — encoded `/` (`%2F`) and `\` (`%5C`), raw `\`, `.`/`..`
+/// segments, `//`, control characters, and non-UTF-8. So every `/` in the
+/// canonical string is a separator the caller genuinely sent, and no segment
+/// can be a dot segment; `set_path` cannot smuggle in structure that
+/// `prefix_matches` did not see.
+///
+/// Characters that delimit *other* URL components are handled by `set_path`
+/// itself: a decoded `?` or `#` (from `%3F`/`%23`) is percent-encoded into the
+/// path, not treated as the start of a query or fragment (asserted in the unit
+/// tests). The query is set separately and verbatim from the caller's URI.
+///
+/// The one character `set_path` does NOT encode is `%` itself (the WHATWG path
+/// percent-encode set omits it, so existing escapes survive re-parsing). A
+/// canonical path may legitimately contain a literal `%` — raw `/100%25`
+/// canonicalizes to `/100%`. Emitting that bare would hand upstream either a
+/// malformed escape or, worse, a *second* decode: canonical `/a%41` (from raw
+/// `/a%2541`, which is what the operator approved and what the audit log says)
+/// would arrive as `/a%41` and be read upstream as `/aA`. So `%` — and only
+/// `%` — is escaped here before `set_path` does the rest, which keeps the
+/// outbound path exactly single-encoded.
+fn outbound_url(
+    origin: &str,
+    canonical_path: &str,
+    query: Option<&str>,
+) -> Result<url::Url, url::ParseError> {
+    let mut url = url::Url::parse(origin)?;
+    url.set_path(&canonical_path.replace('%', "%25"));
+    url.set_query(query);
+    Ok(url)
 }
 
 /// ANY /v1/grants/{id}/proxy — root path.
@@ -395,12 +440,8 @@ async fn forward(
     slot: crate::state::SlotGuard,
     deadline: std::time::Duration,
 ) -> Result<Response, ApiFailure> {
-    // Outbound URL: parse the approved origin, then set path/query on the
-    // parsed URL (addendum #12) — never string-concatenation.
-    let mut url = url::Url::parse(&origin.to_display())
+    let url = outbound_url(&origin.to_display(), canonical_path, parts.uri.query())
         .map_err(|e| ApiFailure::Internal(anyhow::anyhow!("origin parse: {e}")))?;
-    url.set_path(&paths::encode_for_forwarding(canonical_path));
-    url.set_query(parts.uri.query());
 
     let upstream = state
         .upstream
@@ -590,6 +631,87 @@ mod tests {
         assert_eq!(proxy_suffix("/v1/grants/abc/proxyfoo"), None);
         assert_eq!(proxy_suffix("/v1/grants/abc"), None);
         assert_eq!(proxy_suffix("/healthz"), None);
+    }
+
+    /// Full production path: canonicalize the raw request suffix exactly as
+    /// `handle_inner` does, then build the outbound URL from it.
+    fn forwarded_path(raw: &str) -> String {
+        let canonical = paths::canonicalize(raw).expect("canonicalize");
+        let url = outbound_url("https://up.example.com", &canonical, None).unwrap();
+        url.path().to_owned()
+    }
+
+    #[test]
+    fn outbound_path_is_single_encoded() {
+        // Nothing to encode: passes through untouched.
+        assert_eq!(forwarded_path("/v1/echo"), "/v1/echo");
+
+        // A raw space and its encoded spelling canonicalize to the same path
+        // and must forward identically — single-encoded, never `%2520`.
+        assert_eq!(forwarded_path("/a b"), "/a%20b");
+        assert_eq!(forwarded_path("/a%20b"), "/a%20b");
+
+        // Non-ASCII: UTF-8 percent-encoded once.
+        assert_eq!(forwarded_path("/ünïcode"), "/%C3%BCn%C3%AFcode");
+        assert_eq!(forwarded_path("/%C3%BCn%C3%AFcode"), "/%C3%BCn%C3%AFcode");
+
+        // Literal percent. `/100%25` canonicalizes to `/100%`; upstream must
+        // receive `%25` back so it decodes to the approved, audited path — a
+        // bare `%` would be a malformed escape.
+        assert_eq!(forwarded_path("/100%25"), "/100%25");
+        // And the double-decode trap: raw `%2541` was approved as the literal
+        // characters `%41`, so upstream must not be able to read it as `A`.
+        assert_eq!(forwarded_path("/a%2541"), "/a%2541");
+
+        // Plus sign is not a space in a path; it survives verbatim.
+        assert_eq!(forwarded_path("/a+b"), "/a+b");
+    }
+
+    #[test]
+    fn decoded_delimiters_stay_inside_the_path() {
+        // `%3F`/`%23` decode to `?`/`#`; `set_path` must re-encode them into
+        // the path rather than starting a query or fragment.
+        let canonical = paths::canonicalize("/a%3Fb%23c").unwrap();
+        assert_eq!(canonical, "/a?b#c");
+        let url = outbound_url("https://up.example.com", &canonical, None).unwrap();
+        assert_eq!(url.path(), "/a%3Fb%23c");
+        assert_eq!(url.query(), None);
+        assert_eq!(url.fragment(), None);
+        assert_eq!(url.as_str(), "https://up.example.com/a%3Fb%23c");
+
+        // The caller's real query is attached separately and verbatim.
+        let url = outbound_url("https://up.example.com", &canonical, Some("x=1&y=2")).unwrap();
+        assert_eq!(url.path(), "/a%3Fb%23c");
+        assert_eq!(url.query(), Some("x=1&y=2"));
+    }
+
+    #[test]
+    fn canonicalize_rejects_everything_that_would_be_structure() {
+        // The safety argument for handing `set_path` a DECODED path: no
+        // canonical path can contain a separator or dot segment that
+        // `prefix_matches` did not already see.
+        for bad in [
+            "/a%2Fb",  // encoded '/'
+            "/a%2fb",  // lowercase hex
+            "/a%5Cb",  // encoded '\'
+            "/a\\b",   // raw '\'
+            "/a/../b", // dot segment
+            "/a/%2e%2e/b",
+            "/a//b",  // duplicate slash
+            "/a%00b", // control character
+            "/a%FFb", // invalid UTF-8
+            "/a%2",   // truncated escape
+            "/a%zz",  // invalid escape
+        ] {
+            assert!(paths::canonicalize(bad).is_err(), "should reject {bad}");
+        }
+    }
+
+    #[test]
+    fn outbound_url_keeps_the_approved_origin() {
+        // Origin host/port/scheme are never influenced by the path.
+        let url = outbound_url("https://up.example.com:8443", "/v1/echo", None).unwrap();
+        assert_eq!(url.as_str(), "https://up.example.com:8443/v1/echo");
     }
 
     #[test]

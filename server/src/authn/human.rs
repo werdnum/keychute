@@ -92,7 +92,7 @@ pub fn authenticate_static(
 // OIDC
 
 /// Process-wide JWKS cache, keyed by JWKS URL. Refreshed lazily on unknown
-/// `kid` (rate-limited) so key rotation works without a restart.
+/// `kid` AND on age (rate-limited), so key rotation works without a restart.
 struct JwksCache {
     inner: tokio::sync::Mutex<HashMap<String, CachedJwks>>,
 }
@@ -102,7 +102,48 @@ struct CachedJwks {
     fetched_at: Instant,
 }
 
+/// Minimum spacing between two JWKS fetches for the same URL. Without it a
+/// burst of tokens carrying an unknown/rotated `kid` would hammer the IdP.
 const JWKS_MIN_REFRESH: Duration = Duration::from_secs(10);
+
+/// Maximum age of a cached JWKS document, applied even when the requested
+/// `kid` IS present. JWKS permits a provider to rotate the key material behind
+/// an unchanged `kid`; caching known kids forever would then serve the retired
+/// key until the process restarts and every token signed by the replacement
+/// would fail — locking the operator out of the approval UI. Ten minutes is
+/// short enough that a rotation self-heals quickly and long enough that the
+/// steady-state fetch rate is negligible (one request per 10 min per URL).
+const JWKS_MAX_AGE: Duration = Duration::from_secs(10 * 60);
+
+/// What to do with the cache for a given (jwks_url, kid) lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CacheAction {
+    /// Cached entry holds the kid and is still fresh: use it.
+    Serve,
+    /// Fetch the JWKS document (unknown kid, or the entry aged out).
+    Refresh,
+    /// Would refetch, but the last fetch was too recent: reject without a
+    /// network call.
+    RateLimited,
+}
+
+/// Pure cache-expiry decision, factored out so it is testable without network.
+/// `cached` is `None` when nothing is cached for the URL, else
+/// `(kid_is_present, age_of_the_cached_document)`.
+fn cache_action(cached: Option<(bool, Duration)>) -> CacheAction {
+    match cached {
+        None => CacheAction::Refresh,
+        Some((has_kid, age)) => {
+            if has_kid && age < JWKS_MAX_AGE {
+                CacheAction::Serve
+            } else if age < JWKS_MIN_REFRESH {
+                CacheAction::RateLimited
+            } else {
+                CacheAction::Refresh
+            }
+        }
+    }
+}
 
 fn jwks_cache() -> &'static JwksCache {
     static CACHE: OnceLock<JwksCache> = OnceLock::new();
@@ -127,17 +168,23 @@ async fn fetch_jwks(url: &str) -> anyhow::Result<HashMap<String, Jwk>> {
         .collect())
 }
 
-/// Get the JWK for `kid`, refreshing the cache (rate-limited) when unknown.
+/// Get the JWK for `kid`, refreshing the cache (rate-limited) when the kid is
+/// unknown OR the cached document has aged past [`JWKS_MAX_AGE`].
 async fn jwk_for_kid(jwks_url: &str, kid: &str) -> Result<Jwk, StatusCode> {
     let cache = jwks_cache();
+    // Held across the fetch on purpose: it collapses a burst of concurrent
+    // misses into a single upstream request.
     let mut map = cache.inner.lock().await;
-    if let Some(cached) = map.get(jwks_url) {
-        if let Some(jwk) = cached.keys.get(kid) {
-            return Ok(jwk.clone());
+    let entry = map.get(jwks_url);
+    let stale_hit = entry.and_then(|c| c.keys.get(kid).cloned());
+    let action = cache_action(entry.map(|c| (stale_hit.is_some(), c.fetched_at.elapsed())));
+    match action {
+        CacheAction::Serve => {
+            // `Serve` is only produced when the kid was found.
+            return stale_hit.ok_or(StatusCode::UNAUTHORIZED);
         }
-        if cached.fetched_at.elapsed() < JWKS_MIN_REFRESH {
-            return Err(StatusCode::UNAUTHORIZED);
-        }
+        CacheAction::RateLimited => return Err(StatusCode::UNAUTHORIZED),
+        CacheAction::Refresh => {}
     }
     match fetch_jwks(jwks_url).await {
         Ok(keys) => {
@@ -151,7 +198,17 @@ async fn jwk_for_kid(jwks_url: &str, kid: &str) -> Result<Jwk, StatusCode> {
         }
         Err(err) => {
             tracing::warn!(error = %err, "JWKS fetch failed");
-            Err(StatusCode::UNAUTHORIZED)
+            // Stale-if-error: an IdP outage must not lock the operator out of
+            // the approval UI when we still hold a key that validated moments
+            // ago. The entry keeps its old `fetched_at`, so the next request
+            // retries the fetch as soon as the rate limit allows.
+            match stale_hit {
+                Some(jwk) => {
+                    tracing::warn!(kid, "serving stale cached JWK after failed refresh");
+                    Ok(jwk)
+                }
+                None => Err(StatusCode::UNAUTHORIZED),
+            }
         }
     }
 }
@@ -266,6 +323,62 @@ mod tests {
         assert_eq!(bearer_token(&headers), None);
         headers.insert(AUTHORIZATION, "Bearer ".parse().unwrap());
         assert_eq!(bearer_token(&headers), None);
+    }
+
+    #[test]
+    fn jwks_cache_refreshes_when_nothing_is_cached() {
+        assert_eq!(cache_action(None), CacheAction::Refresh);
+    }
+
+    #[test]
+    fn jwks_cache_serves_a_fresh_known_kid() {
+        assert_eq!(
+            cache_action(Some((true, Duration::from_secs(0)))),
+            CacheAction::Serve
+        );
+        assert_eq!(
+            cache_action(Some((true, JWKS_MAX_AGE - Duration::from_secs(1)))),
+            CacheAction::Serve
+        );
+    }
+
+    #[test]
+    fn jwks_cache_expires_a_known_kid_so_same_kid_rotation_recovers() {
+        // The regression this guards: a provider rotating key material behind
+        // an unchanged `kid` must not be served from cache forever.
+        assert_eq!(
+            cache_action(Some((true, JWKS_MAX_AGE))),
+            CacheAction::Refresh
+        );
+        assert_eq!(
+            cache_action(Some((true, JWKS_MAX_AGE + Duration::from_secs(60)))),
+            CacheAction::Refresh
+        );
+    }
+
+    #[test]
+    fn jwks_cache_rate_limits_unknown_kids() {
+        // Unknown kid, fetched moments ago: reject without touching the IdP.
+        assert_eq!(
+            cache_action(Some((false, Duration::from_secs(0)))),
+            CacheAction::RateLimited
+        );
+        assert_eq!(
+            cache_action(Some((false, JWKS_MIN_REFRESH - Duration::from_millis(1)))),
+            CacheAction::RateLimited
+        );
+        // Past the floor, one refresh is allowed.
+        assert_eq!(
+            cache_action(Some((false, JWKS_MIN_REFRESH))),
+            CacheAction::Refresh
+        );
+    }
+
+    #[test]
+    fn jwks_refresh_floor_is_below_the_max_age() {
+        // Otherwise an aged-out known kid would be rejected as rate-limited
+        // instead of triggering the refresh it needs.
+        assert!(JWKS_MIN_REFRESH < JWKS_MAX_AGE);
     }
 
     #[test]

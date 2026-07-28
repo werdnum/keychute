@@ -403,7 +403,7 @@ fn precedence_key(p: &PolicyRow) -> (u8, u8, i32, u8) {
 
 #[cfg(test)]
 mod tests {
-    use super::paths::{canonicalize, encode_for_forwarding, prefix_matches};
+    use super::paths::{canonicalize, prefix_matches};
     use super::*;
     use chrono::Duration;
 
@@ -511,19 +511,6 @@ mod tests {
                 "prefix={prefix:?} path={path:?}"
             );
         }
-    }
-
-    #[test]
-    fn encode_for_forwarding_roundtrip() {
-        assert_eq!(encode_for_forwarding("/v1/a-b_c~d"), "/v1/a-b_c~d");
-        assert_eq!(encode_for_forwarding("/a b"), "/a%20b");
-        assert_eq!(encode_for_forwarding("/a%b"), "/a%25b");
-        assert_eq!(encode_for_forwarding("/café"), "/caf%C3%A9");
-        assert_eq!(
-            encode_for_forwarding("/a!$&'()*+,;=:@/b"),
-            "/a!$&'()*+,;=:@/b"
-        );
-        assert_eq!(encode_for_forwarding("/a\"b"), "/a%22b");
     }
 
     // ---------- evaluate: fixtures ----------

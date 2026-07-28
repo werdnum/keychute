@@ -95,22 +95,8 @@ pub fn prefix_matches(prefix: &str, path: &str) -> bool {
     path == p || (path.len() > p.len() && path.as_bytes()[p.len()] == b'/' && path.starts_with(p))
 }
 
-/// Conservatively re-encode a canonical path for the outbound request line.
-/// Keeps bytes in `[A-Za-z0-9-._~!$&'()*+,;=:@/]` (pchar + `/`), percent-encodes
-/// everything else (uppercase hex).
-pub fn encode_for_forwarding(canonical: &str) -> String {
-    let mut out = String::with_capacity(canonical.len());
-    for &b in canonical.as_bytes() {
-        let keep = matches!(b,
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
-            | b'-' | b'.' | b'_' | b'~'
-            | b'!' | b'$' | b'&' | b'\'' | b'(' | b')' | b'*' | b'+' | b',' | b';' | b'='
-            | b':' | b'@' | b'/');
-        if keep {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
-}
+// NOTE: there is deliberately no re-encoder here. The outbound request line is
+// built by `proxy::outbound_url`, which hands the canonical (decoded) path to
+// `url::Url::set_path` and lets the `url` crate do the single encode. A second
+// encoder applied on top of that would double-encode and send the credential
+// to a different upstream resource than the grant authorized.

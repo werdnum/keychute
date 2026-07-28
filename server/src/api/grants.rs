@@ -108,14 +108,24 @@ pub async fn read(
     // version id is pinned into replay state.
     enum Source {
         Passthrough,
+        /// Was a passthrough grant, but the payload is gone (purged; a restart
+        /// additionally makes decryption impossible).
+        PassthroughGone,
         Stored(db::SecretVersionRow),
     }
     let (source, version_id) = if grant.passthrough_ciphertext.is_some() {
         (Source::Passthrough, grant.id)
     } else if grant.passthrough_ephemeral {
-        // Was a passthrough grant, but the payload is gone (purged; a restart
-        // additionally makes decryption impossible).
-        return Err(ApiFailure::PayloadLost);
+        // Deliberately NOT an early return: use-accounting has to establish
+        // exhaustion first. Once a single-use passthrough has been consumed
+        // and its replay window has closed, the sweeper nulls the ciphertext
+        // by design — reporting "payload-lost" here would tell the caller the
+        // secret was never released (and push the CLI onto its re-approval
+        // exit code) when in fact it already was. `begin_grant_use` sees
+        // `use_count == max_uses` and returns `grant-exhausted`; only when a
+        // use is genuinely still available does this become "payload-lost",
+        // which is the real restart/loss case.
+        (Source::PassthroughGone, grant.id)
     } else {
         let secret = secret.as_ref().ok_or(ApiFailure::PayloadLost)?;
         let version = db::get_secret_version(&state.db, secret.id, secret.current_version)
@@ -143,6 +153,7 @@ pub async fn read(
         db::GrantUse::FirstUse { grant } => {
             let pt = match &source {
                 Source::Passthrough => open_passthrough(&state, &grant)?,
+                Source::PassthroughGone => return Err(ApiFailure::PayloadLost),
                 Source::Stored(version) => open_secret_version(&state, version)?,
             };
             (pt, version_id, grant)
