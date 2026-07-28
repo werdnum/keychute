@@ -111,8 +111,12 @@ and is agent-influenceable. The approval UI therefore renders tier-2 context as
    notify-only pinged), and passes it straight into Playwright's `fill()` on the
    target element. The value never enters the LLM context, tool arguments, or logs.
 3. Keychute records the release with the client-supplied context (page URL, field);
-   policy can constrain releases to matching origins (e.g. only when the page origin
-   is `hellofresh.com`).
+   policy can constrain releases to matching origins (e.g. only when the page
+   origin is `hellofresh.com`). The origin the client checks and reports is the
+   **target element's frame origin, derived immediately before `fill()`** — not
+   the top-level page URL from earlier in the flow — so a cross-origin iframe or
+   a navigation between snapshot and fill cannot redirect the credential into a
+   frame the grant doesn't cover.
 
 This is "Secure Agentic Autofill" like 1Password's, but without granting an agent
 platform access to the real password-manager account.
@@ -274,7 +278,9 @@ the ciphertext-only design removes the main reason to isolate.
   the approval UI. Resolution over overlapping rows is deterministic: `deny`
   overrides any other matching outcome; otherwise the most specific match wins
   (exact secret over tag, specific client over wildcard), with an explicit
-  integer priority as the final tiebreaker.
+  integer priority as a tiebreaker; a residual tie resolves to the most
+  restrictive matching outcome (`require-approval` over `notify-only` over
+  `auto-approve`), so ambiguity can never widen access.
 - `access_requests` — client, secret, requested mechanism+tier+constraints,
   client-supplied context (freeform + structured), state
   (`pending`/`approved`/`denied`/`expired`), resolved_by, timestamps.
@@ -317,6 +323,13 @@ snippet or the `execute_script` source that triggered the need; for the CLI, the
 capture (§1, tier-2 caveat). Rendering the actual script that
 will consume the secret is a first-class goal of the UI.
 
+Separately from that untrusted context, the approval page always renders the
+**server-parsed grant** — normalized origin, methods, path prefix, TTL, use
+limit, tier — as the authoritative "what you are approving" block. The operator
+approves what the server will enforce, never the client's description of it; a
+prompt-injected client that narrates a narrow action while requesting a broad
+grant is thereby visible.
+
 ### Where enforcement lives — server, client, or both?
 
 **Both, with a clean split** (this resolves the open question in the project brief):
@@ -348,7 +361,8 @@ will consume the secret is a first-class goal of the UI.
     pod identity comes with the token), following sudo-service.
 - **Humans** (approval UI): Envoy Gateway `SecurityPolicy` OIDC against Keycloak
   with `forwardAccessToken` enabled, so Keychute receives the JWT and validates it
-  itself (issuer, audience, signature) rather than trusting proxy headers; the
+  itself (issuer, audience, signature, and lifetime — `exp`/`nbf` with bounded
+  clock skew) rather than trusting proxy headers; the
   validated identity is what the audit log records as the approver.
   Authentication alone never suffices: all human routes additionally require an
   **authorization allowlist** — membership of a configured operator group claim
@@ -387,7 +401,10 @@ In `werdnum/kube-config` (a later PR, once the service exists):
   cluster Ingresses are materialized as Envoy Gateway HTTPRoutes (generated name
   `<ingress>-<host-with-dashes>`), and the OIDC `SecurityPolicy` targets that
   HTTPRoute — the exact shape of the existing `oidc-security-policy.yaml` examples
-  (ansible-drift-ui, notes, webslicer). Optional Cloudflare-tunnel exposure so
+  (ansible-drift-ui, notes, webslicer). Because the backend refuses plaintext,
+  the gateway-to-service hop needs explicit backend TLS (Gateway API
+  `BackendTLSPolicy` naming the service DNS name, with the internal CA bundle
+  available in the gateway namespace). Optional Cloudflare-tunnel exposure so
   Pushover links work away from home (tunnel hostname + external-dns target
   annotation, per repo docs).
 - The chart binds the Keychute ServiceAccount to `system:auth-delegator`
