@@ -116,13 +116,10 @@ and is agent-influenceable. The approval UI therefore renders tier-2 context as
    target element. The value never enters the LLM context, tool arguments, or logs.
 3. Keychute records the release with the client-supplied context (page URL, field);
    policy can constrain releases to matching origins (e.g. only when the page
-   origin is `hellofresh.com`). The origin the client checks and reports is the
-   **target element's frame origin** — not the top-level page URL from earlier
-   in the flow — verified against a held element handle whose owner frame is
-   inspected in the same step as the `fill()`. Element handles detach on
-   navigation, so a navigation between check and fill aborts the fill with an
-   error rather than retargeting the credential into a document the grant never
-   covered; the client never re-resolves a selector between check and fill.
+   origin is `hellofresh.com`). Verifying the fill target against that origin,
+   and keeping the value away from the agent afterwards, is enforced by
+   family-assistant's deterministic client code — the browser-side enforcement
+   design exists on the FA side and is deliberately not specified here (§8).
 
 This is "Secure Agentic Autofill" like 1Password's, but without granting an agent
 platform access to the real password-manager account.
@@ -590,21 +587,14 @@ Research findings that shape this (all verified against the current tree):
   in-cluster URL).
 - Autofill: today `browser_fill` takes its text from LLM-generated arguments.
   CUJ 3 needs a new deterministic path — `browser_fill_credential(ref,
-  credential_name)` — whose implementation fetches from Keychute and calls
-  Playwright `fill()` directly. Containment obligations for tier 1: the value never
-  enters tool results or logs; fill only into password-type inputs (or
-  operator-overridden per credential); and subsequent `browser_snapshot` /
-  `browser_extract` / screenshots must mask the filled field's value, since the
-  agent could otherwise read it back off the page. That masking work is part of the
-  integration, not optional. And masking alone is insufficient while an
-  arbitrary-JS path exists: `browser_exec` (or any raw script evaluation) can
-  read `document.querySelector(…).value` directly, so from
-  `browser_fill_credential` until the next navigation or form submission the
-  integration must withhold script-evaluation tools from the agent. A profile
-  that keeps raw JS available while a credential is live does not get tier-1
-  treatment — Keychute classifies the mechanism as tier 2 for that client and
-  the approval UI says so. (`browser_request_handoff` remains the fallback for
-  sites where masking can't be made sound.)
+  credential_name)` — whose implementation fetches from Keychute and fills the
+  field directly, the value never entering LLM context, tool results, or logs.
+  Browser-side containment — verifying the fill target against the grant's
+  origin, and keeping the agent's tools away from the value once filled — is
+  **enforced by family-assistant's deterministic client code**; that enforcement
+  design already exists on the FA side and is deliberately not re-specified in
+  this document. Registering FA at tier 1 is the operator's statement that they
+  trust that enforcement (§6, "mechanism honesty").
 - Context enrichment: when a Keychute request originates inside `execute_script`
   (the Monty sandbox), FA attaches the script source as structured context so the
   approval UI can show me the exact code that will use the access.
@@ -648,8 +638,8 @@ calendar estimates.
   to the proxy path), since an auto-approved client could otherwise hold
   unbounded slow streams open.
 - **M4 — CUJ 3 secure autofill.** `autofill` mechanism + origin constraints
-  server-side; FA `browser_fill_credential` with the masking/containment work in
-  the browser tools.
+  server-side; FA `browser_fill_credential`, with browser-side containment
+  enforced by FA's deterministic code per its own design.
 - **M5 — Hardening.** Rate limits per client, KEK rotation runbook, `notify-only`
   digests, threat-model review against the implementation, docs (user + operator).
 
