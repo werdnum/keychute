@@ -300,6 +300,22 @@ pub async fn create(
         .keyset
         .idem_mac(client.name(), &canonical::canonical_request_payload(&req));
 
+    // Idempotent retry short-circuit, BEFORE policy evaluation: the original
+    // response may have been lost, and the retry must recover the committed
+    // request even when policy state has degraded since (a row that no longer
+    // parses fails `policy_inputs` closed, which would otherwise hide the
+    // original request id from its owner forever). The insert's ON CONFLICT
+    // branch below stays as the backstop for the concurrent-create race.
+    if let Some(row) =
+        db::api_ext::get_request_by_idem(&state.db, client.name(), &req.idempotency_key).await?
+    {
+        if !crypto::ct_eq(&row.idem_mac, &idem_mac) {
+            return Err(ApiFailure::IdempotencyKeyReuse);
+        }
+        let status = status_from_row(&state, &row).await?;
+        return Ok((StatusCode::OK, Json(status)).into_response());
+    }
+
     // Policy evaluation is pure; run it before the insert so the pending cap
     // can be enforced without creating an orphan row (slight race accepted).
     let secret = db::get_secret_by_name(&state.db, &req.secret_name).await?;

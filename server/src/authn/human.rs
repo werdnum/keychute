@@ -120,6 +120,14 @@ const JWKS_MIN_REFRESH: Duration = Duration::from_secs(10);
 /// steady-state fetch rate is negligible (one request per 10 min per URL).
 const JWKS_MAX_AGE: Duration = Duration::from_secs(10 * 60);
 
+/// Ceiling on stale-if-error service. Serving a stale key through an IdP
+/// outage keeps the operator out of a lockout, but without a bound a
+/// retired-and-compromised key would stay valid for as long as an attacker
+/// can keep the JWKS endpoint unreachable. Past this age every stale-serving
+/// path fails closed instead. One hour rides out a realistic IdP outage while
+/// keeping the post-revocation exposure window finite.
+const JWKS_STALE_IF_ERROR_MAX: Duration = Duration::from_secs(60 * 60);
+
 /// What to do with the cache for a given (jwks_url, kid) lookup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CacheAction {
@@ -185,6 +193,11 @@ async fn jwk_for_kid(jwks_url: &str, kid: &str) -> Result<Jwk, StatusCode> {
     let mut map = cache.inner.lock().await;
     let entry = map.get(jwks_url);
     let stale_hit = entry.and_then(|c| c.keys.get(kid).cloned());
+    // Stale-if-error has a ceiling: past it, a key from a document this old
+    // must not authenticate anyone (see `JWKS_STALE_IF_ERROR_MAX`).
+    let within_stale_grace = entry
+        .map(|c| c.fetched_at.elapsed() < JWKS_STALE_IF_ERROR_MAX)
+        .unwrap_or(false);
     let action = cache_action(entry.map(|c| {
         (
             stale_hit.is_some(),
@@ -198,8 +211,13 @@ async fn jwk_for_kid(jwks_url: &str, kid: &str) -> Result<Jwk, StatusCode> {
             return stale_hit.ok_or(StatusCode::UNAUTHORIZED);
         }
         // The last attempt (possibly a failure) was moments ago: serve the
-        // stale key when we hold it, otherwise reject — never refetch.
-        CacheAction::RateLimited => return stale_hit.ok_or(StatusCode::UNAUTHORIZED),
+        // stale key when we hold it (and it is within the stale-if-error
+        // grace), otherwise reject — never refetch.
+        CacheAction::RateLimited => {
+            return stale_hit
+                .filter(|_| within_stale_grace)
+                .ok_or(StatusCode::UNAUTHORIZED);
+        }
         CacheAction::Refresh => {}
     }
     match fetch_jwks(jwks_url).await {
@@ -230,11 +248,20 @@ async fn jwk_for_kid(jwks_url: &str, kid: &str) -> Result<Jwk, StatusCode> {
                 .last_attempt = now;
             // Stale-if-error: an IdP outage must not lock the operator out of
             // the approval UI when we still hold a key that validated moments
-            // ago.
+            // ago — but only within the finite grace window, or a retired key
+            // stays valid for as long as the endpoint can be kept unreachable.
             match stale_hit {
-                Some(jwk) => {
+                Some(jwk) if within_stale_grace => {
                     tracing::warn!(kid, "serving stale cached JWK after failed refresh");
                     Ok(jwk)
+                }
+                Some(_) => {
+                    tracing::error!(
+                        kid,
+                        max_stale_seconds = JWKS_STALE_IF_ERROR_MAX.as_secs(),
+                        "cached JWK exceeded the stale-if-error ceiling; failing closed"
+                    );
+                    Err(StatusCode::UNAUTHORIZED)
                 }
                 None => Err(StatusCode::UNAUTHORIZED),
             }
@@ -442,6 +469,13 @@ mod tests {
         // Otherwise an aged-out known kid would be rejected as rate-limited
         // instead of triggering the refresh it needs.
         assert!(JWKS_MIN_REFRESH < JWKS_MAX_AGE);
+    }
+
+    #[test]
+    fn jwks_stale_grace_sits_above_the_max_age() {
+        // The stale-if-error ceiling only means anything past the point a
+        // document counts as stale; below it, Serve wins outright.
+        assert!(JWKS_STALE_IF_ERROR_MAX > JWKS_MAX_AGE);
     }
 
     fn oidc_cfg() -> OidcHumanAuth {

@@ -194,17 +194,35 @@ pub async fn insert_access_request_with_id(
                 grant,
                 notify_only,
             } => {
-                row = sqlx::query_as::<_, AccessRequestRow>(
+                // Same DB-clock recheck as `ui_ext::approve_request`: the
+                // grant deadline was computed at policy evaluation, and the
+                // KEK lock + context sealing sit between that and here. An
+                // elapsed deadline must not commit an approved request whose
+                // grant can only ever return grant-expired — roll everything
+                // back instead; the caller's retry re-evaluates policy fresh
+                // (no row was created, so the idempotency key is unburned).
+                let approved = sqlx::query_as::<_, AccessRequestRow>(
                     "UPDATE access_requests \
                      SET state = 'approved', resolved_by = $2, resolved_at = now(), \
                          notify_only = $3 \
-                     WHERE id = $1 RETURNING *",
+                     WHERE id = $1 AND now() < $4 RETURNING *",
                 )
                 .bind(row.id)
                 .bind(resolved_by)
                 .bind(notify_only)
-                .fetch_one(&mut *tx)
+                .bind(grant.not_after)
+                .fetch_optional(&mut *tx)
                 .await?;
+                row = match approved {
+                    Some(r) => r,
+                    None => {
+                        tx.rollback().await?;
+                        anyhow::bail!(
+                            "auto-approval grant deadline elapsed during insert; \
+                             nothing was written — a retry re-evaluates policy"
+                        );
+                    }
+                };
                 // See `requests::resolve_approve`: payloads are
                 // ephemeral-KEK-sealed by construction, and the flag outlives
                 // the ciphertext the sweeper nulls.
@@ -256,14 +274,30 @@ pub async fn insert_access_request_with_id(
         return Ok(InsertOutcome::Created { row, grant_id });
     }
     tx.rollback().await?;
-    let row = sqlx::query_as::<_, AccessRequestRow>(
+    let row = get_request_by_idem(db, &req.idem_client, &req.idem_key)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!("idempotency conflict row vanished for {}", req.idem_client)
+        })?;
+    Ok(InsertOutcome::Existing(row))
+}
+
+/// The committed request for an (idem_client, idem_key) pair, if any. The
+/// create handler checks this BEFORE re-running policy evaluation so an
+/// idempotent retry returns the original request even when policy state has
+/// degraded (e.g. a row that no longer parses) since the first attempt.
+pub async fn get_request_by_idem(
+    db: &PgPool,
+    idem_client: &str,
+    idem_key: &str,
+) -> anyhow::Result<Option<AccessRequestRow>> {
+    Ok(sqlx::query_as::<_, AccessRequestRow>(
         "SELECT * FROM access_requests WHERE idem_client = $1 AND idem_key = $2",
     )
-    .bind(&req.idem_client)
-    .bind(&req.idem_key)
-    .fetch_one(db)
-    .await?;
-    Ok(InsertOutcome::Existing(row))
+    .bind(idem_client)
+    .bind(idem_key)
+    .fetch_optional(db)
+    .await?)
 }
 
 /// The grant minted for a request, if any (unique on request_id).

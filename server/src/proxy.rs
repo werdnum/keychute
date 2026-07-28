@@ -632,42 +632,49 @@ async fn forward(
     // Neither a failing nor a slow insert may become a 500 or a 504 here: the
     // caller would retry and duplicate the side effect (or find a finite-use
     // grant already burned). The design allows an attempt row without a
-    // completion row after a mid-release failure; log loudly either way and
-    // return the upstream response.
-    let audited = tokio::time::timeout(
-        COMPLETION_AUDIT_TIMEOUT,
-        insert_audit(
-            &state.db,
-            &AuditEvent {
-                kind: kinds::PROXY_COMPLETED,
-                request_id: Some(grant.request_id),
-                grant_id: Some(grant.id),
-                client_name: Some(grant.client_name.clone()),
-                secret_name: Some(grant.secret_name.clone()),
-                secret_version_id: Some(secret_version_id),
-                method: Some(method.to_owned()),
-                origin: Some(origin.to_display()),
-                path: Some(audited_path.to_owned()),
-                status: Some(status.as_u16() as i32),
-                ..Default::default()
-            },
-        ),
-    )
-    .await;
-    let audit_error: Option<String> = match audited {
-        Ok(Ok(())) => None,
-        Ok(Err(e)) => Some(e.to_string()),
-        Err(_) => Some(format!("timed out after {COMPLETION_AUDIT_TIMEOUT:?}")),
+    // completion row after a mid-release failure; log loudly either way.
+    // DETACHED, not awaited: reqwest's request timeout keeps ticking through
+    // response-body streaming, so even a bounded await here could eat the
+    // caller's remaining deadline and truncate a body whose side effect (and
+    // grant use) already committed. Delivery of the upstream body must not
+    // wait on audit persistence.
+    let audit_event = AuditEvent {
+        kind: kinds::PROXY_COMPLETED,
+        request_id: Some(grant.request_id),
+        grant_id: Some(grant.id),
+        client_name: Some(grant.client_name.clone()),
+        secret_name: Some(grant.secret_name.clone()),
+        secret_version_id: Some(secret_version_id),
+        method: Some(method.to_owned()),
+        origin: Some(origin.to_display()),
+        path: Some(audited_path.to_owned()),
+        status: Some(status.as_u16() as i32),
+        ..Default::default()
     };
-    if let Some(error) = audit_error {
-        tracing::error!(
-            error = %error,
-            grant_id = %grant.id,
-            client_name = %grant.client_name,
-            "proxy-completed audit insert failed; returning upstream response \
-             (attempt row exists, completion row is missing)"
-        );
-    }
+    let audit_db = state.db.clone();
+    let audit_grant_id = grant.id;
+    let audit_client = grant.client_name.clone();
+    tokio::spawn(async move {
+        let audited = tokio::time::timeout(
+            COMPLETION_AUDIT_TIMEOUT,
+            insert_audit(&audit_db, &audit_event),
+        )
+        .await;
+        let audit_error: Option<String> = match audited {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => Some(e.to_string()),
+            Err(_) => Some(format!("timed out after {COMPLETION_AUDIT_TIMEOUT:?}")),
+        };
+        if let Some(error) = audit_error {
+            tracing::error!(
+                error = %error,
+                grant_id = %audit_grant_id,
+                client_name = %audit_client,
+                "proxy-completed audit insert failed; upstream response was returned \
+                 (attempt row exists, completion row is missing)"
+            );
+        }
+    });
 
     let mut headers = build_response_headers(upstream.headers());
     // Addendum #14: override upstream's cache policy on every proxied response.
