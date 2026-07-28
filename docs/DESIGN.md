@@ -190,7 +190,12 @@ One binary, several logical components:
   ntfy/webhook can be added later.
 - **Release engine**: serves grant access — brokered proxying with constraint
   checks, or plaintext reads with TTL/use-count enforcement (single-use by default
-  for releasing tiers).
+  for releasing tiers). Proxy validation operates on the canonical decoded path —
+  ambiguous encoded separators and dot-segments are rejected outright, and exactly
+  the validated representation is forwarded — and the forwarded
+  `Host`/`:authority` and hop-by-hop headers are synthesized from the approved
+  origin, never taken from the caller (a caller-supplied authority could route the
+  credential to a different virtual host behind the same wildcard certificate).
 - **Crypto**: envelope encryption (§5).
 - **Audit log**: append-only record of every request, decision, and release/use.
 
@@ -263,10 +268,15 @@ the ciphertext-only design removes the main reason to isolate.
 - `secrets` — id, name, description, max_tier, created/updated, current_version,
   and an operator-managed **injection template** for brokered use: how the
   credential is placed on proxied requests (default
-  `Authorization: Bearer {secret}`; alternatively a named custom header, Basic
-  auth, or query parameter). Injection placement is never taken from the
+  `Authorization: Bearer {secret}`; alternatively a named custom header or Basic
+  auth — query-parameter placement is deliberately unsupported, since URLs land
+  in upstream access logs, traces, and client error values, which would break the
+  never-logged invariant). Injection placement is never taken from the
   requesting client — an agent that could choose the header could smuggle the
   secret into a field the target echoes back.
+- `secret_tags` — (secret_id, tag) associations backing tag-scoped policy rows.
+  Tag membership is evaluated at request time, so re-tagging a secret
+  immediately changes which policies match it.
 - `secret_versions` — secret_id, version, ciphertext, nonce, wrapped_dek, aad
   context, created_by (approval that ingested it).
 - `clients` — id, name (`family-assistant`, `k8s-agent`), authn binding (SA
@@ -280,7 +290,11 @@ the ciphertext-only design removes the main reason to isolate.
   (exact secret over tag, specific client over wildcard), with an explicit
   integer priority as a tiebreaker; a residual tie resolves to the most
   restrictive matching outcome (`require-approval` over `notify-only` over
-  `auto-approve`), so ambiguity can never widen access.
+  `auto-approve`), so ambiguity can never widen access. A row only yields its
+  non-approval outcome when the requested constraints are a **subset** of the
+  row's (methods, path prefix, TTL, use limit); a request broader than every
+  matching row falls through to `require-approval` — a narrowly pre-approved
+  client cannot silently obtain a wider grant.
 - `access_requests` — client, secret, requested mechanism+tier+constraints,
   client-supplied context (freeform + structured), state
   (`pending`/`approved`/`denied`/`expired`), resolved_by, timestamps.
@@ -316,7 +330,12 @@ timeout after which the request expires — sudo-service uses 1 h), `notify-only
 `auto-approve` (silent, audit-logged; for the lowest-stakes cases).
 
 **Client-supplied context** rides with every request and is rendered verbatim (and
-clearly labelled as *client-asserted, unverified*) in the approval UI: a freeform
+clearly labelled as *client-asserted, unverified*) in the approval UI. Verbatim
+means faithful, not raw: context is always contextually escaped and rendered
+text-only, as an explicit invariant rather than a template implementation detail —
+it originates from a possibly prompt-injected agent, and markup executing on the
+approval origin would be script injection into the exact page that grants
+authority. The context includes: a freeform
 "reason", plus structured fields the integration fills in — for FA, the conversation
 snippet or the `execute_script` source that triggered the need; for the CLI, the
 `--reason` flag, the requesting identity, and the best-effort shell-pipeline
@@ -367,7 +386,12 @@ grant is thereby visible.
   Authentication alone never suffices: all human routes additionally require an
   **authorization allowlist** — membership of a configured operator group claim
   (the sudo-service `adminGroup` pattern) or an explicit subject list — since the
-  Keycloak realm admits principals who must not approve releases. Cluster-
+  Keycloak realm admits principals who must not approve releases. Approval and
+  standing-grant mutations are non-GET and carry application-level CSRF
+  protection (per-session token plus `Origin`/Fetch-Metadata checks) — an
+  authenticated gateway session alone never proves the operator initiated the
+  action, since the gateway attaches the operator's token to whatever their
+  browser sends. Cluster-
   internal client API routes bypass OIDC (the sudo-service shape: internal service
   URL for machines, OIDC-fronted external URL for me).
 
