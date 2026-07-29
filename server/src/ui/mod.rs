@@ -363,7 +363,11 @@ async fn requests_page(
     headers: HeaderMap,
 ) -> UiResult<Html<String>> {
     operator(&state, &headers).await?;
-    let now = Utc::now();
+    // Database clock: the approve/deny transitions enforce `expires_at` with
+    // SQL now(), so filtering here on a skewed process clock would either
+    // hide a still-approvable request ("No pending requests") or offer a form
+    // whose submission is guaranteed to 409.
+    let now = db::db_now(&state.db).await?;
     let rows: Vec<AccessRequestRow> = db::list_pending(&state.db)
         .await?
         .into_iter()
@@ -424,7 +428,9 @@ async fn request_detail_page(
     let row = db::get_request(&state.db, id)
         .await?
         .ok_or_else(|| UiError::new(StatusCode::NOT_FOUND, "no such request"))?;
-    let now = Utc::now();
+    // Database clock: this decides approval-form vs read-only resolved page
+    // on `expires_at`, which the approve transition enforces with SQL now().
+    let now = db::db_now(&state.db).await?;
     render_request_detail(&state, &op, &row, now, None).await
 }
 

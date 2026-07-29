@@ -494,7 +494,15 @@ These override anything above where they conflict.
     JSON serialization (serde_json with sorted keys — serialize
     `CreateAccessRequest` to `serde_json::Value`, then a canonical writer that
     sorts object keys, no whitespace) of the request body MINUS
-    `idempotency_key`. Bounds enforced at the API: `idempotency_key` ≤ 128
+    `idempotency_key` and MINUS `context.structured`. The latter carries
+    machine-captured environment (the CLI's `ps` snapshot of the invoking
+    pipeline) that legitimately differs between two otherwise identical
+    invocations, and the only recovery path after a failed grant read is to
+    rerun with the same idempotency key — so MACing it would 409 that retry
+    and strand an approved grant. Everything deliberately stated stays in,
+    `context.reason` included: changing the stated reason under a reused key
+    is a different claim about the request and must be detected.
+    Bounds enforced at the API: `idempotency_key` ≤ 128
     bytes, `reason` ≤ 4 KiB, `structured` context ≤ 16 KiB serialized,
     constraints lists ≤ 32 entries each. Oversize → 400.
 19. **KEK retirement lock.** Every transaction that INSERTs a wrapped DEK takes

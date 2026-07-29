@@ -322,9 +322,16 @@ pub async fn resolve_deny(
     Ok(true)
 }
 
-/// Expire pending requests past their deadline. Encrypted context is purged
-/// with the transition (the request is terminal; the approval page will never
-/// render it). Returns the number of requests expired.
+/// Expire pending requests past their deadline. Returns the number expired.
+///
+/// The encrypted context is deliberately KEPT here and left to
+/// [`purge_request_context`]'s retention window, exactly like a denied or
+/// approved request's: the resolved-request page renders context for terminal
+/// rows, so an operator opening the link for a request that expired minutes
+/// ago must still be able to read what the client asked for and why. Purging
+/// at the transition would blank it instantly while denied rows keep theirs
+/// for the full window — an inconsistency with no privacy benefit, since both
+/// are purged on the same schedule.
 ///
 /// Deadline and `resolved_at` are both on the DATABASE clock, matching every
 /// other predicate that reads `expires_at` (`claim_for_push`, the pending-cap
@@ -333,9 +340,7 @@ pub async fn expire_stale(db: &PgPool) -> anyhow::Result<u64> {
     let mut tx = db.begin().await?;
     let expired: Vec<(Uuid, String, String)> = sqlx::query_as(
         "UPDATE access_requests \
-         SET state = 'expired', resolved_at = now(), \
-             context_ciphertext = NULL, context_nonce = NULL, \
-             context_wrapped_dek = NULL, context_kek_id = NULL \
+         SET state = 'expired', resolved_at = now() \
          WHERE state = 'pending' AND expires_at < now() \
          RETURNING id, client_name, secret_name",
     )
