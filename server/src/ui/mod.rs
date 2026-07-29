@@ -114,9 +114,11 @@ impl IntoResponse for UiError {
         let page = layout(
             "Error",
             html! {
-                h1 { "Error" }
-                p { (self.msg) }
-                p { a href="/ui/requests" { "Back to pending requests" } }
+                (page_head("Something went wrong", html! { "The action was not carried out." }))
+                div .callout .callout-danger {
+                    p { (self.msg) }
+                }
+                p { a .btn-link href="/ui/requests" { "← Back to pending requests" } }
             },
         );
         (self.status, Html(page.into_string())).into_response()
@@ -176,47 +178,661 @@ fn check_post(
 // ---------------------------------------------------------------------------
 // Layout & shared rendering
 
+/// Stylesheet for every UI page.
+///
+/// Inlined deliberately: the CSP is `default-src 'none'; style-src
+/// 'unsafe-inline'`, so there is no stylesheet to fetch and no script at all.
+/// Everything responsive here is therefore pure CSS — nav wraps rather than
+/// collapsing behind a JS toggle, and wide tables restyle into stacked cards
+/// via `data-label` rather than being scrolled by a script.
+const STYLE: &str = r#"
+*, *::before, *::after { box-sizing: border-box; }
+
+:root {
+  color-scheme: light dark;
+  --bg: #f5f6f8;
+  --bg-accent: #eef1f6;
+  --surface: #ffffff;
+  --surface-2: #f3f5f8;
+  --border: #dde1e7;
+  --border-strong: #c3cad3;
+  --text: #14181f;
+  --text-muted: #59626f;
+  --accent: #3a54c9;
+  --accent-hover: #2f45a8;
+  --accent-soft: #eaeeff;
+  --on-accent: #ffffff;
+  --ok: #17784a;
+  --ok-bg: #eaf7f0;
+  --ok-border: #a9ddc2;
+  --warn: #8f5108;
+  --warn-bg: #fdf4e6;
+  --warn-border: #ecc98f;
+  --danger: #b32626;
+  --danger-bg: #fdeded;
+  --danger-border: #eeb3b3;
+  --radius: 14px;
+  --radius-sm: 9px;
+  --shadow: 0 1px 2px rgba(16, 24, 40, .05), 0 4px 14px rgba(16, 24, 40, .05);
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0e1116;
+    --bg-accent: #141922;
+    --surface: #171c25;
+    --surface-2: #1e2530;
+    --border: #2a323f;
+    --border-strong: #3a4553;
+    --text: #e7ebf1;
+    --text-muted: #9aa5b4;
+    --accent: #8ea4ff;
+    --accent-hover: #a8b9ff;
+    --accent-soft: #1d2540;
+    --on-accent: #0e1116;
+    --ok: #5fd39b;
+    --ok-bg: #12261d;
+    --ok-border: #2c5c44;
+    --warn: #e8b464;
+    --warn-bg: #2a2114;
+    --warn-border: #5e4926;
+    --danger: #f08a8a;
+    --danger-bg: #2c1719;
+    --danger-border: #5e2f32;
+    --shadow: 0 1px 2px rgba(0, 0, 0, .4), 0 4px 16px rgba(0, 0, 0, .3);
+  }
+}
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  overflow-wrap: break-word;
+}
+
+/* ---- header / nav ---- */
+
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+
+.topbar-inner {
+  max-width: 72rem;
+  margin: 0 auto;
+  padding: 0.6rem 1rem;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 1rem;
+}
+
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.55rem;
+  font-weight: 700;
+  font-size: 1.05rem;
+  letter-spacing: -0.01em;
+  color: var(--text);
+  text-decoration: none;
+  flex: 0 0 auto;
+}
+
+.brand-mark {
+  width: 1.85rem;
+  height: 1.85rem;
+  border-radius: 8px;
+  background: linear-gradient(140deg, var(--accent), #7b5cf0);
+  color: #fff;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.95rem;
+  font-weight: 800;
+}
+
+nav.sections {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  margin-left: auto;
+}
+
+nav.sections a {
+  display: inline-block;
+  padding: 0.5rem 0.75rem;
+  border-radius: 999px;
+  color: var(--text-muted);
+  text-decoration: none;
+  font-size: 0.95rem;
+  font-weight: 500;
+  min-height: 2.5rem;
+  line-height: 1.5rem;
+}
+
+nav.sections a:hover, nav.sections a:focus-visible {
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+nav.sections a[aria-current="page"] {
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 650;
+}
+
+/* On a phone the nav wraps to a second row. Two rows of sticky chrome would
+   eat ~17% of the viewport on every page, so below this width the header
+   scrolls away with the content instead. */
+@media (max-width: 560px) {
+  .topbar { position: static; }
+  .topbar-inner { padding: 0.5rem 0.9rem; gap: 0.35rem 0.5rem; }
+  nav.sections { margin-left: 0; width: 100%; }
+  nav.sections a { padding: 0.4rem 0.6rem; font-size: 0.9rem; min-height: 2.25rem; }
+}
+
+/* ---- page frame ---- */
+
+main {
+  max-width: 72rem;
+  margin: 0 auto;
+  padding: 1.5rem 1rem 4rem;
+}
+
+h1 {
+  font-size: clamp(1.45rem, 1.15rem + 1.4vw, 2rem);
+  line-height: 1.2;
+  letter-spacing: -0.02em;
+  margin: 0 0 0.35rem;
+}
+
+h2 {
+  font-size: 1.15rem;
+  letter-spacing: -0.01em;
+  margin: 0 0 0.75rem;
+}
+
+h3 {
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  margin: 1rem 0 0.35rem;
+}
+
+p { margin: 0 0 0.75rem; }
+.lede { color: var(--text-muted); max-width: 60ch; }
+.muted { color: var(--text-muted); }
+.mono { font-family: var(--mono); font-size: 0.92em; }
+
+a { color: var(--accent); text-underline-offset: 2px; }
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+.page-head { margin-bottom: 1.25rem; }
+
+/* ---- cards & callouts ---- */
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 1.1rem;
+  margin: 0 0 1.25rem;
+}
+
+.card > :last-child { margin-bottom: 0; }
+
+.callout {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  padding: 0.85rem 1rem;
+  margin: 0 0 1.25rem;
+}
+
+.callout > :last-child { margin-bottom: 0; }
+.callout-attention { border-color: var(--warn-border); border-left-color: var(--warn); background: var(--warn-bg); color: var(--warn); }
+.callout-attention a { color: inherit; }
+.callout-calm { border-color: var(--ok-border); border-left-color: var(--ok); background: var(--ok-bg); color: var(--ok); }
+.callout-danger { border-color: var(--danger-border); border-left-color: var(--danger); background: var(--danger-bg); color: var(--danger); }
+
+.grant-block {
+  border: 1px solid var(--ok-border);
+  border-top: 4px solid var(--ok);
+  background: var(--surface);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 1.1rem;
+  margin: 0 0 1.25rem;
+}
+
+.context-block {
+  border: 1px dashed var(--warn-border);
+  border-top: 4px solid var(--warn);
+  background: var(--surface);
+  border-radius: var(--radius);
+  padding: 1.1rem;
+  margin: 0 0 1.25rem;
+}
+
+.grant-block > :last-child, .context-block > :last-child { margin-bottom: 0; }
+
+.caveat { color: var(--warn); font-weight: 600; }
+.callout-danger .caveat, .callout-attention .caveat { color: inherit; }
+
+.block-label {
+  display: block;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  font-weight: 700;
+  color: var(--text-muted);
+  margin-bottom: 0.2rem;
+}
+
+/* ---- stat grid (overview) ---- */
+
+.stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+  gap: 0.85rem;
+  margin: 0 0 1.5rem;
+  padding: 0;
+  list-style: none;
+}
+
+.stat {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 1rem;
+  text-decoration: none;
+  color: inherit;
+}
+
+.stat:hover, .stat:focus-visible { border-color: var(--accent); }
+.stat-name { font-weight: 650; font-size: 0.95rem; color: var(--accent); }
+.stat-value { font-size: 1.4rem; font-weight: 700; letter-spacing: -0.02em; line-height: 1.2; }
+.stat-desc { font-size: 0.87rem; color: var(--text-muted); }
+.stat-alert .stat-value { color: var(--warn); }
+
+/* ---- badges ---- */
+
+.badge {
+  display: inline-block;
+  padding: 0.15rem 0.55rem;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  background: var(--surface-2);
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  font-weight: 650;
+  line-height: 1.45;
+  white-space: nowrap;
+}
+
+.badge-ok { background: var(--ok-bg); border-color: var(--ok-border); color: var(--ok); }
+.badge-warn { background: var(--warn-bg); border-color: var(--warn-border); color: var(--warn); }
+.badge-danger { background: var(--danger-bg); border-color: var(--danger-border); color: var(--danger); }
+.badge-accent { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+
+/* ---- tables ---- */
+
+.table-wrap {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  overflow-x: auto;
+  margin: 0 0 1.25rem;
+}
+
+table { border-collapse: collapse; width: 100%; }
+
+th, td {
+  padding: 0.65rem 0.9rem;
+  text-align: left;
+  vertical-align: top;
+  border-bottom: 1px solid var(--border);
+}
+
+thead th {
+  background: var(--surface-2);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+tbody tr:last-child td { border-bottom: 0; }
+tbody tr:hover td { background: var(--bg-accent); }
+td.numeric, th.numeric { font-variant-numeric: tabular-nums; }
+td .row-actions { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+
+/* Key/value tables inside the grant block. */
+.kv { width: 100%; }
+.kv th {
+  width: 13rem;
+  background: transparent;
+  font-weight: 600;
+  color: var(--text-muted);
+  font-size: 0.9rem;
+}
+.kv tr:last-child th, .kv tr:last-child td { border-bottom: 0; }
+
+@media (max-width: 720px) {
+  .kv th, .kv td { display: block; width: auto; border-bottom: 0; padding: 0.15rem 0; }
+  .kv th { padding-top: 0.6rem; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.06em; }
+  .kv tr { display: block; border-bottom: 1px solid var(--border); padding-bottom: 0.55rem; }
+  .kv tr:last-child { border-bottom: 0; }
+  .kv { border-collapse: separate; }
+}
+
+/* Wide record tables restyle into one card per row on narrow screens. */
+@media (max-width: 800px) {
+  .stack-wrap { border: 0; background: transparent; box-shadow: none; overflow: visible; }
+  .stack thead { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+  .stack, .stack tbody, .stack tr, .stack td { display: block; }
+  .stack tr {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    margin-bottom: 0.85rem;
+    padding: 0.25rem 0.15rem;
+  }
+  .stack tbody tr:hover td { background: transparent; }
+  .stack td {
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem 1rem;
+    align-items: baseline;
+    justify-content: space-between;
+    padding: 0.5rem 0.85rem;
+  }
+  .stack td::before {
+    content: attr(data-label);
+    flex: 0 0 auto;
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-weight: 700;
+    color: var(--text-muted);
+  }
+  .stack td:last-child { border-bottom: 0; }
+  .stack td.actions { justify-content: flex-start; }
+  .stack td.actions::before { content: none; }
+  .stack td > * { min-width: 0; }
+}
+
+/* ---- forms ---- */
+
+form { margin: 0; }
+form.inline { display: inline-block; }
+
+fieldset {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.9rem 1rem 1rem;
+  margin: 0 0 1rem;
+  min-width: 0;
+}
+
+legend {
+  padding: 0 0.4rem;
+  font-size: 0.85rem;
+  font-weight: 650;
+  color: var(--text-muted);
+}
+
+label {
+  display: block;
+  margin: 0 0 0.85rem;
+  font-size: 0.92rem;
+  font-weight: 550;
+}
+
+label > .muted { font-weight: 400; }
+
+.field-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
+  gap: 0 1rem;
+}
+
+input[type="text"], input[type="number"], input[type="password"],
+input[type="datetime-local"], select, textarea {
+  display: block;
+  width: 100%;
+  margin-top: 0.3rem;
+  padding: 0.6rem 0.7rem;
+  min-height: 2.75rem;
+  font: inherit;
+  font-size: 1rem; /* keeps iOS from zooming on focus */
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+}
+
+textarea { min-height: 5.5rem; resize: vertical; font-family: var(--mono); font-size: 0.95rem; }
+
+input:focus, select:focus, textarea:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  border-color: var(--accent);
+}
+
+label.check {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.6rem;
+  font-weight: 400;
+  line-height: 1.45;
+}
+
+label.check input[type="checkbox"] {
+  width: 1.15rem;
+  height: 1.15rem;
+  margin: 0.2rem 0 0;
+  flex: 0 0 auto;
+  accent-color: var(--accent);
+}
+
+.actions-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  align-items: center;
+  margin-top: 0.5rem;
+}
+
+button, .btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  min-height: 2.75rem;
+  padding: 0.55rem 1.1rem;
+  font: inherit;
+  font-weight: 600;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-strong);
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+  text-decoration: none;
+}
+
+button:hover, .btn:hover { border-color: var(--accent); color: var(--accent); }
+
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-accent);
+}
+button.primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); color: var(--on-accent); }
+
+button.danger { color: var(--danger); border-color: var(--danger-border); background: var(--danger-bg); }
+button.danger:hover { border-color: var(--danger); color: var(--danger); }
+
+button.small, .btn.small { min-height: 2.25rem; padding: 0.3rem 0.8rem; font-size: 0.88rem; }
+
+.btn-link {
+  display: inline-flex;
+  align-items: center;
+  min-height: 2.25rem;
+  font-weight: 600;
+  text-decoration: none;
+}
+.btn-link:hover { text-decoration: underline; }
+
+/* ---- misc ---- */
+
+pre {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.7rem 0.8rem;
+  margin: 0 0 0.75rem;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--mono);
+  font-size: 0.88rem;
+}
+
+.empty {
+  text-align: center;
+  padding: 2.25rem 1rem;
+  color: var(--text-muted);
+  background: var(--surface);
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius);
+  margin: 0 0 1.25rem;
+}
+
+.empty p { margin: 0; }
+
+.list-plain { list-style: none; margin: 0; padding: 0; }
+.list-plain li + li { margin-top: 0.15rem; }
+
+@media (prefers-reduced-motion: no-preference) {
+  a, button, .btn, .stat { transition: background-color .12s ease, border-color .12s ease, color .12s ease; }
+}
+"#;
+
 fn layout(title: &str, body: Markup) -> Markup {
+    layout_at(title, None, body)
+}
+
+/// `current` is the nav href to mark as the active section (`aria-current`).
+fn layout_at(title: &str, current: Option<&str>, body: Markup) -> Markup {
+    const SECTIONS: [(&str, &str); 5] = [
+        ("/", "Overview"),
+        ("/ui/requests", "Requests"),
+        ("/ui/grants", "Grants"),
+        ("/ui/policies", "Policies"),
+        ("/ui/secrets", "Secrets"),
+    ];
     html! {
         (DOCTYPE)
         html lang="en" {
             head {
                 meta charset="utf-8";
-                meta name="viewport" content="width=device-width, initial-scale=1";
+                meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover";
+                meta name="color-scheme" content="light dark";
                 title { (title) " — Keychute" }
-                style {
-                    r#"
-                    body { font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 60rem; padding: 0 1rem; color: #1a1a1a; }
-                    nav a { margin-right: 1rem; }
-                    table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
-                    th, td { border: 1px solid #ccc; padding: 0.4rem 0.6rem; text-align: left; vertical-align: top; }
-                    .grant-block { border: 2px solid #2a6; background: #f2fbf5; padding: 1rem; margin: 1rem 0; }
-                    .context-block { border: 2px dashed #b60; background: #fff8ef; padding: 1rem; margin: 1rem 0; }
-                    .caveat { color: #a40; font-weight: bold; }
-                    .muted { color: #666; }
-                    pre { background: #f4f4f4; padding: 0.6rem; overflow-x: auto; white-space: pre-wrap; word-break: break-all; }
-                    form.inline { display: inline; }
-                    fieldset { margin: 1rem 0; }
-                    label { display: block; margin: 0.4rem 0; }
-                    "#
-                }
+                style { (maud::PreEscaped(STYLE)) }
             }
             body {
-                nav {
-                    a href="/" { "Overview" }
-                    a href="/ui/requests" { "Requests" }
-                    a href="/ui/grants" { "Grants" }
-                    a href="/ui/policies" { "Policies" }
-                    a href="/ui/secrets" { "Secrets" }
+                header .topbar {
+                    div .topbar-inner {
+                        a .brand href="/" {
+                            span .brand-mark aria-hidden="true" { "K" }
+                            span { "Keychute" }
+                        }
+                        nav .sections aria-label="Sections" {
+                            @for (href, label) in SECTIONS {
+                                a href=(href) aria-current=[
+                                    (current == Some(href)).then_some("page")
+                                ] { (label) }
+                            }
+                        }
+                    }
                 }
-                (body)
+                main { (body) }
             }
         }
     }
 }
 
-fn html_page(title: &str, body: Markup) -> Html<String> {
-    Html(layout(title, body).into_string())
+fn html_page_at(title: &str, current: &str, body: Markup) -> Html<String> {
+    Html(layout_at(title, Some(current), body).into_string())
+}
+
+/// Short badge for a tier: the long [`Tier::human_label`] belongs in the
+/// grant block, not in a table cell that has to fit on a phone.
+fn tier_badge(tier: Tier) -> Markup {
+    let class = match tier {
+        Tier::Brokered => "badge badge-ok",
+        Tier::TrustedClient => "badge",
+        Tier::CooperatingClient => "badge badge-warn",
+        Tier::Direct => "badge badge-danger",
+    };
+    html! { span class=(class) title=(tier.human_label()) { (tier.as_str()) } }
+}
+
+/// Badge for a mechanism string as stored (may be an unknown legacy value).
+fn mechanism_badge(mechanism: &str) -> Markup {
+    html! { span .badge .mono { (mechanism) } }
+}
+
+fn policy_outcome_badge(outcome: &str) -> Markup {
+    let class = match outcome {
+        "auto-approve" => "badge badge-warn",
+        "deny" => "badge badge-danger",
+        "notify-only" => "badge",
+        _ => "badge badge-ok",
+    };
+    html! { span class=(class) { (outcome) } }
+}
+
+/// Page title plus optional one-line explanation, shared by every section.
+fn page_head(title: &str, lede: Markup) -> Markup {
+    html! {
+        div .page-head {
+            h1 { (title) }
+            p .lede { (lede) }
+        }
+    }
+}
+
+fn empty_state(msg: &str) -> Markup {
+    html! { div .empty { p { (msg) } } }
 }
 
 fn age_label(created_at: DateTime<Utc>, now: DateTime<Utc>) -> String {
@@ -257,27 +873,36 @@ fn grant_block(mechanism: Mechanism, constraints: &Constraints, secret_line: Mar
     let tier = mechanism.tier();
     html! {
         section .grant-block {
-            h2 { "What you are approving (server-parsed)" }
-            table {
+            span .block-label { "Authoritative · server-parsed" }
+            h2 { "What you are approving" }
+            table .kv {
                 tr { th { "Secret" } td { (secret_line) } }
-                tr { th { "Mechanism" } td { (mechanism.as_str()) } }
+                tr { th { "Mechanism" } td { (mechanism_badge(mechanism.as_str())) } }
                 tr { th { "Tier" } td { (tier.human_label()) } }
                 tr { th { "Origins" }
                     td {
                         @if constraints.origins.is_empty() { span .muted { "(none)" } }
-                        @else { @for o in &constraints.origins { div { (o.to_display()) } } }
+                        @else {
+                            ul .list-plain {
+                                @for o in &constraints.origins { li .mono { (o.to_display()) } }
+                            }
+                        }
                     }
                 }
                 tr { th { "Methods" }
                     td {
                         @if constraints.methods.is_empty() { span .muted { "(none)" } }
-                        @else { (constraints.methods.join(", ")) }
+                        @else { span .mono { (constraints.methods.join(", ")) } }
                     }
                 }
                 tr { th { "Path prefixes" }
                     td {
                         @if constraints.path_prefixes.is_empty() { span .muted { "(none)" } }
-                        @else { @for p in &constraints.path_prefixes { div { (p) } } }
+                        @else {
+                            ul .list-plain {
+                                @for p in &constraints.path_prefixes { li .mono { (p) } }
+                            }
+                        }
                     }
                 }
                 tr { th { "Requested TTL" } td { (constraints.ttl_seconds) " seconds" } }
@@ -302,7 +927,8 @@ fn grant_block(mechanism: Mechanism, constraints: &Constraints, secret_line: Mar
 fn context_block(context: Option<&RequestContext>, mechanism: Mechanism) -> Markup {
     html! {
         section .context-block {
-            h2 { "Client-asserted context (unverified)" }
+            span .block-label { "Untrusted · client-asserted" }
+            h2 { "Context supplied by the client" }
             p .muted {
                 "Everything below was supplied by the requesting client and may be "
                 "influenced by a prompt-injected agent. It is NOT what the server "
@@ -394,53 +1020,69 @@ async fn overview_page(
     let policies = db::count_policies(&state.db).await?;
     let secrets = db::count_secrets(&state.db).await?;
 
-    Ok(html_page(
+    Ok(html_page_at(
         "Overview",
+        "/",
         html! {
-            h1 { "Keychute" }
-            p .muted {
+            (page_head("Keychute", html! {
                 "Secrets storage and delivery broker for AI agents. Every "
                 "delivery path has an operator-chosen risk tier, and every "
                 "release is either matched by a standing policy or approved "
                 "here by you."
-            }
-            p { "Signed in as " (op.subject) "." }
+            }))
+            p .muted { "Signed in as " span .mono { (op.subject) } "." }
 
             @if pending > 0 {
-                p .caveat {
-                    (pending)
-                    @if pending == 1 { " request is" } @else { " requests are" }
-                    " waiting for your decision. "
-                    a href="/ui/requests" { "Review now" }
+                div .callout .callout-attention {
+                    p {
+                        b {
+                            (pending)
+                            @if pending == 1 { " request is" } @else { " requests are" }
+                            " waiting for your decision."
+                        }
+                        " "
+                        a href="/ui/requests" { "Review now" }
+                    }
                 }
             } @else {
-                p { "Nothing is waiting for your decision." }
+                div .callout .callout-calm {
+                    p { "Nothing is waiting for your decision." }
+                }
             }
 
-            table {
-                tr { th { "Section" } th { "Now" } th { "What it is" } }
-                tr {
-                    td { a href="/ui/requests" { "Requests" } }
-                    td { (pending) " pending" }
-                    td { "Access requests awaiting approval or denial." }
+            // Each tile is the section link itself: on a phone the whole card
+            // is the tap target, not a word inside a table cell.
+            ul .stats {
+                li {
+                    a .stat .stat-alert[pending > 0] href="/ui/requests" {
+                        span .stat-name { "Requests" }
+                        span .stat-value { (pending) " pending" }
+                        span .stat-desc { "Access requests awaiting approval or denial." }
+                    }
                 }
-                tr {
-                    td { a href="/ui/grants" { "Grants" } }
-                    td { (grants) " active" }
-                    td { "Live grants; revoke one to cut off access immediately." }
+                li {
+                    a .stat href="/ui/grants" {
+                        span .stat-name { "Grants" }
+                        span .stat-value { (grants) " active" }
+                        span .stat-desc { "Live grants; revoke one to cut off access immediately." }
+                    }
                 }
-                tr {
-                    td { a href="/ui/policies" { "Policies" } }
-                    td { (policies) }
-                    // Not "auto-approve": a policy row's outcome is any of
-                    // auto-approve, notify-only, require-approval or deny, and
-                    // the count (like /ui/policies itself) covers all of them.
-                    td { "Standing rules applied to a request before you see it." }
+                li {
+                    a .stat href="/ui/policies" {
+                        span .stat-name { "Policies" }
+                        span .stat-value { (policies) }
+                        // Not "auto-approve": a policy row's outcome is any of
+                        // auto-approve, notify-only, require-approval or deny,
+                        // and the count (like /ui/policies itself) covers all.
+                        span .stat-desc { "Standing rules applied to a request before you see it." }
+                    }
                 }
-                tr {
-                    td { a href="/ui/secrets" { "Secrets" } }
-                    td { (secrets) " stored" }
-                    td { "Stored credentials, their max tier and injection style." }
+                li {
+                    a .stat href="/ui/secrets" {
+                        span .stat-name { "Secrets" }
+                        span .stat-value { (secrets) " stored" }
+                        span .stat-desc { "Stored credentials, their max tier and injection style." }
+                    }
                 }
             }
         },
@@ -465,30 +1107,42 @@ async fn requests_page(
         .into_iter()
         .filter(|r| r.expires_at > now)
         .collect();
-    Ok(html_page(
+    Ok(html_page_at(
         "Pending requests",
+        "/ui/requests",
         html! {
-            h1 { "Pending access requests" }
-            @if rows.is_empty() { p .muted { "No pending requests." } }
+            (page_head("Pending access requests", html! {
+                "Each row is an agent waiting on you. Open one to see the "
+                "server-parsed grant before deciding."
+            }))
+            @if rows.is_empty() { (empty_state("No pending requests.")) }
             @else {
-                table {
-                    tr {
-                        th { "Client" } th { "Secret" } th { "Mechanism" }
-                        th { "Tier" } th { "Age" } th { "" }
-                    }
-                    @for r in &rows {
-                        tr {
-                            td { (r.client_name) }
-                            td { (r.secret_name) }
-                            td { (r.mechanism) }
-                            td {
-                                @match Mechanism::from_str_opt(&r.mechanism) {
-                                    Some(m) => { (m.tier().human_label()) }
-                                    None => { span .muted { "unknown" } }
+                div .table-wrap .stack-wrap {
+                    table .stack {
+                        thead {
+                            tr {
+                                th { "Client" } th { "Secret" } th { "Mechanism" }
+                                th { "Tier" } th .numeric { "Age" } th { span .muted { "Action" } }
+                            }
+                        }
+                        tbody {
+                            @for r in &rows {
+                                tr {
+                                    td data-label="Client" { b { (r.client_name) } }
+                                    td data-label="Secret" { span .mono { (r.secret_name) } }
+                                    td data-label="Mechanism" { (mechanism_badge(&r.mechanism)) }
+                                    td data-label="Tier" {
+                                        @match Mechanism::from_str_opt(&r.mechanism) {
+                                            Some(m) => { (tier_badge(m.tier())) }
+                                            None => { span .badge .muted { "unknown" } }
+                                        }
+                                    }
+                                    td .numeric data-label="Age" { (age_label(r.created_at, now)) }
+                                    td .actions data-label="" {
+                                        a .btn .small href={ "/ui/requests/" (r.id) } { "Review" }
+                                    }
                                 }
                             }
-                            td { (age_label(r.created_at, now)) }
-                            td { a href={ "/ui/requests/" (r.id) } { "Review" } }
                         }
                     }
                 }
@@ -555,7 +1209,7 @@ async fn render_request_detail(
         let context = decrypt_context(state, row);
         let secret_line = match &secret {
             Some(s) => html! {
-                (s.name) " "
+                span .mono { (s.name) } " "
                 span .muted {
                     "(stored, version " (s.current_version)
                     ", max tier: "
@@ -565,38 +1219,61 @@ async fn render_request_detail(
             },
             None => html! { (row.secret_name) },
         };
-        return Ok(html_page(
+        let badge_class = match label {
+            "approved" => "badge badge-ok",
+            "denied" => "badge badge-danger",
+            _ => "badge badge-warn",
+        };
+        return Ok(html_page_at(
             "Request resolved",
+            "/ui/requests",
             html! {
-                h1 { "Request from " (row.client_name) }
-                p { "This request is " b { (label) } " and can no longer be acted on." }
-                p .muted {
-                    "Created " (age_label(row.created_at, now)) " ago"
-                    @if let Some(by) = &row.resolved_by { " · resolved by " (by) }
-                    @if let Some(at) = row.resolved_at {
-                        " at " (at.format("%Y-%m-%d %H:%M:%S UTC"))
+                div .page-head {
+                    h1 { "Request from " (row.client_name) }
+                    p .lede {
+                        span class=(badge_class) { (label) }
+                        " — this request can no longer be acted on."
                     }
                 }
-                @if let Some(reason) = &row.deny_reason {
-                    p { "Deny reason: " (reason) }
+                div .card {
+                    table .kv {
+                        tr { th { "Age" } td { "Created " (age_label(row.created_at, now)) " ago" } }
+                        @if let Some(by) = &row.resolved_by {
+                            tr { th { "Resolved by" } td { (by) } }
+                        }
+                        @if let Some(at) = row.resolved_at {
+                            tr { th { "Resolved at" } td { (at.format("%Y-%m-%d %H:%M:%S UTC")) } }
+                        }
+                        @if let Some(reason) = &row.deny_reason {
+                            tr { th { "Deny reason" } td { (reason) } }
+                        }
+                    }
                 }
                 (grant_block(mechanism, &constraints, secret_line))
                 (context_block(context.as_ref(), mechanism))
+                p { a .btn-link href="/ui/requests" { "← Back to pending requests" } }
             },
         ));
     }
     if policy_cap_elapsed(row.policy_not_after, now) {
-        return Ok(html_page(
+        return Ok(html_page_at(
             "Request no longer approvable",
+            "/ui/requests",
             html! {
-                h1 { "Request " (row.id) }
-                p {
-                    "The standing policy this request matched has "
-                    b { "expired" }
-                    ", so any grant issued now would already be past its cap. "
-                    "This request can no longer be approved and must be re-submitted \
-                     by the client."
+                div .page-head {
+                    h1 { "Request no longer approvable" }
+                    p .lede .mono { (row.id) }
                 }
+                div .callout .callout-danger {
+                    p {
+                        "The standing policy this request matched has "
+                        b { "expired" }
+                        ", so any grant issued now would already be past its cap. "
+                        "This request can no longer be approved and must be re-submitted \
+                         by the client."
+                    }
+                }
+                p { a .btn-link href="/ui/requests" { "← Back to pending requests" } }
             },
         ));
     }
@@ -607,7 +1284,7 @@ async fn render_request_detail(
 
     let secret_line = match &secret {
         Some(s) => html! {
-            (s.name) " "
+            span .mono { (s.name) } " "
             span .muted {
                 "(stored, version " (s.current_version)
                 ", max tier: "
@@ -616,7 +1293,8 @@ async fn render_request_detail(
             }
         },
         None => html! {
-            (row.secret_name) " " span .caveat { "(NOT stored in Keychute — value required below)" }
+            span .mono { (row.secret_name) } " "
+            span .caveat { "(NOT stored in Keychute — value required below)" }
         },
     };
 
@@ -650,78 +1328,102 @@ async fn render_request_detail(
     );
     let default_tier = mechanism.tier();
 
-    Ok(html_page(
+    Ok(html_page_at(
         "Approve request",
+        "/ui/requests",
         html! {
-            h1 { "Access request from " (row.client_name) }
-            @if let Some(text) = notice {
-                p .caveat { (text) }
+            div .page-head {
+                h1 { "Access request from " (row.client_name) }
+                p .lede {
+                    "Created " (age_label(row.created_at, now)) " ago · expires at "
+                    (row.expires_at.format("%Y-%m-%d %H:%M:%S UTC"))
+                }
             }
-            p .muted {
-                "Created " (age_label(row.created_at, now)) " ago · expires at "
-                (row.expires_at.format("%Y-%m-%d %H:%M:%S UTC"))
+            @if let Some(text) = notice {
+                div .callout .callout-danger {
+                    p .caveat { (text) }
+                }
             }
             (grant_block(mechanism, &constraints, secret_line))
             (context_block(context.as_ref(), mechanism))
 
-            form method="post" action={ "/ui/requests/" (id) "/approve" } {
-                input type="hidden" name="csrf_token" value=(approve_token);
-                input type="hidden" name=(F_SECRET_PRESENT) value=(secret_present);
-                fieldset {
-                    legend { "Narrow the grant (optional — values may only shrink the request)" }
-                    label {
-                        "TTL seconds (≤ " (constraints.ttl_seconds) "): "
-                        input type="number" name="ttl_seconds" min="1"
-                            max=(constraints.ttl_seconds) placeholder=(constraints.ttl_seconds);
-                    }
-                    label {
-                        "Max uses: "
-                        input type="number" name="max_uses" min="1";
-                    }
-                }
-                @if secret.is_none() {
+            div .card {
+                h2 { "Your decision" }
+                form method="post" action={ "/ui/requests/" (id) "/approve" } {
+                    input type="hidden" name="csrf_token" value=(approve_token);
+                    input type="hidden" name=(F_SECRET_PRESENT) value=(secret_present);
                     fieldset {
-                        legend { "Secret value (not yet stored)" }
-                        label {
-                            "Secret value: "
-                            input type="password" name="secret_value" autocomplete="off";
-                        }
-                        label {
-                            input type="checkbox" name="store_secret" value="on";
-                            " Store this secret in Keychute (otherwise it is released once, to this grant only)"
-                        }
-                        label {
-                            "Max tier when stored: " b { (default_tier.as_str()) }
-                            input type="hidden" name="store_max_tier" value=(default_tier.as_str());
-                            span .muted {
-                                " (the requested mechanism's tier — approving here cannot store \
-                                 the secret at a broader tier than the access being approved; \
-                                 widen it later from the secrets page if you mean to)"
+                        legend { "Narrow the grant (optional — values may only shrink the request)" }
+                        div .field-grid {
+                            label {
+                                "TTL seconds (≤ " (constraints.ttl_seconds) ")"
+                                input type="number" name="ttl_seconds" min="1" inputmode="numeric"
+                                    max=(constraints.ttl_seconds) placeholder=(constraints.ttl_seconds);
                             }
-                        }
-                        label {
-                            "Injection kind: "
-                            select name="injection_kind" {
-                                option value="bearer" selected { "bearer (Authorization: Bearer …)" }
-                                option value="header" { "header (named header)" }
-                                option value="basic" { "basic-password (Authorization: Basic)" }
+                            label {
+                                "Max uses"
+                                input type="number" name="max_uses" min="1" inputmode="numeric";
                             }
-                        }
-                        label {
-                            "Header name (kind=header) / username (kind=basic-password): "
-                            input type="text" name="injection_header";
-                        }
-                        label {
-                            "Description: "
-                            input type="text" name="store_description";
                         }
                     }
+                    @if secret.is_none() {
+                        fieldset {
+                            legend { "Secret value (not yet stored)" }
+                            label {
+                                "Secret value"
+                                input type="password" name="secret_value" autocomplete="off"
+                                    autocapitalize="off" autocorrect="off" spellcheck="false";
+                            }
+                            label .check {
+                                input type="checkbox" name="store_secret" value="on";
+                                span {
+                                    "Store this secret in Keychute"
+                                    br;
+                                    span .muted { "Otherwise it is released once, to this grant only." }
+                                }
+                            }
+                            label {
+                                "Max tier when stored: " b { (default_tier.as_str()) }
+                                input type="hidden" name="store_max_tier" value=(default_tier.as_str());
+                                span .muted {
+                                    " (the requested mechanism's tier — approving here cannot store \
+                                     the secret at a broader tier than the access being approved; \
+                                     widen it later from the secrets page if you mean to)"
+                                }
+                            }
+                            div .field-grid {
+                                label {
+                                    "Injection kind"
+                                    select name="injection_kind" {
+                                        option value="bearer" selected { "bearer (Authorization: Bearer …)" }
+                                        option value="header" { "header (named header)" }
+                                        option value="basic" { "basic-password (Authorization: Basic)" }
+                                    }
+                                }
+                                label {
+                                    "Header name / basic-auth username"
+                                    input type="text" name="injection_header"
+                                        autocapitalize="off" autocorrect="off" spellcheck="false";
+                                    span .muted { "Used by injection kinds " b { "header" } " and " b { "basic-password" } "." }
+                                }
+                            }
+                            label {
+                                "Description"
+                                input type="text" name="store_description";
+                            }
+                        }
+                    }
+                    div .actions-bar {
+                        button .primary type="submit" { "Approve" }
+                    }
                 }
-                button type="submit" { "Approve" }
-            }
-            form method="post" action={ "/ui/requests/" (id) "/deny" } .inline {
-                input type="hidden" name="csrf_token" value=(deny_token);
-                button type="submit" { "Deny" }
+                div .actions-bar {
+                    form method="post" action={ "/ui/requests/" (id) "/deny" } .inline {
+                        input type="hidden" name="csrf_token" value=(deny_token);
+                        button .danger type="submit" { "Deny" }
+                    }
+                    a .btn-link href="/ui/requests" { "Decide later" }
+                }
             }
         },
     ))
@@ -1191,35 +1893,45 @@ async fn grants_page(State(state): State<AppState>, headers: HeaderMap) -> UiRes
     let grants =
         db::ui_ext::list_active_grants(&state.db, state.config.limits.replay_window_seconds)
             .await?;
-    Ok(html_page(
+    Ok(html_page_at(
         "Active grants",
+        "/ui/grants",
         html! {
-            h1 { "Active grants" }
-            @if grants.is_empty() { p .muted { "No active grants." } }
+            (page_head("Active grants", html! {
+                "Live access a client is holding right now. Revoking one cuts it "
+                "off immediately."
+            }))
+            @if grants.is_empty() { (empty_state("No active grants.")) }
             @else {
-                table {
-                    tr {
-                        th { "Client" } th { "Secret" } th { "Mechanism" }
-                        th { "Expires" } th { "Uses" } th { "" }
-                    }
-                    @for g in &grants {
-                        tr {
-                            td { (g.client_name) }
-                            td { (g.secret_name) }
-                            td { (g.mechanism) }
-                            td { (g.not_after.format("%Y-%m-%d %H:%M:%S UTC")) }
-                            td {
-                                (g.use_count) " / "
-                                @match g.max_uses {
-                                    Some(m) => { (m) }
-                                    None => { "unlimited" }
-                                }
+                div .table-wrap .stack-wrap {
+                    table .stack {
+                        thead {
+                            tr {
+                                th { "Client" } th { "Secret" } th { "Mechanism" }
+                                th { "Expires" } th .numeric { "Uses" } th { span .muted { "Action" } }
                             }
-                            td {
-                                form method="post" action={ "/ui/grants/" (g.id) "/revoke" } .inline {
-                                    input type="hidden" name="csrf_token"
-                                        value=(csrf::issue_token(&state.keyset, R_REVOKE, &g.id.to_string(), &op.subject, "", now));
-                                    button type="submit" { "Revoke" }
+                        }
+                        tbody {
+                            @for g in &grants {
+                                tr {
+                                    td data-label="Client" { b { (g.client_name) } }
+                                    td data-label="Secret" { span .mono { (g.secret_name) } }
+                                    td data-label="Mechanism" { (mechanism_badge(&g.mechanism)) }
+                                    td data-label="Expires" { (g.not_after.format("%Y-%m-%d %H:%M:%S UTC")) }
+                                    td .numeric data-label="Uses" {
+                                        (g.use_count) " / "
+                                        @match g.max_uses {
+                                            Some(m) => { (m) }
+                                            None => { "unlimited" }
+                                        }
+                                    }
+                                    td .actions data-label="" {
+                                        form method="post" action={ "/ui/grants/" (g.id) "/revoke" } .inline {
+                                            input type="hidden" name="csrf_token"
+                                                value=(csrf::issue_token(&state.keyset, R_REVOKE, &g.id.to_string(), &op.subject, "", now));
+                                            button .danger .small type="submit" { "Revoke" }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1269,85 +1981,158 @@ async fn policies_page(
     let now = Utc::now();
     let policies = db::list_policies(&state.db).await?;
     let create_token = csrf::issue_token(&state.keyset, R_POLICY_CREATE, "", &op.subject, "", now);
-    Ok(html_page(
+    Ok(html_page_at(
         "Policies",
+        "/ui/policies",
         html! {
-            h1 { "Standing policies" }
-            @if policies.is_empty() { p .muted { "No policy rows." } }
+            (page_head("Standing policies", html! {
+                "Rules applied to a request before you ever see it — the highest-priority "
+                "match decides whether it is auto-approved, pushed as an FYI, sent to you "
+                "for approval, or denied outright."
+            }))
+            @if policies.is_empty() { (empty_state("No policy rows.")) }
             @else {
-                table {
-                    tr {
-                        th { "Client" } th { "Secret" } th { "Mechanism" } th { "Outcome" }
-                        th { "Priority" } th { "Limits" } th { "Not after" } th { "By" } th { "" }
-                    }
-                    @for p in &policies {
-                        tr {
-                            td { (p.client_name.as_deref().unwrap_or("any")) }
-                            td {
-                                @if let Some(s) = &p.secret_name { (s) }
-                                @else if let Some(t) = &p.secret_tag { "tag:" (t) }
-                                @else { "any" }
+                div .table-wrap .stack-wrap {
+                    table .stack {
+                        thead {
+                            tr {
+                                th { "Client" } th { "Secret" } th { "Mechanism" } th { "Outcome" }
+                                th .numeric { "Priority" } th { "Limits" } th { "Not after" }
+                                th { "By" } th { span .muted { "Action" } }
                             }
-                            td { (p.mechanism) }
-                            td { (p.outcome) }
-                            td { (p.priority) }
-                            td {
-                                @if let Some(ttl) = p.max_ttl_seconds { "ttl ≤ " (ttl) "s " }
-                                @if let Some(u) = p.max_uses { "uses ≤ " (u) }
-                            }
-                            td {
-                                @match p.not_after {
-                                    Some(t) => { (t.format("%Y-%m-%d %H:%M UTC")) }
-                                    None => { span .muted { "—" } }
-                                }
-                            }
-                            td { (p.created_by) }
-                            td {
-                                form method="post" action={ "/ui/policies/" (p.id) "/delete" } .inline {
-                                    input type="hidden" name="csrf_token"
-                                        value=(csrf::issue_token(&state.keyset, R_POLICY_DELETE, &p.id.to_string(), &op.subject, "", now));
-                                    button type="submit" { "Delete" }
+                        }
+                        tbody {
+                            @for p in &policies {
+                                tr {
+                                    td data-label="Client" {
+                                        @match &p.client_name {
+                                            Some(c) => { b { (c) } }
+                                            None => { span .muted { "any" } }
+                                        }
+                                    }
+                                    td data-label="Secret" {
+                                        @if let Some(s) = &p.secret_name { span .mono { (s) } }
+                                        @else if let Some(t) = &p.secret_tag { span .mono { "tag:" (t) } }
+                                        @else { span .muted { "any" } }
+                                    }
+                                    td data-label="Mechanism" { (mechanism_badge(&p.mechanism)) }
+                                    td data-label="Outcome" { (policy_outcome_badge(&p.outcome)) }
+                                    td .numeric data-label="Priority" { (p.priority) }
+                                    td data-label="Limits" {
+                                        @if p.max_ttl_seconds.is_none() && p.max_uses.is_none() {
+                                            span .muted { "—" }
+                                        }
+                                        @if let Some(ttl) = p.max_ttl_seconds { "ttl ≤ " (ttl) "s" }
+                                        @if p.max_ttl_seconds.is_some() && p.max_uses.is_some() { " · " }
+                                        @if let Some(u) = p.max_uses { "uses ≤ " (u) }
+                                    }
+                                    td data-label="Not after" {
+                                        @match p.not_after {
+                                            Some(t) => { (t.format("%Y-%m-%d %H:%M UTC")) }
+                                            None => { span .muted { "—" } }
+                                        }
+                                    }
+                                    td data-label="By" { span .muted { (p.created_by) } }
+                                    td .actions data-label="" {
+                                        form method="post" action={ "/ui/policies/" (p.id) "/delete" } .inline {
+                                            input type="hidden" name="csrf_token"
+                                                value=(csrf::issue_token(&state.keyset, R_POLICY_DELETE, &p.id.to_string(), &op.subject, "", now));
+                                            button .danger .small type="submit" { "Delete" }
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
-            h2 { "Create policy" }
-            form method="post" action="/ui/policies" {
-                input type="hidden" name="csrf_token" value=(create_token);
-                label { "Client name (blank = any): " input type="text" name="client_name"; }
-                label { "Secret name (blank = any): " input type="text" name="secret_name"; }
-                label { "OR secret tag: " input type="text" name="secret_tag"; }
-                label {
-                    "Mechanism: "
-                    select name="mechanism" {
-                        option value="brokered" { "brokered" }
-                        option value="autofill" { "autofill" }
-                        option value="cli-read" { "cli-read" }
-                        option value="direct-read" { "direct-read" }
+            div .card {
+                h2 { "Create policy" }
+                form method="post" action="/ui/policies" {
+                    input type="hidden" name="csrf_token" value=(create_token);
+                    fieldset {
+                        legend { "What it matches" }
+                        div .field-grid {
+                            label {
+                                "Client name " span .muted { "(blank = any)" }
+                                input type="text" name="client_name"
+                                    autocapitalize="off" autocorrect="off" spellcheck="false";
+                            }
+                            label {
+                                "Secret name " span .muted { "(blank = any)" }
+                                input type="text" name="secret_name"
+                                    autocapitalize="off" autocorrect="off" spellcheck="false";
+                            }
+                            label {
+                                "…or secret tag"
+                                input type="text" name="secret_tag"
+                                    autocapitalize="off" autocorrect="off" spellcheck="false";
+                            }
+                            label {
+                                "Mechanism"
+                                select name="mechanism" {
+                                    option value="brokered" { "brokered" }
+                                    option value="autofill" { "autofill" }
+                                    option value="cli-read" { "cli-read" }
+                                    option value="direct-read" { "direct-read" }
+                                }
+                            }
+                        }
+                    }
+                    fieldset {
+                        legend { "What it does" }
+                        div .field-grid {
+                            label {
+                                "Outcome"
+                                select name="outcome" {
+                                    option value="require-approval" { "require-approval" }
+                                    option value="notify-only" { "notify-only" }
+                                    option value="auto-approve" { "auto-approve" }
+                                    option value="deny" { "deny" }
+                                }
+                            }
+                            label {
+                                "Priority"
+                                input type="number" name="priority" value="0" inputmode="numeric";
+                            }
+                        }
+                    }
+                    fieldset {
+                        legend { "Constraints" }
+                        label {
+                            "Origins " span .muted { "(host[:port], one per line)" }
+                            textarea name="origins" rows="3"
+                                autocapitalize="off" autocorrect="off" spellcheck="false" {}
+                        }
+                        label {
+                            "Methods " span .muted { "(comma/space separated, blank = unconstrained)" }
+                            input type="text" name="methods"
+                                autocapitalize="characters" autocorrect="off" spellcheck="false";
+                        }
+                        label {
+                            "Path prefixes " span .muted { "(one per line, blank = unconstrained)" }
+                            textarea name="path_prefixes" rows="3"
+                                autocapitalize="off" autocorrect="off" spellcheck="false" {}
+                        }
+                        div .field-grid {
+                            label {
+                                "Max TTL seconds"
+                                input type="number" name="max_ttl_seconds" min="1" inputmode="numeric";
+                            }
+                            label {
+                                "Max uses"
+                                input type="number" name="max_uses" min="1" inputmode="numeric";
+                            }
+                            label {
+                                "Not after (UTC)"
+                                input type="datetime-local" name="not_after";
+                            }
+                        }
+                    }
+                    div .actions-bar {
+                        button .primary type="submit" { "Create policy" }
                     }
                 }
-                label {
-                    "Outcome: "
-                    select name="outcome" {
-                        option value="require-approval" { "require-approval" }
-                        option value="notify-only" { "notify-only" }
-                        option value="auto-approve" { "auto-approve" }
-                        option value="deny" { "deny" }
-                    }
-                }
-                label { "Priority: " input type="number" name="priority" value="0"; }
-                label { "Origins (host[:port], one per line): " br;
-                    textarea name="origins" rows="3" cols="40" {} }
-                label { "Methods (comma/space separated, blank = unconstrained): "
-                    input type="text" name="methods"; }
-                label { "Path prefixes (one per line, blank = unconstrained): " br;
-                    textarea name="path_prefixes" rows="3" cols="40" {} }
-                label { "Max TTL seconds: " input type="number" name="max_ttl_seconds" min="1"; }
-                label { "Max uses: " input type="number" name="max_uses" min="1"; }
-                label { "Not after (UTC): " input type="datetime-local" name="not_after"; }
-                button type="submit" { "Create policy" }
             }
         },
     ))
@@ -1562,63 +2347,105 @@ async fn secrets_page(State(state): State<AppState>, headers: HeaderMap) -> UiRe
     let now = Utc::now();
     let secrets = db::list_secrets(&state.db).await?;
     let token = csrf::issue_token(&state.keyset, R_SECRET_SAVE, "", &op.subject, "", now);
-    Ok(html_page(
+    Ok(html_page_at(
         "Secrets",
+        "/ui/secrets",
         html! {
-            h1 { "Stored secrets" }
-            @if secrets.is_empty() { p .muted { "No stored secrets." } }
+            (page_head("Stored secrets", html! {
+                "Credentials Keychute holds, each capped at the broadest delivery tier "
+                "it may ever be released through."
+            }))
+            @if secrets.is_empty() { (empty_state("No stored secrets.")) }
             @else {
-                table {
-                    tr {
-                        th { "Name" } th { "Description" } th { "Version" }
-                        th { "Max tier" } th { "Injection" } th { "Enabled" }
-                    }
-                    @for s in &secrets {
-                        tr {
-                            td { (s.name) }
-                            td { (s.description) }
-                            td { (s.current_version) }
-                            td { (Tier::from_int(s.max_tier).map(|t| t.as_str()).unwrap_or("?")) }
-                            td {
-                                (s.injection_kind)
-                                @if let Some(h) = &s.injection_header { " (" (h) ")" }
+                div .table-wrap .stack-wrap {
+                    table .stack {
+                        thead {
+                            tr {
+                                th { "Name" } th { "Description" } th .numeric { "Version" }
+                                th { "Max tier" } th { "Injection" } th { "Enabled" }
                             }
-                            td { @if s.enabled { "yes" } @else { "no" } }
+                        }
+                        tbody {
+                            @for s in &secrets {
+                                tr {
+                                    td data-label="Name" { b .mono { (s.name) } }
+                                    td data-label="Description" {
+                                        @if s.description.is_empty() { span .muted { "—" } }
+                                        @else { (s.description) }
+                                    }
+                                    td .numeric data-label="Version" { (s.current_version) }
+                                    td data-label="Max tier" {
+                                        @match Tier::from_int(s.max_tier) {
+                                            Some(t) => { (tier_badge(t)) }
+                                            None => { span .badge .muted { "?" } }
+                                        }
+                                    }
+                                    td data-label="Injection" {
+                                        span .mono {
+                                            (s.injection_kind)
+                                            @if let Some(h) = &s.injection_header { " (" (h) ")" }
+                                        }
+                                    }
+                                    td data-label="Enabled" {
+                                        @if s.enabled { span .badge .badge-ok { "yes" } }
+                                        @else { span .badge .badge-danger { "no" } }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
-            h2 { "Create or rotate a secret" }
-            p .muted {
-                "If the name matches an existing secret the value is rotated in as a "
-                "new version (other fields are ignored); otherwise a new secret is created."
-            }
-            form method="post" action="/ui/secrets" {
-                input type="hidden" name="csrf_token" value=(token);
-                label { "Name: " input type="text" name="name" required; }
-                label { "Value: " input type="password" name="secret_value" autocomplete="off" required; }
-                label { "Description: " input type="text" name="description"; }
-                label {
-                    "Max tier: "
-                    select name="max_tier" {
-                        @for t in [Tier::Brokered, Tier::TrustedClient, Tier::CooperatingClient, Tier::Direct] {
-                            option value=(t.as_str()) selected[t == Tier::Brokered] { (t.as_str()) }
+            div .card {
+                h2 { "Create or rotate a secret" }
+                p .muted {
+                    "If the name matches an existing secret the value is rotated in as a "
+                    "new version (other fields are ignored); otherwise a new secret is created."
+                }
+                form method="post" action="/ui/secrets" {
+                    input type="hidden" name="csrf_token" value=(token);
+                    div .field-grid {
+                        label {
+                            "Name"
+                            input type="text" name="name" required
+                                autocapitalize="off" autocorrect="off" spellcheck="false";
+                        }
+                        label {
+                            "Value"
+                            input type="password" name="secret_value" autocomplete="off" required
+                                autocapitalize="off" autocorrect="off" spellcheck="false";
+                        }
+                        label {
+                            "Description"
+                            input type="text" name="description";
+                        }
+                        label {
+                            "Max tier"
+                            select name="max_tier" {
+                                @for t in [Tier::Brokered, Tier::TrustedClient, Tier::CooperatingClient, Tier::Direct] {
+                                    option value=(t.as_str()) selected[t == Tier::Brokered] { (t.as_str()) }
+                                }
+                            }
+                        }
+                        label {
+                            "Injection kind"
+                            select name="injection_kind" {
+                                option value="bearer" selected { "bearer" }
+                                option value="header" { "header" }
+                                option value="basic" { "basic-password" }
+                            }
+                        }
+                        label {
+                            "Header name / basic-auth username"
+                            input type="text" name="injection_header"
+                                autocapitalize="off" autocorrect="off" spellcheck="false";
+                            span .muted { "Used by injection kinds " b { "header" } " and " b { "basic-password" } "." }
                         }
                     }
-                }
-                label {
-                    "Injection kind: "
-                    select name="injection_kind" {
-                        option value="bearer" selected { "bearer" }
-                        option value="header" { "header" }
-                        option value="basic" { "basic-password" }
+                    div .actions-bar {
+                        button .primary type="submit" { "Save" }
                     }
                 }
-                label {
-                    "Header name (kind=header) / username (kind=basic-password): "
-                    input type="text" name="injection_header";
-                }
-                button type="submit" { "Save" }
             }
         },
     ))
