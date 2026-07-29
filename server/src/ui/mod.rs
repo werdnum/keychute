@@ -451,7 +451,9 @@ a { color: var(--accent); text-underline-offset: 2px; }
 
 .stats {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+  /* min(…, 100%) so the track can shrink below its ideal width instead of
+     overflowing on a narrow phone or at a large text size. */
+  grid-template-columns: repeat(auto-fit, minmax(min(15rem, 100%), 1fr));
   gap: 0.85rem;
   margin: 0 0 1.5rem;
   padding: 0;
@@ -619,7 +621,7 @@ label > .muted { font-weight: 400; }
 
 .field-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(16rem, 100%), 1fr));
   gap: 0 1rem;
 }
 
@@ -763,7 +765,7 @@ fn layout_at(title: &str, current: Option<&str>, body: Markup) -> Markup {
         html lang="en" {
             head {
                 meta charset="utf-8";
-                meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover";
+                meta name="viewport" content="width=device-width, initial-scale=1";
                 meta name="color-scheme" content="light dark";
                 title { (title) " — Keychute" }
                 style { (maud::PreEscaped(STYLE)) }
@@ -1982,8 +1984,10 @@ async fn policies_page(
         "/ui/policies",
         html! {
             (page_head("Standing policies", html! {
-                "Applied before a request ever reaches you. The highest-priority match "
-                "wins, and its outcome decides the request."
+                "Applied before a request ever reaches you. A matching deny wins "
+                "outright; otherwise the most specific match does — naming a client, "
+                "then a secret, outranks a wildcard, and Priority only breaks ties "
+                "between rows of equal specificity."
             }))
             @if policies.is_empty() { (empty_state("No policy rows.")) }
             @else {
