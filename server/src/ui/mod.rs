@@ -14,6 +14,9 @@
 pub mod csrf;
 mod policy_store;
 
+use base64::Engine as _;
+
+use crate::audit;
 use crate::authn::human::{authenticate_human, Operator};
 use crate::crypto::{AadContext, SecretBytes, EPHEMERAL_KEK_ID};
 use crate::db;
@@ -42,6 +45,8 @@ const R_REVOKE: &str = "/ui/grants/revoke";
 const R_POLICY_CREATE: &str = "/ui/policies/create";
 const R_POLICY_DELETE: &str = "/ui/policies/delete";
 const R_SECRET_SAVE: &str = "/ui/secrets/save";
+const R_SECRET_REVEAL: &str = "/ui/secrets/reveal";
+const R_SECRET_VET: &str = "/ui/secrets/vet";
 
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -62,6 +67,8 @@ pub fn router(state: AppState) -> Router {
         .route("/ui/policies/{id}/delete", post(delete_policy))
         .route("/ui/secrets", get(secrets_page))
         .route("/ui/secrets", post(save_secret))
+        .route("/ui/secrets/{id}/review", post(review_secret))
+        .route("/ui/secrets/{id}/reviewed", post(mark_reviewed))
         .layer(axum::middleware::from_fn(security_headers))
         .with_state(state)
 }
@@ -1320,6 +1327,12 @@ async fn render_request_detail(
                 (Tier::from_int(s.max_tier).map(|t| t.as_str()).unwrap_or("?"))
                 ")"
             }
+            // Who put these bytes here matters to the decision: a deposited,
+            // unreviewed value was chosen by the client, not by you.
+            @if !s.operator_vetted {
+                " "
+                span .caveat { "(deposited by a client — not yet reviewed by you)" }
+            }
         },
         None => html! {
             span .mono { (row.secret_name) } " "
@@ -1433,6 +1446,13 @@ async fn render_request_detail(
                                                 ", max tier: "
                                                 (Tier::from_int(s.max_tier)
                                                     .map(|t| t.as_str()).unwrap_or("?"))
+                                                // Substituting is a human decision, so an
+                                                // unreviewed deposit is a legitimate choice
+                                                // here — but the operator should know they
+                                                // are handing over bytes a CLIENT chose.
+                                                @if !s.operator_vetted {
+                                                    ", deposited by a client, unreviewed"
+                                                }
                                                 ")"
                                             }
                                         }
@@ -1562,91 +1582,14 @@ fn parse_narrow_u64(input: Option<&str>, requested: u64, what: &str) -> UiResult
     }
 }
 
-/// Addendum #4/#17 subset: validate operator-supplied injection template.
-/// Returns `(injection_kind, injection_header, injection_username)`: the form
-/// has one free-text field (named `injection_header`), routed to the header
-/// column for kind 'header' and to `injection_username` for kind 'basic'
-/// (migration 0003). 'basic-password' is accepted as an alias for 'basic'
-/// (both spellings are also valid in the DB CHECK since migration 0004).
+/// Operator-facing wrapper around [`crate::injection::validate_injection`]
+/// (shared with the client deposit endpoint): same rules, UI error shape.
 #[allow(clippy::type_complexity)]
 fn validate_injection(
     kind: &str,
     header: Option<&str>,
 ) -> UiResult<(String, Option<String>, Option<String>)> {
-    const RESERVED: &[&str] = &[
-        "host",
-        "authorization",
-        "proxy-authorization",
-        "cookie",
-        "set-cookie",
-        "forwarded",
-        "x-real-ip",
-        "x-http-method-override",
-        "x-method-override",
-        "x-original-url",
-        "x-rewrite-url",
-        "x-original-method",
-        "connection",
-        "keep-alive",
-        "proxy-connection",
-        "te",
-        "trailer",
-        "transfer-encoding",
-        "upgrade",
-        "content-length",
-        "expect",
-    ];
-    match kind {
-        "bearer" => Ok(("bearer".into(), None, None)),
-        "header" => {
-            let name = header.ok_or_else(|| {
-                UiError::bad_request("injection kind 'header' requires a header name")
-            })?;
-            let lower = name.to_ascii_lowercase();
-            let valid_token = !name.is_empty()
-                && name.bytes().all(|b| {
-                    b.is_ascii_alphanumeric()
-                        || matches!(
-                            b,
-                            b'!' | b'#'
-                                | b'$'
-                                | b'%'
-                                | b'&'
-                                | b'\''
-                                | b'*'
-                                | b'+'
-                                | b'-'
-                                | b'.'
-                                | b'^'
-                                | b'_'
-                                | b'`'
-                                | b'|'
-                                | b'~'
-                        )
-                });
-            if !valid_token {
-                return Err(UiError::bad_request(
-                    "injection header is not a valid header name",
-                ));
-            }
-            if RESERVED.contains(&lower.as_str()) || lower.starts_with("x-forwarded-") {
-                return Err(UiError::bad_request("injection header is reserved"));
-            }
-            Ok(("header".into(), Some(name.to_owned()), None))
-        }
-        "basic" | "basic-password" => {
-            let username = header.ok_or_else(|| {
-                UiError::bad_request("injection kind 'basic-password' requires a username")
-            })?;
-            if username.contains(':') || username.chars().any(|c| c.is_control()) {
-                return Err(UiError::bad_request("invalid basic-auth username"));
-            }
-            // Username goes to injection_username; injection_header stays NULL
-            // (the proxy still falls back to injection_header for old rows).
-            Ok(("basic".into(), None, Some(username.to_owned())))
-        }
-        _ => Err(UiError::bad_request("unknown injection kind")),
-    }
+    crate::injection::validate_injection(kind, header).map_err(UiError::bad_request)
 }
 
 /// Parse the approval form's render-time marker: `Some(true)` = the page was
@@ -2090,11 +2033,26 @@ async fn approve(
     };
     let approved =
         db::ui_ext::approve_request(&state.db, id, &op.subject, grant_id, &grant, store).await?;
-    if approved.is_none() {
-        return Err(UiError::new(
-            StatusCode::CONFLICT,
-            "request was resolved or expired concurrently",
-        ));
+    match approved {
+        db::ui_ext::ApproveOutcome::Approved(_) => {}
+        db::ui_ext::ApproveOutcome::NotApprovable => {
+            return Err(UiError::new(
+                StatusCode::CONFLICT,
+                "request was resolved or expired concurrently",
+            ));
+        }
+        db::ui_ext::ApproveOutcome::SecretNameTaken => {
+            // A client deposit (or another operator) stored that name between
+            // this page rendering and the approve. Nothing was approved and
+            // nothing was overwritten: re-render so the operator decides
+            // against the secret that now exists.
+            return Err(UiError::new(
+                StatusCode::CONFLICT,
+                "a secret with that name was stored while you were reviewing. \
+                 Nothing was approved — reload the request and decide against \
+                 the secret that is now stored.",
+            ));
+        }
     }
     state.resolve_notify.notify_waiters();
     Ok(Redirect::to("/ui/requests").into_response())
@@ -2231,6 +2189,11 @@ async fn policies_page(
     let op = operator(&state, &headers).await?;
     let now = Utc::now();
     let policies = db::list_policies(&state.db).await?;
+    // Named on this page because it is where consent gets expressed: a client
+    // can squat a name BEFORE the operator writes the matching rule, and the
+    // unvetted clamp is what makes that harmless. Saying so here is what makes
+    // it visible.
+    let unvetted = db::list_unvetted_secret_names(&state.db).await?;
     let create_token = csrf::issue_token(&state.keyset, R_POLICY_CREATE, "", &op.subject, "", now);
     Ok(html_page_at(
         "Policies",
@@ -2300,6 +2263,22 @@ async fn policies_page(
             }
             div .card {
                 h2 { "Create policy" }
+                @if !unvetted.is_empty() {
+                    div .callout .callout-attention {
+                        p {
+                            "Heads up: these secrets were deposited by a client and "
+                            "nobody has reviewed them — "
+                            @for (i, name) in unvetted.iter().enumerate() {
+                                @if i > 0 { ", " }
+                                span .mono { (name) }
+                            }
+                            ". A rule you write now will not auto-release them until "
+                            "you review each one on the secrets page, so a client "
+                            "cannot claim a name ahead of a policy you are about to "
+                            "write."
+                        }
+                    }
+                }
                 form method="post" action="/ui/policies" {
                     input type="hidden" name="csrf_token" value=(create_token);
                     fieldset {
@@ -2607,6 +2586,17 @@ async fn secrets_page(State(state): State<AppState>, headers: HeaderMap) -> UiRe
                 "Credentials Keychute holds. Each one is capped at the broadest tier "
                 "it can ever be released through."
             }))
+            @if secrets.iter().any(|s| !s.operator_vetted) {
+                div .callout .callout-attention {
+                    p {
+                        "Some secrets below were deposited by a client and nobody has "
+                        "reviewed them. Until you do, every release of them needs your "
+                        "approval — a standing auto-approve or notify-only policy will "
+                        "NOT release a secret you have never seen. "
+                        "\"Review value\" shows you the credential the client stored."
+                    }
+                }
+            }
             @if secrets.is_empty() { (empty_state("No stored secrets.")) }
             @else {
                 div .table-wrap .stack-wrap {
@@ -2615,6 +2605,7 @@ async fn secrets_page(State(state): State<AppState>, headers: HeaderMap) -> UiRe
                             tr {
                                 th { "Name" } th { "Description" } th .numeric { "Version" }
                                 th { "Max tier" } th { "Injection" } th { "Enabled" }
+                                th { "Reviewed" } th { "" }
                             }
                         }
                         tbody {
@@ -2635,12 +2626,34 @@ async fn secrets_page(State(state): State<AppState>, headers: HeaderMap) -> UiRe
                                     td data-label="Injection" {
                                         span .mono {
                                             (s.injection_kind)
+                                            // Both free-text fields are shown: for kind 'basic'
+                                            // the account identity lives in injection_username,
+                                            // and the proxy builds the Authorization header from
+                                            // it — an operator vetting a deposit has to see whose
+                                            // account the client picked.
                                             @if let Some(h) = &s.injection_header { " (" (h) ")" }
+                                            @if let Some(u) = &s.injection_username { " (user: " (u) ")" }
                                         }
                                     }
                                     td data-label="Enabled" {
                                         @if s.enabled { span .badge .badge-ok { "yes" } }
                                         @else { span .badge .badge-danger { "no" } }
+                                    }
+                                    td data-label="Reviewed" {
+                                        @if s.operator_vetted { span .badge .badge-ok { "yes" } }
+                                        @else {
+                                            span .badge .badge-warn { "not yet" }
+                                        }
+                                    }
+                                    td .actions data-label="" {
+                                        @if !s.operator_vetted {
+                                            form method="post"
+                                                action={ "/ui/secrets/" (s.id) "/review" } .inline {
+                                                input type="hidden" name="csrf_token"
+                                                    value=(csrf::issue_token(&state.keyset, R_SECRET_REVEAL, &s.id.to_string(), &op.subject, "", now));
+                                                button .small type="submit" { "Review value" }
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -2731,6 +2744,353 @@ impl Drop for SecretForm {
     }
 }
 
+#[derive(Deserialize)]
+struct ReviewForm {
+    csrf_token: String,
+    /// Present when the operator explicitly asked to see the plaintext.
+    #[serde(default)]
+    reveal: Option<String>,
+}
+
+/// Standing rows that would begin releasing this secret WITHOUT a human the
+/// moment it is vetted — the actual consequence of the button, and the thing an
+/// operator can meaningfully weigh.
+///
+/// Deliberately selector-only (client, name/tag/wildcard, live) rather than a
+/// full policy evaluation: there is no request to evaluate yet, and listing a
+/// superset is the safe direction for a warning.
+fn policies_activated_by_vetting<'a>(
+    policies: &'a [db::PolicyRow],
+    secret_name: &str,
+    tags: &[String],
+    now: DateTime<Utc>,
+) -> Vec<&'a db::PolicyRow> {
+    policies
+        .iter()
+        .filter(|p| matches!(p.outcome.as_str(), "auto-approve" | "notify-only"))
+        .filter(|p| p.not_after.is_none_or(|t| t > now))
+        .filter(|p| match (&p.secret_name, &p.secret_tag) {
+            (Some(name), _) => name == secret_name,
+            (None, Some(tag)) => tags.contains(tag),
+            (None, None) => true,
+        })
+        .collect()
+}
+
+/// POST /ui/secrets/{id}/review — the decision page for a client deposit.
+///
+/// Leads with what an operator can actually judge: which client put this here
+/// and when, the injection template (for kind 'basic' that is an account
+/// identity the client chose), the tier cap, and — the point of the page —
+/// which standing policies would start releasing it with no human once it is
+/// vetted. A credential's BYTES are not judgeable by eye; its provenance and
+/// its consequences are.
+///
+/// The plaintext is therefore shown only when explicitly asked for (`reveal`),
+/// and only that path decrypts and audits `secret-revealed`. POST, not GET: a
+/// URL that renders a secret would land in browser history and be re-fetchable.
+///
+/// The confirmation form is bound to the version displayed here, so a rotation
+/// landing in between cannot get unseen bytes vetted.
+async fn review_secret(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    Form(form): Form<ReviewForm>,
+) -> UiResult<Response> {
+    let op = operator(&state, &headers).await?;
+    check_post(
+        &state,
+        &headers,
+        R_SECRET_REVEAL,
+        &id.to_string(),
+        &op.subject,
+        "",
+        &form.csrf_token,
+    )?;
+    let secret = db::list_secrets(&state.db)
+        .await?
+        .into_iter()
+        .find(|s| s.id == id)
+        .ok_or_else(|| UiError::new(StatusCode::NOT_FOUND, "no such secret"))?;
+    if secret.operator_vetted {
+        return Err(UiError::new(
+            StatusCode::CONFLICT,
+            "that secret is already marked reviewed",
+        ));
+    }
+    let version = db::get_secret_version(&state.db, secret.id, secret.current_version)
+        .await?
+        .ok_or_else(|| UiError::new(StatusCode::NOT_FOUND, "no stored version to review"))?;
+    let now = Utc::now();
+    let origin = db::client_deposit_origin(&state.db, &secret.name).await?;
+    let tags = db::get_tags_for_secret(&state.db, secret.id).await?;
+    let policies = db::list_policies(&state.db).await?;
+    let activated = policies_activated_by_vetting(&policies, &secret.name, &tags, now);
+
+    // Only the explicit reveal decrypts, and only it is audited: seeing a
+    // credential is an event, but opening the decision page is not.
+    let revealed = match form.reveal.as_deref() {
+        Some("1") => {
+            let plaintext = state
+                .keyset
+                .open(
+                    &version.ciphertext,
+                    &version.nonce,
+                    &version.wrapped_dek,
+                    &version.kek_id,
+                    AadContext::SecretVersion {
+                        secret_id: secret.id,
+                        version: version.version,
+                    },
+                )
+                .map_err(|e| {
+                    tracing::warn!(secret_id = %secret.id, error = %e, "secret version undecryptable");
+                    UiError::new(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "that secret\'s stored value could not be decrypted",
+                    )
+                })?;
+            audit::insert_audit(
+                &state.db,
+                &audit::AuditEvent {
+                    kind: audit::kinds::SECRET_REVEALED,
+                    secret_name: Some(secret.name.clone()),
+                    secret_version_id: Some(version.id),
+                    actor: Some(op.subject.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| UiError::from(anyhow::Error::from(e)))?;
+            // A faithful rendering, or the operator is looking at something
+            // other than what is stored. Valid UTF-8 goes out verbatim;
+            // anything else (the CLI deposits non-UTF-8 credentials as base64,
+            // and binary keys are a real case) is shown as base64 rather than
+            // lossily mangled into replacement characters. Always a TEXT node —
+            // auto-escaped like every other client-derived string — inside a
+            // <pre>, so a PEM\'s line breaks survive the trip to the screen.
+            use secrecy::ExposeSecret;
+            let bytes = plaintext.expose_secret();
+            Some(match std::str::from_utf8(bytes) {
+                Ok(text) => (text.to_owned(), false),
+                Err(_) => (
+                    base64::engine::general_purpose::STANDARD.encode(bytes),
+                    true,
+                ),
+            })
+        }
+        _ => None,
+    };
+
+    let marker = version.version.to_string();
+    let vet_token = csrf::issue_token(
+        &state.keyset,
+        R_SECRET_VET,
+        &id.to_string(),
+        &op.subject,
+        &marker,
+        now,
+    );
+    let reveal_token = csrf::issue_token(
+        &state.keyset,
+        R_SECRET_REVEAL,
+        &id.to_string(),
+        &op.subject,
+        "",
+        now,
+    );
+    Ok(html_page_at(
+        "Review secret",
+        "/ui/secrets",
+        html! {
+            (page_head("Review a deposited secret", html! {
+                "A client stored this credential and nobody has reviewed it, so Keychute "
+                "will not release it without your approval — not even under a standing "
+                "auto-approve policy. Marking it reviewed lifts that."
+            }))
+            div .card {
+                h2 { span .mono { (secret.name) } }
+                table .kv {
+                    tr {
+                        th { "Deposited by" }
+                        td {
+                            @match &origin {
+                                Some((client, at)) => {
+                                    span .mono { (client) }
+                                    " on " (at.format("%Y-%m-%d %H:%M UTC"))
+                                }
+                                // Belt and braces: an unvetted row with no
+                                // client deposit audit row should not exist.
+                                None => { span .muted { "unknown (no deposit record)" } }
+                            }
+                        }
+                    }
+                    tr { th { "Version" } td { (version.version) } }
+                    tr {
+                        th { "Max tier" }
+                        td {
+                            @match Tier::from_int(secret.max_tier) {
+                                Some(t) => { (tier_badge(t)) }
+                                None => { span .badge .muted { "?" } }
+                            }
+                        }
+                    }
+                    tr {
+                        th { "Injection" }
+                        td {
+                            span .mono { (secret.injection_kind) }
+                            @if let Some(h) = &secret.injection_header {
+                                " into header " span .mono { (h) }
+                            }
+                            @if let Some(u) = &secret.injection_username {
+                                " as user " span .mono { (u) }
+                                " "
+                                span .caveat { "(the account the client chose)" }
+                            }
+                        }
+                    }
+                    @if !secret.description.is_empty() {
+                        tr { th { "Client description" } td { (secret.description) } }
+                    }
+                }
+            }
+            div .card {
+                h2 { "What marking this reviewed allows" }
+                @if activated.is_empty() {
+                    p {
+                        "No standing policy currently matches this secret, so releases "
+                        "will keep coming to you for approval either way. Reviewing it "
+                        "only means a future auto-approve or notify-only policy would "
+                        "apply."
+                    }
+                } @else {
+                    div .callout .callout-attention {
+                        p {
+                            "These standing policies would begin releasing this secret "
+                            b { " without asking you" } ":"
+                        }
+                        ul {
+                            @for p in &activated {
+                                li {
+                                    (policy_outcome_badge(&p.outcome)) " "
+                                    span .mono { (p.mechanism) }
+                                    " for client "
+                                    span .mono {
+                                        @match &p.client_name {
+                                            Some(c) => { (c) }
+                                            None => { "ANY CLIENT" }
+                                        }
+                                    }
+                                    @match (&p.secret_name, &p.secret_tag) {
+                                        (Some(_), _) => { " (this secret by name)" }
+                                        (None, Some(tag)) => { " (tag " span .mono { (tag) } ")" }
+                                        (None, None) => { " (any secret)" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            div .card {
+                h2 { "The stored value" }
+                @match &revealed {
+                    Some((shown, is_base64)) => {
+                        @if *is_base64 {
+                            p {
+                                "As deposited — " b { "not valid UTF-8" }
+                                ", shown base64-encoded:"
+                            }
+                        } @else {
+                            p { "As deposited:" }
+                        }
+                        pre { (shown) }
+                    }
+                    None => {
+                        p .muted {
+                            "Hidden. A credential\'s bytes are rarely judgeable by eye — "
+                            "the questions above usually decide this. Reveal it if you "
+                            "need to compare it against something you already have; "
+                            "doing so is recorded in the audit log."
+                        }
+                        form method="post" action={ "/ui/secrets/" (secret.id) "/review" } .inline {
+                            input type="hidden" name="csrf_token" value=(reveal_token);
+                            input type="hidden" name="reveal" value="1";
+                            button .small type="submit" { "Reveal stored value" }
+                        }
+                    }
+                }
+            }
+            div .card {
+                p .muted {
+                    "Marking this reviewed applies to version " (version.version)
+                    " specifically. If it is rotated before you confirm, you will be "
+                    "asked to look again."
+                }
+                div .actions-bar {
+                    form method="post" action={ "/ui/secrets/" (secret.id) "/reviewed" } .inline {
+                        input type="hidden" name="csrf_token" value=(vet_token);
+                        input type="hidden" name="reviewed_version" value=(marker);
+                        button .primary type="submit" {
+                            "Mark reviewed (version " (version.version) ")"
+                        }
+                    }
+                    a .button href="/ui/secrets" { "Back without reviewing" }
+                }
+            }
+        },
+    )
+    .into_response())
+}
+
+#[derive(Deserialize)]
+struct ReviewedForm {
+    csrf_token: String,
+    /// The version whose plaintext was displayed. Echoed back and bound into
+    /// the CSRF token, so it cannot be swapped for another.
+    reviewed_version: String,
+}
+
+/// POST /ui/secrets/{id}/reviewed — the operator has looked at a
+/// client-deposited value and accepts it. Until this happens the policy engine
+/// treats the secret like one that does not exist: no auto-approve, no
+/// notify-only, every release needs a decision (migration 0007).
+async fn mark_reviewed(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    Form(form): Form<ReviewedForm>,
+) -> UiResult<Response> {
+    let op = operator(&state, &headers).await?;
+    // The version is part of the token's binding: only the page that actually
+    // displayed those bytes can produce a token that verifies here.
+    check_post(
+        &state,
+        &headers,
+        R_SECRET_VET,
+        &id.to_string(),
+        &op.subject,
+        &form.reviewed_version,
+        &form.csrf_token,
+    )?;
+    let reviewed_version: i32 = form
+        .reviewed_version
+        .parse()
+        .map_err(|_| UiError::bad_request("invalid reviewed version"))?;
+    // Already reviewed, gone, or rotated since the reveal: nothing was written
+    // and nothing audited, so say so rather than redirecting as if this call
+    // did the work — same as the revoke handler.
+    if !db::mark_secret_vetted(&state.db, id, reviewed_version, &op.subject).await? {
+        return Err(UiError::new(
+            StatusCode::CONFLICT,
+            "that secret is already reviewed, no longer exists, or has been rotated \
+             since you looked at it — open it again to review the current value",
+        ));
+    }
+    Ok(Redirect::to("/ui/secrets").into_response())
+}
+
 async fn save_secret(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2793,7 +3153,7 @@ async fn save_secret(
                 validate_injection(kind, non_empty(&form.injection_header))?;
             let secret_id = Uuid::new_v4();
             let keyset = &state.keyset;
-            db::ui_ext::create_secret_with_version(
+            let created = db::ui_ext::create_secret_with_version(
                 &state.db,
                 StoreSecretParams {
                     secret_id,
@@ -2818,6 +3178,17 @@ async fn save_secret(
                 &op.subject,
             )
             .await?;
+            if !created {
+                // The name was claimed between the lookup above and the
+                // insert — a client deposit (`POST /v1/secrets`) racing this
+                // form. Nothing was overwritten either way; say so rather than
+                // surfacing a unique violation as a 500.
+                return Err(UiError::new(
+                    StatusCode::CONFLICT,
+                    "a secret with that name was just created by someone else. \
+                     Reload the page: submitting again would ROTATE it, not create it.",
+                ));
+            }
         }
     }
     Ok(Redirect::to("/ui/secrets").into_response())
@@ -2908,8 +3279,10 @@ mod tests {
             max_tier: Tier::Direct.as_int(),
             injection_kind: "bearer".into(),
             injection_header: None,
+            injection_username: None,
             current_version: version,
             enabled: true,
+            operator_vetted: true,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -2946,6 +3319,63 @@ mod tests {
         assert!(parse_narrow_u64(Some("0"), 100, "ttl").is_err());
         assert!(parse_narrow_u64(Some("abc"), 100, "ttl").is_err());
         assert!(parse_narrow_u64(Some("-1"), 100, "ttl").is_err());
+    }
+
+    /// The review page's headline question — what would vetting switch on —
+    /// has to include the rows that release without a human and exclude the
+    /// ones that don't, across all three selector shapes.
+    #[test]
+    fn vetting_activates_only_human_free_policies() {
+        let now = Utc::now();
+        let row = |outcome: &str, name: Option<&str>, tag: Option<&str>| db::PolicyRow {
+            id: Uuid::new_v4(),
+            client_name: None,
+            secret_name: name.map(str::to_owned),
+            secret_tag: tag.map(str::to_owned),
+            mechanism: "cli-read".to_owned(),
+            outcome: outcome.to_owned(),
+            priority: 0,
+            origins: serde_json::Value::Array(vec![]),
+            methods: vec![],
+            path_prefixes: vec![],
+            max_ttl_seconds: None,
+            max_uses: None,
+            not_after: None,
+            created_by: "andrew".into(),
+            created_at: now,
+        };
+        let tags = vec!["prod".to_owned()];
+
+        // Selector shapes that match: by name, by tag, and the wildcard row.
+        let by_name = row("auto-approve", Some("k"), None);
+        let by_tag = row("notify-only", None, Some("prod"));
+        let wildcard = row("auto-approve", None, None);
+        // ...and ones that must not be listed.
+        let other_name = row("auto-approve", Some("other"), None);
+        let other_tag = row("auto-approve", None, Some("staging"));
+        let needs_human = row("require-approval", None, None);
+        let denies = row("deny", None, None);
+        let mut expired = row("auto-approve", None, None);
+        expired.not_after = Some(now - Duration::hours(1));
+
+        let all = vec![
+            by_name.clone(),
+            by_tag.clone(),
+            wildcard.clone(),
+            other_name,
+            other_tag,
+            needs_human,
+            denies,
+            expired,
+        ];
+        let got = policies_activated_by_vetting(&all, "k", &tags, now);
+        let ids: Vec<Uuid> = got.iter().map(|p| p.id).collect();
+        assert_eq!(ids, vec![by_name.id, by_tag.id, wildcard.id]);
+
+        // A secret with no tags loses the tag row but keeps the wildcard.
+        let got = policies_activated_by_vetting(&all, "k", &[], now);
+        let ids: Vec<Uuid> = got.iter().map(|p| p.id).collect();
+        assert_eq!(ids, vec![by_name.id, wildcard.id]);
     }
 
     #[test]

@@ -25,7 +25,7 @@ Milestones M0–M3 server-side, minus cluster wiring:
 - Human authn: pluggable — `static` mode (bearer token hash + subject, for
   dev/e2e) or `oidc` mode (JWT validation: issuer, audience, signature via JWKS,
   exp/nbf with skew, group/subject allowlist).
-- `keychute` CLI (request → wait → read → stdout).
+- `keychute` CLI (request → wait → read → stdout; `store` for deposits).
 - TLS: rustls listener when cert/key paths configured; plain HTTP otherwise
   (dev/e2e). Production charts always configure TLS.
 - Abuse guards: per-client pending-request cap, per-client concurrent wait cap,
@@ -105,6 +105,7 @@ clients:                   # declarative client provisioning (reconciled at star
   - name: k8s-agent
     max_tier: cooperating-client
     mechanisms: [cli-read]
+    may_store_secrets: true   # optional, default false: allows POST /v1/secrets
     auth:
       service_account:
         audience: "keychute.example.dev"
@@ -124,6 +125,7 @@ limits:
   proxy_max_body_bytes: 10485760
   proxy_stream_deadline_seconds: 300
   replay_window_seconds: 60
+  max_deposits_per_hour_per_client: 20   # POST /v1/secrets, per client
 ```
 
 ## KEK file format (`keyset.json`)
@@ -199,6 +201,36 @@ Client authn: `Authorization: Bearer <api-token>` or
   "utf8"|"base64", "secret_version_id": "..."}`. Only for mechanisms cli-read /
   autofill / direct-read. 410 with code `payload-lost` if a passthrough payload
   was lost to restart.
+- `POST /v1/secrets` — client-initiated deposit of a NEW secret (DESIGN
+  CUJ 2b). Body:
+  ```json
+  {
+    "name": "my-api-key",
+    "value": "<utf8 or base64>",
+    "encoding": "utf8",              // default "utf8"
+    "description": "provisioned by the agent",
+    "max_tier": "brokered",          // default "brokered"
+    "injection_kind": "bearer",      // 'bearer' | 'header' | 'basic'; default 'bearer'
+    "injection_header": "X-Api-Key"  // header name for 'header', username for 'basic'
+  }
+  ```
+  → `201 {"secret_id": "...", "name": "...", "version": 1}`.
+  Guardrails, all server-enforced: the client must have `may_store_secrets` in
+  config (else `403 policy-denied`); the endpoint is **create-only**, so an
+  existing name is `409 secret-exists` and never a rotation; `max_tier` may not
+  exceed the client's own cap (`400`); tags cannot be set by a client (tag
+  membership selects policy rows); `429 too-many-deposits` past
+  `limits.max_deposits_per_hour_per_client` — counted off the audit log inside
+  the deposit's own transaction, behind a per-client advisory lock, so
+  concurrent deposits cannot each observe the same pre-deposit count.
+  A deposit lands with `operator_vetted = false`, so it can never satisfy a
+  standing auto-approve/notify-only row until a human reviews it. Bounds:
+  name ≤ 128 bytes of
+  `[A-Za-z0-9._-]` (not leading `.`), description ≤ 1 KiB, decoded value ≤
+  64 KiB. Writes `secret-created` with `client_name` set and actor
+  `client:<name>`, plus a best-effort FYI push. Not idempotent by design — a
+  blind retry conflicts rather than silently rotating — so the CLI does not
+  retry it.
 - `ANY /v1/grants/{id}/proxy/{path...}` — brokered. Query string passthrough.
   The target origin comes from the grant (single-origin grants in v1: a brokered
   request must name exactly one origin). Method+path validated against grant.
@@ -226,7 +258,19 @@ or Envoy-forwarded JWT in oidc mode):
 - `GET /ui/policies` + `POST /ui/policies` (create standing grant row) +
   `POST /ui/policies/{id}/delete`.
 - Admin secret management (human-auth too): `POST /ui/secrets` (create/rotate:
-  name, value, max_tier, injection template), `GET /ui/secrets`.
+  name, value, max_tier, injection template), `GET /ui/secrets`,
+  `POST /ui/secrets/{id}/review` (the decision page for a client deposit:
+  depositing client, injection template, tier, and which standing policies would
+  begin releasing it with no human once vetted — with the plaintext shown only
+  on an explicit `reveal=1`, which is what audits `secret-revealed`) and
+  `POST /ui/secrets/{id}/reviewed` (lift the unvetted clamp; audits
+  `secret-vetted`). A revealed value renders verbatim in a `<pre>` — base64 when
+  it is not valid UTF-8 — so what the operator sees is what is stored, not a
+  whitespace-collapsed or lossily-decoded rendering of it. The confirmation is
+  bound to the displayed version — in the
+  CSRF token AND in the `UPDATE ... AND current_version = $2` — so a rotation
+  between the two steps cannot vet bytes nobody saw. Both are POST: a URL that
+  renders a credential would sit in browser history.
 - CSRF: session-less double-submit is NOT enough with header auth; since auth is
   a header (no cookies), CSRF risk is minimal, but implement `Origin`/
   `Sec-Fetch-Site` checks on all POSTs + a per-rendered-form token MAC'd with the
@@ -244,7 +288,10 @@ Use `uuid` PKs (`gen_random_uuid()` via pgcrypto or app-generated), `timestamptz
 
 - `secrets(id, name unique, description, max_tier int, injection_kind text
   ['bearer'|'header'|'basic'], injection_header text null, current_version int,
-  enabled bool, created_at, updated_at)`
+  enabled bool, operator_vetted bool default true, created_at, updated_at)` —
+  `operator_vetted` is false for a client deposit until an operator reviews it
+  (`POST /ui/secrets/{id}/reviewed`); the policy engine clamps an unvetted
+  secret to at most `require-approval`, exactly like an absent one.
 - `secret_versions(id uuid pk, secret_id fk, version int, ciphertext bytea,
   nonce bytea, wrapped_dek bytea, kek_id text, created_at, created_by_request
   uuid null, unique(secret_id, version))` — append-only; only `wrapped_dek`+
@@ -252,7 +299,7 @@ Use `uuid` PKs (`gen_random_uuid()` via pgcrypto or app-generated), `timestamptz
 - `secret_tags(secret_id, tag, pk both)`
 - `clients(id, name unique, max_tier int, mechanisms text[], auth_kind text,
   api_token_sha256 text null, sa_audience text null, sa_subject text null,
-  enabled bool)` — reconciled from config at startup (upsert by name; disable
+  may_store_secrets bool default false, enabled bool)` — reconciled from config at startup (upsert by name; disable
   rows absent from config).
 - `policies(id, client_name text null /*null = any*/, secret_name text null,
   secret_tag text null, mechanism text, outcome text
@@ -277,6 +324,9 @@ Use `uuid` PKs (`gen_random_uuid()` via pgcrypto or app-generated), `timestamptz
   secret_version_id uuid null, actor text null, method text null, origin text
   null, path text null, status int null, detail jsonb null)` — append-only.
   `detail` must never contain secret material or freeform client context.
+  Indexed on `at`, plus a partial `(client_name, at) WHERE kind =
+  'secret-created'` (migration 0008) for the deposit rate cap, which counts
+  inside the deposit's transaction while holding that client's lock.
 
 Atomicity requirements (single statements / explicit transactions):
 

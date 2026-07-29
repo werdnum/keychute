@@ -113,6 +113,9 @@ oidc:
 #   - name: k8s-agent
 #     maxTier: cooperating-client
 #     mechanisms: [cli-read]
+#     # Optional, default false: allows `keychute store` (POST /v1/secrets) to
+#     # deposit NEW secrets. Never permits replacing an existing one.
+#     mayStoreSecrets: true
 #     auth:
 #       serviceAccount:
 #         audience: keychute.andrewgarrett.dev
@@ -279,6 +282,11 @@ limits:
   replayWindowSeconds: 60
   # Concurrent in-flight proxy streams per client.
   maxProxyStreamsPerClient: 8
+  # Secret deposits (POST /v1/secrets) one client may make per rolling hour.
+  # Only bites clients with `mayStoreSecrets: true`; every deposit pushes the
+  # operator, so this bounds how much of their attention one client can spend.
+  # Must be positive — to withhold deposits entirely, leave mayStoreSecrets off.
+  maxDepositsPerHourPerClient: 20
   # Graceful-shutdown drain window. Must stay below
   # terminationGracePeriodSeconds below: a passthrough payload is wrapped under
   # the process-local ephemeral KEK, so a read cut off mid-flight is

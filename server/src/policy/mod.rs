@@ -90,6 +90,9 @@ pub struct SecretRow {
     pub name: String,
     pub enabled: bool,
     pub max_tier: Tier,
+    /// Has an operator ever seen this value (migration 0007)? A client
+    /// deposit starts false.
+    pub operator_vetted: bool,
 }
 
 /// A row of the `policies` table.
@@ -161,7 +164,8 @@ impl Evaluation {
 /// Evaluate a requested grant against the policy table. Pure.
 ///
 /// `secret` is None for an unknown secret name (allowed: approval-time entry);
-/// in that case the result is clamped to at most RequireApproval.
+/// in that case — and when the secret exists but no operator has vetted it —
+/// the result is clamped to at most RequireApproval.
 pub fn evaluate(
     client: &ClientRow,
     secret: Option<&SecretRow>,
@@ -234,10 +238,18 @@ pub fn evaluate(
                 Outcome::RequireApproval => Decision::RequireApproval,
                 Outcome::Deny => unreachable!("deny rows filtered above"),
             };
-            // Unknown secret: never auto-approve (or silently notify) a secret
-            // that doesn't exist yet.
-            if secret.is_none() && matches!(decision, Decision::AutoApprove | Decision::NotifyOnly)
-            {
+            // Never auto-approve (or silently notify) a release of a secret no
+            // human has seen: one that doesn't exist yet, or one a CLIENT
+            // deposited and no operator has reviewed. The second case is what
+            // stops a deposit from being an end-run around this clamp — the
+            // depositing client picks the name, so without it a client could
+            // satisfy a name-scoped or wildcard standing policy with bytes
+            // nobody reviewed and have them released with no human in the loop.
+            let unvetted = match secret {
+                None => true,
+                Some(s) => !s.operator_vetted,
+            };
+            if unvetted && matches!(decision, Decision::AutoApprove | Decision::NotifyOnly) {
                 decision = Decision::RequireApproval;
             }
             // A brokered row with NO origin constraint is unconstrained in the
@@ -580,6 +592,15 @@ mod tests {
             name: "example-api-token".into(),
             enabled: true,
             max_tier: Tier::Direct,
+            operator_vetted: true,
+        }
+    }
+
+    /// A client-deposited secret no operator has reviewed yet.
+    fn unvetted_secret() -> SecretRow {
+        SecretRow {
+            operator_vetted: false,
+            ..secret()
         }
     }
 
@@ -1167,6 +1188,59 @@ mod tests {
         // Deny still denies for unknown secrets.
         let p = row(Outcome::Deny);
         assert_deny(&eval(&client(), None, &[], &req_brokered(), &[p]));
+    }
+
+    /// A client deposit must not be able to satisfy a standing auto-approve or
+    /// notify-only row. The depositing client picks the name, so without this
+    /// clamp it could create a row matching a name-scoped OR wildcard policy
+    /// and have bytes no human ever saw released with nobody in the loop.
+    #[test]
+    fn unvetted_secret_clamps_auto_approve_and_notify() {
+        let p = row(Outcome::AutoApprove);
+        let e = eval(
+            &client(),
+            Some(&unvetted_secret()),
+            &[],
+            &req_brokered(),
+            &[p],
+        );
+        assert_eq!(e.decision, Decision::RequireApproval);
+
+        let p = row(Outcome::NotifyOnly);
+        let e = eval(
+            &client(),
+            Some(&unvetted_secret()),
+            &[],
+            &req_brokered(),
+            &[p],
+        );
+        assert_eq!(e.decision, Decision::RequireApproval);
+
+        // A wildcard row (no secret_name) is the same story — the clamp is on
+        // the secret, not on how the row selected it.
+        let mut p = row(Outcome::AutoApprove);
+        p.secret_name = None;
+        let e = eval(
+            &client(),
+            Some(&unvetted_secret()),
+            &[],
+            &req_brokered(),
+            &[p],
+        );
+        assert_eq!(e.decision, Decision::RequireApproval);
+
+        // Deny still denies, and an operator-vetted secret still auto-approves.
+        let p = row(Outcome::Deny);
+        assert_deny(&eval(
+            &client(),
+            Some(&unvetted_secret()),
+            &[],
+            &req_brokered(),
+            &[p],
+        ));
+        let p = row(Outcome::AutoApprove);
+        let e = eval(&client(), Some(&secret()), &[], &req_brokered(), &[p]);
+        assert_eq!(e.decision, Decision::AutoApprove);
     }
 
     #[test]

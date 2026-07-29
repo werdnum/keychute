@@ -15,6 +15,8 @@ pub struct ClientRow {
     pub sa_audience: Option<String>,
     pub sa_subject: Option<String>,
     pub enabled: bool,
+    /// Config opt-in for client-initiated secret deposit (migration 0006).
+    pub may_store_secrets: bool,
 }
 
 /// Reconcile the `clients` table from declarative config at startup:
@@ -31,7 +33,8 @@ pub async fn reconcile_clients(db: &PgPool, clients: &[ClientConfig]) -> anyhow:
     // could not authenticate anyway).
     sqlx::query(
         "UPDATE clients \
-         SET enabled = false, api_token_sha256 = NULL, sa_audience = NULL, sa_subject = NULL \
+         SET enabled = false, api_token_sha256 = NULL, sa_audience = NULL, sa_subject = NULL, \
+             may_store_secrets = false \
          WHERE name <> ALL($1)",
     )
     .bind(&names)
@@ -65,8 +68,9 @@ pub async fn reconcile_clients(db: &PgPool, clients: &[ClientConfig]) -> anyhow:
         };
         sqlx::query(
             "INSERT INTO clients \
-             (name, max_tier, mechanisms, auth_kind, api_token_sha256, sa_audience, sa_subject, enabled) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, true) \
+             (name, max_tier, mechanisms, auth_kind, api_token_sha256, sa_audience, sa_subject, \
+              may_store_secrets, enabled) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true) \
              ON CONFLICT (name) DO UPDATE SET \
                max_tier = EXCLUDED.max_tier, \
                mechanisms = EXCLUDED.mechanisms, \
@@ -74,6 +78,7 @@ pub async fn reconcile_clients(db: &PgPool, clients: &[ClientConfig]) -> anyhow:
                api_token_sha256 = EXCLUDED.api_token_sha256, \
                sa_audience = EXCLUDED.sa_audience, \
                sa_subject = EXCLUDED.sa_subject, \
+               may_store_secrets = EXCLUDED.may_store_secrets, \
                enabled = true",
         )
         .bind(&c.name)
@@ -89,6 +94,7 @@ pub async fn reconcile_clients(db: &PgPool, clients: &[ClientConfig]) -> anyhow:
         )
         .bind(sa_audience)
         .bind(sa_subject)
+        .bind(c.may_store_secrets)
         .execute(&mut *tx)
         .await?;
     }

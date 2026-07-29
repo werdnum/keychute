@@ -103,6 +103,53 @@ and is agent-influenceable. The approval UI therefore renders tier-2 context as
    transcript unless the agent deliberately captures it — which is exactly the
    residual risk tier 2 declares.
 
+### CUJ 2b — k8s-agent deposits a credential it just minted (client write)
+
+1. The agent has just created a credential elsewhere (an API key it provisioned,
+   a token it rotated in a third-party console) and needs Keychute to hold it:
+   `… | keychute store my-service-api-key --description "provisioned by the agent"`.
+   The value arrives on **stdin** — never argv, which every other process on the
+   box can read.
+2. The CLI posts it to `POST /v1/secrets`. No approval gate: nothing is being
+   *released*, and holding the deposit pending would strip the agent of a
+   credential it already has in hand. What the deposit does get is the four
+   guardrails that keep it from becoming a back door:
+   - the client must be marked `may_store_secrets` in config (default off);
+   - it is **create-only** — an existing name is a 409, never a rotation, so a
+     compromised client cannot substitute the credential behind a standing grant
+     or overwrite bytes an operator reviewed. Rotation stays operator-only;
+   - the new secret's `max_tier` defaults to `brokered` and may not exceed the
+     depositing client's own cap, so a deposit cannot mint something more
+     releasable than its depositor;
+   - the client may not tag its deposit, because tags select policy rows —
+     self-tagging would be self-selecting its own approval rules;
+   - a per-client hourly deposit cap, decided inside the deposit's own
+     transaction under a per-client lock (a check outside it would bound only a
+     serial client), bounds how much operator attention one client can spend;
+   - **the deposit lands unvetted**, and the policy engine treats an unvetted
+     secret exactly like one that does not exist: no auto-approve, no
+     notify-only, every release needs a decision. Without this, depositing
+     under a name a standing policy selects — by name OR by the wildcard row —
+     would let a client hand itself bytes nobody reviewed and have them
+     released with no human in the loop — including to a DIFFERENT client, since
+     a policy row may name no client at all: without the clamp, one agent could
+     deposit bytes for another to collect, through a path with no human on it.
+     To lift the clamp the operator opens the deposit and confirms for that
+     specific version. The page leads with what a human can actually judge —
+     which client deposited it, the injection template (for basic auth, an
+     account identity the client chose), and which standing policies would start
+     releasing it without asking — because a credential's BYTES are not
+     judgeable by eye. The plaintext is there on request, and revealing it is
+     audited.
+3. The operator gets an FYI push ("k8s-agent stored a new secret …") and an audit
+   row (`secret-created`, actor `client:k8s-agent`). Getting the secret back out
+   is the ordinary CUJ 2 flow, approval and all — and the approval page says the
+   value was deposited by a client and not yet reviewed, because who chose those
+   bytes is part of the decision.
+
+This is the second ingestion path alongside approval-time entry (CUJ 2 step 3);
+both exist so credentials never have to transit an LLM chat to get into the store.
+
 ### CUJ 3 — Secure agentic autofill for family-assistant (tier 1)
 
 1. I pre-approve a **standing grant**: secret `hellofresh-login` may be released to

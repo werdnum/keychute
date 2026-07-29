@@ -1,6 +1,8 @@
-//! keychute CLI: request secrets from a Keychute server (CUJ 2, tier-2 cli-read).
+//! keychute CLI: request secrets from a Keychute server (CUJ 2, tier-2 cli-read),
+//! and deposit new ones (`keychute store`, reading the value from stdin).
 //!
 //! The secret goes to STDOUT and nowhere else; all diagnostics go to stderr.
+//! Nothing ever puts a secret value in argv — `store` reads stdin or a file.
 //!
 //! Exit codes: 0 success, 2 usage/config error, 3 denied, 4 timeout/expired
 //! (including an expired grant), 5 payload lost, 1 anything else (including a
@@ -8,7 +10,7 @@
 
 mod pipeline;
 
-use std::io::{IsTerminal, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -16,10 +18,11 @@ use base64::Engine as _;
 use clap::{Parser, Subcommand};
 use keychute_types::{
     ApiError, Constraints, CreateAccessRequest, Mechanism, ReadGrantRequest, ReadGrantResponse,
-    RequestContext, RequestState, SecretEncoding,
+    RequestContext, RequestState, SecretEncoding, StoreSecretRequest, StoreSecretResponse, Tier,
 };
 use serde::Deserialize;
 use uuid::Uuid;
+use zeroize::{Zeroize, Zeroizing};
 
 const EXIT_OTHER: i32 = 1;
 const EXIT_CONFIG: i32 = 2;
@@ -43,6 +46,10 @@ const CREATE_ATTEMPTS: u32 = 3;
 const RETRY_BACKOFF_SECONDS: u64 = 1;
 /// Consecutive network failures tolerated while waiting for approval.
 const MAX_WAIT_NETWORK_ERRORS: u32 = 5;
+/// Largest secret `store` will send, matching the server's own cap. Enforced
+/// while reading so an oversize input fails locally instead of after a wasted
+/// upload.
+const MAX_SECRET_BYTES: usize = 64 * 1024;
 
 #[derive(Parser)]
 #[command(name = "keychute", version, about = "Keychute secret delivery CLI")]
@@ -55,6 +62,8 @@ struct Cli {
 enum Cmd {
     /// Request a secret; once approved, print it to stdout.
     Request(RequestArgs),
+    /// Store a NEW secret, read from stdin (never printed, never in argv).
+    Store(StoreArgs),
     /// Print the state of an access request as JSON (never the secret).
     Status {
         /// The access request id.
@@ -85,6 +94,36 @@ struct RequestArgs {
     /// (default: only when stdout is a TTY).
     #[arg(long)]
     newline: bool,
+}
+
+#[derive(clap::Args)]
+struct StoreArgs {
+    /// Name for the new secret. Must not already exist: this command never
+    /// replaces a stored secret (rotation is an operator action in the UI).
+    secret_name: String,
+    /// Read the value from this file instead of stdin ("-" means stdin).
+    #[arg(long)]
+    value_file: Option<PathBuf>,
+    /// Operator-facing description, shown in the Keychute UI.
+    #[arg(long, default_value = "")]
+    description: String,
+    /// Most permissive delivery this secret may ever get: brokered,
+    /// trusted-client, cooperating-client or direct. Defaults to the tightest
+    /// (brokered) and may not exceed this client's own maximum tier.
+    #[arg(long, default_value = "brokered")]
+    max_tier: String,
+    /// How the brokered proxy injects this credential: bearer, header, basic.
+    #[arg(long, default_value = "bearer")]
+    injection_kind: String,
+    /// Header name for --injection-kind header; username for basic.
+    #[arg(long)]
+    injection_header: Option<String>,
+    /// Store the input bytes verbatim, including any trailing newline.
+    /// Without this, exactly one trailing newline is stripped — `echo secret |
+    /// keychute store …` is the common case and the newline is not part of
+    /// the credential.
+    #[arg(long)]
+    raw: bool,
 }
 
 /// A terminal failure: message for stderr plus the process exit code.
@@ -183,8 +222,15 @@ impl Config {
 }
 
 fn build_http_client(cfg: &Config) -> CliResult<reqwest::Client> {
-    let mut builder =
-        reqwest::Client::builder().user_agent(concat!("keychute-cli/", env!("CARGO_PKG_VERSION")));
+    // Never follow redirects. Every call here carries the bearer token, `read`
+    // carries a released secret back, and `store` carries the credential in
+    // the request BODY — which a 307/308 replays verbatim at the new origin
+    // even where reqwest would strip a cross-origin `Authorization` header. A
+    // redirect from a secrets API is a misconfiguration or an attack, not a
+    // route to follow; it surfaces as a 3xx error instead.
+    let mut builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(concat!("keychute-cli/", env!("CARGO_PKG_VERSION")));
     if let Some(path) = &cfg.ca_bundle {
         let pem = std::fs::read(path).map_err(|e| {
             fail(
@@ -740,6 +786,250 @@ fn write_secret(released: &ReadGrantResponse, force_newline: bool) -> CliResult<
     Ok(())
 }
 
+/// Read the secret bytes for `store`: stdin by default, or `--value-file`.
+///
+/// Never an argv flag: process arguments are readable by every other process
+/// on the box (and land in shell history), which is exactly the exposure this
+/// tool exists to avoid.
+fn read_secret_input(source: Option<&PathBuf>, raw: bool) -> CliResult<Zeroizing<Vec<u8>>> {
+    let mut buf: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::new());
+    match source {
+        Some(path) if path.as_os_str() != "-" => {
+            let file = std::fs::File::open(path).map_err(|e| {
+                fail(
+                    EXIT_CONFIG,
+                    format!("cannot read --value-file {}: {e}", path.display()),
+                )
+            })?;
+            // `--value-file /dev/tty` (or /dev/stdin, /proc/self/fd/0 when
+            // stdin is the terminal) would route around the refusal below and
+            // have the terminal driver echo the typed credential. The check
+            // belongs on the opened descriptor, not the path spelling.
+            if file.is_terminal() {
+                return Err(fail(
+                    EXIT_CONFIG,
+                    format!(
+                        "--value-file {} is a terminal: reading a secret from one echoes it \
+                         on screen. Pipe the value in, or point at a regular file",
+                        path.display()
+                    ),
+                ));
+            }
+            read_bounded(file, &mut buf).map_err(|e| {
+                fail(
+                    EXIT_CONFIG,
+                    format!("cannot read --value-file {}: {e}", path.display()),
+                )
+            })?;
+        }
+        _ => {
+            let stdin = std::io::stdin();
+            if stdin.is_terminal() {
+                // The terminal driver echoes what is typed, so an interactive
+                // prompt would print the credential on screen and into any
+                // session recording — exactly what this tool exists to avoid.
+                return Err(fail(
+                    EXIT_CONFIG,
+                    "refusing to read a secret from a terminal (it would be echoed on screen): \
+                     pipe the value in, or use --value-file",
+                ));
+            }
+            read_bounded(stdin.lock(), &mut buf).map_err(|e| {
+                fail(
+                    EXIT_CONFIG,
+                    format!("cannot read the secret from stdin: {e}"),
+                )
+            })?;
+        }
+    }
+    if !raw && strip_trailing_newline(&mut buf) {
+        eprintln!("keychute: stripped the trailing newline (pass --raw to keep it)");
+    }
+    // The cap applies to the CREDENTIAL, so it is enforced after normalization:
+    // a full-size secret plus the shell's `\n` is a full-size secret, and the
+    // reader deliberately allows that much headroom.
+    if buf.len() > MAX_SECRET_BYTES {
+        buf.zeroize();
+        return Err(fail(
+            EXIT_CONFIG,
+            format!("the secret value exceeds {MAX_SECRET_BYTES} bytes"),
+        ));
+    }
+    if buf.is_empty() {
+        return Err(fail(EXIT_CONFIG, "the secret value is empty"));
+    }
+    Ok(buf)
+}
+
+/// Read at most [`MAX_SECRET_BYTES`] plus newline headroom, then stop. Both
+/// sources are attacker-or-accident shaped — a mistaken `--value-file
+/// /dev/zero`, a stuck producer upstream in the pipe — and the server would
+/// refuse anything over the limit anyway, so the bound belongs here rather than
+/// after an unbounded read into memory.
+///
+/// The headroom is `\r\n` plus one byte: enough that a maximum-size credential
+/// followed by a shell newline still arrives intact (the caller strips it and
+/// then enforces the real cap), and one byte beyond that so oversize input is
+/// still detectable rather than silently truncated.
+fn read_bounded(source: impl Read, buf: &mut Vec<u8>) -> std::io::Result<()> {
+    const HEADROOM: u64 = 3;
+    source
+        .take(MAX_SECRET_BYTES as u64 + HEADROOM)
+        .read_to_end(buf)?;
+    if buf.len() as u64 > MAX_SECRET_BYTES as u64 + HEADROOM - 1 {
+        // `clear()` only drops the length — overwrite first, or the fragment
+        // stays in the allocation for `Zeroizing`'s drop to miss.
+        buf.zeroize();
+        buf.clear();
+        return Err(std::io::Error::other(format!(
+            "the secret value exceeds {MAX_SECRET_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+/// Drop exactly one trailing newline (`\n` or `\r\n`) — the one `echo` and
+/// heredocs add. Returns whether anything was stripped. A second trailing
+/// newline, or interior whitespace, is left alone: it could be part of the
+/// credential (a PEM block ends in a newline; two do not).
+fn strip_trailing_newline(buf: &mut Vec<u8>) -> bool {
+    if buf.last() != Some(&b'\n') {
+        return false;
+    }
+    buf.pop();
+    if buf.last() == Some(&b'\r') {
+        buf.pop();
+    }
+    true
+}
+
+/// Store a new secret. Deliberately a single attempt with no retry: unlike
+/// `request`, this call is not idempotent — a retry after a lost response
+/// would hit the server's create-only refusal and report a conflict for a
+/// secret this very invocation stored. The failure message says so, so the
+/// caller checks the store rather than blindly re-running.
+async fn run_store(cfg: &Config, http: &reqwest::Client, args: StoreArgs) -> CliResult<()> {
+    let StoreArgs {
+        secret_name,
+        value_file,
+        description,
+        max_tier,
+        injection_kind,
+        injection_header,
+        raw,
+    } = args;
+    let tier = parse_tier(&max_tier)
+        .ok_or_else(|| fail(EXIT_CONFIG, format!("unknown max-tier {max_tier:?}")))?;
+    let value = read_secret_input(value_file.as_ref(), raw)?;
+    // utf8 when it round-trips, base64 otherwise (binary keys, DER blobs).
+    let (encoded, encoding) = match std::str::from_utf8(&value) {
+        Ok(s) => (Zeroizing::new(s.to_owned()), SecretEncoding::Utf8),
+        Err(_) => (
+            Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(&*value)),
+            SecretEncoding::Base64,
+        ),
+    };
+
+    let mut body = StoreSecretRequest {
+        name: secret_name,
+        value: encoded.to_string(),
+        encoding,
+        description,
+        max_tier: Some(tier),
+        injection_kind: Some(injection_kind),
+        injection_header,
+    };
+    // Serialize here rather than handing the struct to `.json()`, so the
+    // plaintext copy inside the DTO can be wiped immediately instead of living
+    // through the whole HTTP exchange and being freed intact. The serialized
+    // buffer zeroizes on drop. Best-effort past this point, same as the server
+    // side: reqwest and rustls make their own copies we do not own.
+    let payload = Zeroizing::new(serde_json::to_vec(&body).map_err(|e| {
+        fail(
+            EXIT_OTHER,
+            format!("failed encoding the store request: {e}"),
+        )
+    })?);
+    body.value.zeroize();
+
+    let resp = http
+        .post(format!("{}/v1/secrets", cfg.url))
+        .bearer_auth(cfg.bearer()?)
+        .timeout(Duration::from_secs(HTTP_TIMEOUT_SECONDS))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(payload.to_vec())
+        .send()
+        .await
+        .map_err(|e| fail(EXIT_OTHER, ambiguous(format!("store request failed: {e}"))))?;
+    let status = resp.status();
+    let text = resp.text().await.map_err(|e| {
+        fail(
+            EXIT_OTHER,
+            ambiguous(format!("failed reading store response: {e}")),
+        )
+    })?;
+    if !status.is_success() {
+        let msg = api_error_message(status, &text);
+        let code = match status.as_u16() {
+            401 => EXIT_CONFIG,
+            403 => EXIT_DENIED,
+            _ => EXIT_OTHER,
+        };
+        if status == reqwest::StatusCode::CONFLICT {
+            return Err(fail(
+                code,
+                format!(
+                    "store failed: {msg}. Keychute never replaces a stored secret from the CLI: \
+                     pick a different name, or ask the operator to rotate it"
+                ),
+            ));
+        }
+        // A 5xx proves nothing about what was written: a gateway that timed
+        // out after Keychute committed synthesizes 502/504 all the same. Same
+        // warning as a dropped connection.
+        if status.is_server_error() {
+            return Err(fail(code, ambiguous(format!("store failed: {msg}"))));
+        }
+        // A definitive 4xx (bad request, denied, over the rate cap) means the
+        // server rejected the deposit before writing anything.
+        return Err(fail(code, format!("store failed: {msg}")));
+    }
+    let stored: StoreSecretResponse = serde_json::from_str(&text).map_err(|e| {
+        fail(
+            EXIT_OTHER,
+            ambiguous(format!("unexpected store response: {e}")),
+        )
+    })?;
+    // Diagnostics only, and never the value: stdout stays free for pipelines.
+    eprintln!(
+        "keychute: stored {} (version {}, id {})",
+        stored.name, stored.version, stored.secret_id
+    );
+    Ok(())
+}
+
+/// Annotate a `store` failure whose outcome the client cannot know: the server
+/// may well have committed the secret and lost only the response. Rerunning
+/// would then hit the create-only refusal and report a conflict for a secret
+/// this very invocation stored — so the caller has to look before choosing
+/// another name or retrying.
+fn ambiguous(message: String) -> String {
+    format!(
+        "{message}. The secret MAY already have been stored (the request was sent): \
+         check the store before retrying or picking another name"
+    )
+}
+
+fn parse_tier(s: &str) -> Option<Tier> {
+    match s {
+        "brokered" => Some(Tier::Brokered),
+        "trusted-client" => Some(Tier::TrustedClient),
+        "cooperating-client" => Some(Tier::CooperatingClient),
+        "direct" => Some(Tier::Direct),
+        _ => None,
+    }
+}
+
 async fn run_status(cfg: &Config, http: &reqwest::Client, request_id: &str) -> CliResult<()> {
     let id: Uuid = request_id
         .parse()
@@ -771,6 +1061,7 @@ async fn run(cli: Cli) -> CliResult<()> {
     let http = build_http_client(&cfg)?;
     match cli.cmd {
         Cmd::Request(args) => run_request(&cfg, &http, args).await,
+        Cmd::Store(args) => run_store(&cfg, &http, args).await,
         Cmd::Status { request_id } => run_status(&cfg, &http, &request_id).await,
     }
 }
@@ -863,6 +1154,109 @@ mod tests {
             }
             _ => panic!("expected request subcommand"),
         }
+    }
+
+    #[test]
+    fn store_arg_defaults_are_the_tightest() {
+        let cli = Cli::parse_from(["keychute", "store", "new-key"]);
+        match cli.cmd {
+            Cmd::Store(args) => {
+                assert_eq!(args.secret_name, "new-key");
+                assert_eq!(args.value_file, None);
+                assert_eq!(args.description, "");
+                // Tightest tier by default: a deposit must not quietly become
+                // the most releasable thing in the store.
+                assert_eq!(args.max_tier, "brokered");
+                assert_eq!(args.injection_kind, "bearer");
+                assert_eq!(args.injection_header, None);
+                assert!(!args.raw);
+            }
+            _ => panic!("expected store subcommand"),
+        }
+    }
+
+    #[test]
+    fn store_has_no_value_flag() {
+        // The value never travels in argv (visible in `ps`, shell history).
+        assert!(Cli::try_parse_from(["keychute", "store", "k", "--value", "s3kr1t"]).is_err());
+    }
+
+    #[test]
+    fn store_tier_parsing() {
+        assert_eq!(parse_tier("brokered"), Some(Tier::Brokered));
+        assert_eq!(
+            parse_tier("cooperating-client"),
+            Some(Tier::CooperatingClient)
+        );
+        assert_eq!(parse_tier("direct"), Some(Tier::Direct));
+        assert_eq!(parse_tier("Brokered"), None);
+        assert_eq!(parse_tier("nonsense"), None);
+    }
+
+    #[test]
+    fn bounded_read_refuses_oversize_input() {
+        // At the limit: fine.
+        let mut buf = Vec::new();
+        let at_limit = vec![b'x'; MAX_SECRET_BYTES];
+        read_bounded(at_limit.as_slice(), &mut buf).unwrap();
+        assert_eq!(buf.len(), MAX_SECRET_BYTES);
+        // Past the newline headroom: rejected locally, and the buffer is not
+        // left holding a partial secret.
+        let mut buf = Vec::new();
+        let over = vec![b'x'; MAX_SECRET_BYTES + 3];
+        let err = read_bounded(over.as_slice(), &mut buf).unwrap_err();
+        assert!(err.to_string().contains("exceeds"), "{err}");
+        assert!(buf.is_empty());
+        // An endless producer stops at the bound instead of eating memory.
+        let mut buf = Vec::new();
+        assert!(read_bounded(std::io::repeat(b'x'), &mut buf).is_err());
+    }
+
+    #[test]
+    fn a_full_size_secret_survives_its_shell_newline() {
+        // MAX + "\n" must reach the caller intact so the newline can be
+        // stripped and the credential accepted at exactly the cap.
+        let mut input = vec![b'x'; MAX_SECRET_BYTES];
+        input.push(b'\n');
+        let mut buf = Vec::new();
+        read_bounded(input.as_slice(), &mut buf).unwrap();
+        assert!(strip_trailing_newline(&mut buf));
+        assert_eq!(buf.len(), MAX_SECRET_BYTES);
+
+        // Same with CRLF.
+        let mut input = vec![b'x'; MAX_SECRET_BYTES];
+        input.extend_from_slice(b"\r\n");
+        let mut buf = Vec::new();
+        read_bounded(input.as_slice(), &mut buf).unwrap();
+        assert!(strip_trailing_newline(&mut buf));
+        assert_eq!(buf.len(), MAX_SECRET_BYTES);
+    }
+
+    #[test]
+    fn ambiguous_failures_say_the_secret_may_be_stored() {
+        let msg = ambiguous("store request failed: connection reset".into());
+        assert!(msg.contains("connection reset"));
+        assert!(msg.contains("MAY already have been stored"));
+        assert!(msg.contains("check the store"));
+    }
+
+    #[test]
+    fn trailing_newline_stripping_is_exactly_one() {
+        let mut b = b"s3kr1t\n".to_vec();
+        assert!(strip_trailing_newline(&mut b));
+        assert_eq!(b, b"s3kr1t");
+        // CRLF counts as the same one newline.
+        let mut b = b"s3kr1t\r\n".to_vec();
+        assert!(strip_trailing_newline(&mut b));
+        assert_eq!(b, b"s3kr1t");
+        // A second newline is content, not shell noise.
+        let mut b = b"pem\n\n".to_vec();
+        assert!(strip_trailing_newline(&mut b));
+        assert_eq!(b, b"pem\n");
+        // Nothing to strip.
+        let mut b = b"s3kr1t".to_vec();
+        assert!(!strip_trailing_newline(&mut b));
+        assert_eq!(b, b"s3kr1t");
     }
 
     #[test]

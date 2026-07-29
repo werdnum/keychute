@@ -58,6 +58,11 @@ data:
           {{- range .mechanisms }}
           - {{ . | quote }}
           {{- end }}
+        {{- if .mayStoreSecrets }}
+        # Lets this client DEPOSIT new secrets (POST /v1/secrets). Create-only:
+        # it can never replace a stored secret, and never raises its own tier.
+        may_store_secrets: true
+        {{- end }}
         auth:
           {{- with .auth.apiTokenSha256 }}
           api_token_sha256: {{ . | lower | quote }}
@@ -93,3 +98,4 @@ data:
       replay_window_seconds: {{ .Values.limits.replayWindowSeconds | int64 }}
       drain_seconds: {{ .Values.limits.drainSeconds | int64 }}
       max_proxy_streams_per_client: {{ .Values.limits.maxProxyStreamsPerClient | int64 }}
+      max_deposits_per_hour_per_client: {{ .Values.limits.maxDepositsPerHourPerClient | int64 }}

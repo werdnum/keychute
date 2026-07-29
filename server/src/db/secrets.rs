@@ -12,8 +12,17 @@ pub struct SecretRow {
     pub max_tier: i32,
     pub injection_kind: String,
     pub injection_header: Option<String>,
+    /// Basic-auth username (migration 0003). Selected alongside the header so
+    /// the UI can show which account a template targets — for kind 'basic' the
+    /// proxy builds the Authorization header from THIS field, so an operator
+    /// reviewing a client deposit has to be able to see it.
+    pub injection_username: Option<String>,
     pub current_version: i32,
     pub enabled: bool,
+    /// Has an operator ever seen this value? False for a client deposit until
+    /// one reviews it (migration 0007): the policy engine keeps such a secret
+    /// under the same "never auto-approve" clamp as one that does not exist.
+    pub operator_vetted: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -94,6 +103,136 @@ pub async fn insert_secret_version(
     Ok(row)
 }
 
+/// Outcome of a client-initiated deposit. The rate decision lives here rather
+/// than in the handler because it is only meaningful when taken atomically
+/// with the write (see [`create_secret_from_client`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DepositOutcome {
+    Created(Uuid),
+    /// A secret of that name already exists — 409, never a rotation.
+    NameTaken,
+    /// The client's hourly deposit cap is already spent — 429.
+    RateLimited,
+}
+
+/// Client-initiated deposit (`POST /v1/secrets`): create a secret with its
+/// version 1, but ONLY if the name is free and the client is under its hourly
+/// deposit cap.
+///
+/// Create-only by construction: `ON CONFLICT (name) DO NOTHING` decides inside
+/// the transaction, so two concurrent deposits (or a deposit racing an
+/// operator's `POST /ui/secrets`) cannot both win, and a client can never
+/// replace credential bytes an operator already reviewed. Rotation stays
+/// operator-only.
+///
+/// The rate cap is enforced in the SAME transaction, behind a per-client
+/// advisory lock taken first: without it, N concurrent deposits could each read
+/// the pre-deposit count, all pass, and all insert — the cap would bound
+/// nothing but a serial client. The lock serializes one client's deposits
+/// against each other only; different clients never contend.
+///
+/// Same crypto discipline as [`crate::db::ui_ext::create_secret_with_version`]:
+/// the KEK shared lock is taken before sealing and the payload is sealed inside
+/// the writing transaction (addendum #19). The `secret-created` audit row joins
+/// the same transaction and records the depositing client — which is also what
+/// the cap counts, so the count can never drift from what actually happened.
+pub async fn create_secret_from_client(
+    db: &PgPool,
+    store: crate::db::ui_ext::StoreSecretParams<'_>,
+    client_name: &str,
+    rate: DepositRate,
+) -> anyhow::Result<DepositOutcome> {
+    let mut tx = db.begin().await?;
+    // Per-client serialization for the count-then-insert below. Taken before
+    // the KEK lock, and in that fixed order everywhere, so the two can never
+    // deadlock against each other.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('keychute-deposit'), hashtext($1))")
+        .bind(client_name)
+        .execute(&mut *tx)
+        .await?;
+    // `kind` is interpolated, not bound — it is a compile-time constant, never
+    // caller data, and the partial index this count relies on
+    // (`audit_log_client_deposits_idx`, migration 0008) is predicated on the
+    // literal. A bound `kind = $1` cannot be proven to imply that predicate
+    // when the planner builds a generic plan, so the index would sometimes be
+    // skipped and the count would fall back to scanning the window — inside
+    // the per-client lock.
+    let recent: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM audit_log \
+         WHERE kind = '{}' AND client_name = $1 AND at > now() - make_interval(hours => $2)",
+        crate::audit::kinds::SECRET_CREATED
+    ))
+    .bind(client_name)
+    .bind(rate.window_hours)
+    .fetch_one(&mut *tx)
+    .await?;
+    if recent >= rate.max_per_window {
+        tx.rollback().await?;
+        return Ok(DepositOutcome::RateLimited);
+    }
+    super::take_kek_shared_lock(&mut tx).await?;
+    let inserted = sqlx::query(
+        // `operator_vetted = false`: nobody has looked at these bytes. Until
+        // someone does, the policy engine treats this row like an absent one
+        // for auto-approve/notify-only purposes (migration 0007).
+        "INSERT INTO secrets \
+         (id, name, description, max_tier, injection_kind, injection_header, \
+          injection_username, current_version, operator_vetted) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 1, false) \
+         ON CONFLICT (name) DO NOTHING",
+    )
+    .bind(store.secret_id)
+    .bind(&store.name)
+    .bind(&store.description)
+    .bind(store.max_tier)
+    .bind(&store.injection_kind)
+    .bind(&store.injection_header)
+    .bind(&store.injection_username)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if inserted == 0 {
+        tx.rollback().await?;
+        return Ok(DepositOutcome::NameTaken);
+    }
+    let sealed = (store.seal)().map_err(|e| anyhow::anyhow!("sealing secret: {e}"))?;
+    sqlx::query(
+        "INSERT INTO secret_versions \
+         (secret_id, version, ciphertext, nonce, wrapped_dek, kek_id) \
+         VALUES ($1, 1, $2, $3, $4, $5)",
+    )
+    .bind(store.secret_id)
+    .bind(&sealed.ciphertext)
+    .bind(&sealed.nonce)
+    .bind(&sealed.wrapped_dek)
+    .bind(&sealed.kek_id)
+    .execute(&mut *tx)
+    .await?;
+    crate::audit::insert_audit(
+        &mut *tx,
+        &crate::audit::AuditEvent {
+            kind: crate::audit::kinds::SECRET_CREATED,
+            client_name: Some(client_name.to_owned()),
+            secret_name: Some(store.name.clone()),
+            actor: Some(format!("client:{client_name}")),
+            // Server vocabulary only — how the row got here, never its content.
+            detail: Some(serde_json::json!({"source": "client-api"})),
+            ..Default::default()
+        },
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(DepositOutcome::Created(store.secret_id))
+}
+
+/// The deposit rate cap: at most `max_per_window` deposits per client per
+/// rolling `window_hours`.
+#[derive(Debug, Clone, Copy)]
+pub struct DepositRate {
+    pub max_per_window: i64,
+    pub window_hours: i32,
+}
+
 pub async fn get_secret_by_name(db: &PgPool, name: &str) -> anyhow::Result<Option<SecretRow>> {
     Ok(
         sqlx::query_as::<_, SecretRow>("SELECT * FROM secrets WHERE name = $1")
@@ -143,6 +282,83 @@ pub async fn count_secrets(db: &PgPool) -> anyhow::Result<i64> {
     Ok(sqlx::query_scalar("SELECT count(*) FROM secrets")
         .fetch_one(db)
         .await?)
+}
+
+/// Record that an operator has reviewed a client-deposited secret, lifting the
+/// policy engine's "never auto-approve an unvetted secret" clamp.
+///
+/// `reviewed_version` is the version whose plaintext the operator was actually
+/// shown: the update only lands if that is still `current_version`. Without
+/// that binding "reviewed" would mean "clicked a button" — a rotation landing
+/// between the reveal and the confirmation would vet bytes nobody saw. Returns
+/// false when the row is already vetted, absent, or has moved on.
+pub async fn mark_secret_vetted(
+    db: &PgPool,
+    secret_id: Uuid,
+    reviewed_version: i32,
+    actor: &str,
+) -> anyhow::Result<bool> {
+    let mut tx = db.begin().await?;
+    let updated = sqlx::query(
+        "UPDATE secrets SET operator_vetted = true, updated_at = now() \
+         WHERE id = $1 AND NOT operator_vetted AND current_version = $2",
+    )
+    .bind(secret_id)
+    .bind(reviewed_version)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if updated == 0 {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    let name: String = sqlx::query_scalar("SELECT name FROM secrets WHERE id = $1")
+        .bind(secret_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    crate::audit::insert_audit(
+        &mut *tx,
+        &crate::audit::AuditEvent {
+            kind: crate::audit::kinds::SECRET_VETTED,
+            secret_name: Some(name),
+            actor: Some(actor.to_owned()),
+            // Which bytes the operator signed off on.
+            detail: Some(serde_json::json!({"version": reviewed_version})),
+            ..Default::default()
+        },
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// Which client deposited this secret, and when, from the audit log — the
+/// deposit's own append-only record (`secret-created` with a client_name;
+/// operator-created rows have none). Powers the review page's "who put this
+/// here", which is the part of a deposit an operator can actually judge.
+pub async fn client_deposit_origin(
+    db: &PgPool,
+    secret_name: &str,
+) -> anyhow::Result<Option<(String, DateTime<Utc>)>> {
+    Ok(sqlx::query_as::<_, (String, DateTime<Utc>)>(
+        "SELECT client_name, at FROM audit_log \
+         WHERE kind = 'secret-created' AND secret_name = $1 AND client_name IS NOT NULL \
+         ORDER BY id LIMIT 1",
+    )
+    .bind(secret_name)
+    .fetch_optional(db)
+    .await?)
+}
+
+/// Names of secrets no operator has reviewed yet. Small by construction (a
+/// deposit is rate-capped and reviewing clears the flag), so the policy page
+/// can warn about them without pagination.
+pub async fn list_unvetted_secret_names(db: &PgPool) -> anyhow::Result<Vec<String>> {
+    Ok(
+        sqlx::query_scalar("SELECT name FROM secrets WHERE NOT operator_vetted ORDER BY name")
+            .fetch_all(db)
+            .await?,
+    )
 }
 
 /// Replace the tag set for a secret.

@@ -132,6 +132,7 @@ pub struct SpawnOpts {
     pub request_expiry_seconds: i64,
     pub proxy_max_body_bytes: usize,
     pub replay_window_seconds: i64,
+    pub max_deposits_per_hour_per_client: i64,
     /// Full replacement for the default `clients:` YAML block when set.
     pub clients_yaml: Option<String>,
 }
@@ -144,6 +145,7 @@ impl Default for SpawnOpts {
             request_expiry_seconds: 3600,
             proxy_max_body_bytes: 10 * 1024 * 1024,
             replay_window_seconds: 3,
+            max_deposits_per_hour_per_client: 20,
             clients_yaml: None,
         }
     }
@@ -430,6 +432,7 @@ impl TestEnv {
                  \x20 - name: k8s-agent\n\
                  \x20   max_tier: cooperating-client\n\
                  \x20   mechanisms: [cli-read]\n\
+                 \x20   may_store_secrets: true\n\
                  \x20   auth:\n\
                  \x20     api_token_sha256: \"{k8s}\"\n",
                 fa = sha256_hex(FA_TOKEN),
@@ -460,7 +463,8 @@ impl TestEnv {
              \x20 proxy_max_body_bytes: {max_body}\n\
              \x20 proxy_stream_deadline_seconds: 300\n\
              \x20 replay_window_seconds: {replay}\n\
-             \x20 max_proxy_streams_per_client: 8\n",
+             \x20 max_proxy_streams_per_client: 8\n\
+             \x20 max_deposits_per_hour_per_client: {max_deposits}\n",
             keyset = keyset_path.display(),
             ca = ca_path.display(),
             operator_hash = sha256_hex(OPERATOR_TOKEN),
@@ -469,6 +473,7 @@ impl TestEnv {
             expiry = opts.request_expiry_seconds,
             max_body = opts.proxy_max_body_bytes,
             replay = opts.replay_window_seconds,
+            max_deposits = opts.max_deposits_per_hour_per_client,
         );
         let config_path = dir.path().join("config.yaml");
         std::fs::write(&config_path, config)?;

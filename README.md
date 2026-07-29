@@ -15,7 +15,10 @@ v1 server-side implementation (design milestones M0–M3) plus packaging:
   (idempotent access requests, wait endpoint, grant read with idempotent
   replay, brokered proxy), server-rendered approval UI with CSRF, Pushover
   notifier with request-row outbox, audit log.
-- `cli/` — the `keychute` CLI (`keychute request <secret> | consumer…`).
+- `cli/` — the `keychute` CLI: `keychute request <secret> | consumer…` to get a
+  secret out (human approval in the loop), and `… | keychute store <secret>` to
+  deposit a new one (opt-in per client, create-only — it never replaces a
+  stored secret).
 - `types/` — shared API types.
 - `e2e/` — black-box end-to-end suite: each test boots a fresh Postgres
   database, a real server process, a TLS recording upstream, a fake Pushover,

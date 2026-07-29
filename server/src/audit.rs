@@ -21,6 +21,11 @@ pub mod kinds {
     pub const PROXY_COMPLETED: &str = "proxy-completed";
     pub const SECRET_CREATED: &str = "secret-created";
     pub const SECRET_ROTATED: &str = "secret-rotated";
+    /// An operator reviewed a client-deposited secret (migration 0007).
+    pub const SECRET_VETTED: &str = "secret-vetted";
+    /// An operator displayed a stored secret's plaintext in the UI, to review
+    /// a client deposit before vetting it.
+    pub const SECRET_REVEALED: &str = "secret-revealed";
     pub const POLICY_CREATED: &str = "policy-created";
     pub const POLICY_DELETED: &str = "policy-deleted";
 }
