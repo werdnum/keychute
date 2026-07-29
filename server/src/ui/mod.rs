@@ -1446,6 +1446,13 @@ async fn render_request_detail(
                                                 ", max tier: "
                                                 (Tier::from_int(s.max_tier)
                                                     .map(|t| t.as_str()).unwrap_or("?"))
+                                                // Substituting is a human decision, so an
+                                                // unreviewed deposit is a legitimate choice
+                                                // here — but the operator should know they
+                                                // are handing over bytes a CLIENT chose.
+                                                @if !s.operator_vetted {
+                                                    ", deposited by a client, unreviewed"
+                                                }
                                                 ")"
                                             }
                                         }
@@ -3272,8 +3279,10 @@ mod tests {
             max_tier: Tier::Direct.as_int(),
             injection_kind: "bearer".into(),
             injection_header: None,
+            injection_username: None,
             current_version: version,
             enabled: true,
+            operator_vetted: true,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
