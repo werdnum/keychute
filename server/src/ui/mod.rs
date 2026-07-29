@@ -1760,11 +1760,26 @@ async fn approve(
     };
     let approved =
         db::ui_ext::approve_request(&state.db, id, &op.subject, grant_id, &grant, store).await?;
-    if approved.is_none() {
-        return Err(UiError::new(
-            StatusCode::CONFLICT,
-            "request was resolved or expired concurrently",
-        ));
+    match approved {
+        db::ui_ext::ApproveOutcome::Approved(_) => {}
+        db::ui_ext::ApproveOutcome::NotApprovable => {
+            return Err(UiError::new(
+                StatusCode::CONFLICT,
+                "request was resolved or expired concurrently",
+            ));
+        }
+        db::ui_ext::ApproveOutcome::SecretNameTaken => {
+            // A client deposit (or another operator) stored that name between
+            // this page rendering and the approve. Nothing was approved and
+            // nothing was overwritten: re-render so the operator decides
+            // against the secret that now exists.
+            return Err(UiError::new(
+                StatusCode::CONFLICT,
+                "a secret with that name was stored while you were reviewing. \
+                 Nothing was approved — reload the request and decide against \
+                 the secret that is now stored.",
+            ));
+        }
     }
     state.resolve_notify.notify_waiters();
     Ok(Redirect::to("/ui/requests").into_response())

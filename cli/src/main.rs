@@ -222,8 +222,15 @@ impl Config {
 }
 
 fn build_http_client(cfg: &Config) -> CliResult<reqwest::Client> {
-    let mut builder =
-        reqwest::Client::builder().user_agent(concat!("keychute-cli/", env!("CARGO_PKG_VERSION")));
+    // Never follow redirects. Every call here carries the bearer token, `read`
+    // carries a released secret back, and `store` carries the credential in
+    // the request BODY — which a 307/308 replays verbatim at the new origin
+    // even where reqwest would strip a cross-origin `Authorization` header. A
+    // redirect from a secrets API is a misconfiguration or an attack, not a
+    // route to follow; it surfaces as a 3xx error instead.
+    let mut builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(concat!("keychute-cli/", env!("CARGO_PKG_VERSION")));
     if let Some(path) = &cfg.ca_bundle {
         let pem = std::fs::read(path).map_err(|e| {
             fail(
@@ -794,6 +801,20 @@ fn read_secret_input(source: Option<&PathBuf>, raw: bool) -> CliResult<Zeroizing
                     format!("cannot read --value-file {}: {e}", path.display()),
                 )
             })?;
+            // `--value-file /dev/tty` (or /dev/stdin, /proc/self/fd/0 when
+            // stdin is the terminal) would route around the refusal below and
+            // have the terminal driver echo the typed credential. The check
+            // belongs on the opened descriptor, not the path spelling.
+            if file.is_terminal() {
+                return Err(fail(
+                    EXIT_CONFIG,
+                    format!(
+                        "--value-file {} is a terminal: reading a secret from one echoes it \
+                         on screen. Pipe the value in, or point at a regular file",
+                        path.display()
+                    ),
+                ));
+            }
             read_bounded(file, &mut buf).map_err(|e| {
                 fail(
                     EXIT_CONFIG,

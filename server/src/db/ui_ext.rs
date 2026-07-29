@@ -34,14 +34,25 @@ pub struct StoreSecretParams<'a> {
     pub seal: SealFn<'a>,
 }
 
+/// Outcome of [`approve_request`]. Every non-`Approved` variant means nothing
+/// was written at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApproveOutcome {
+    Approved(Uuid),
+    /// The request was resolved or expired concurrently.
+    NotApprovable,
+    /// "Also store this secret" lost a race for the name — a client deposit
+    /// (`POST /v1/secrets`) or another operator got there first.
+    SecretNameTaken,
+}
+
 /// Approve a pending request with an app-supplied grant id (required for
 /// passthrough payloads, whose AAD binds the grant id before insert).
 ///
 /// One transaction: flip `pending -> approved` (rowcount-checked, incl.
 /// `now() < expires_at` per addendum #8), optionally create the secret +
 /// version 1 (addendum #16, sealed here under the KEK shared lock), insert the
-/// grant, audit. Returns `None` — with nothing written — when the request was
-/// not approvable.
+/// grant, audit. Nothing is written unless the whole thing succeeds.
 pub async fn approve_request(
     db: &PgPool,
     request_id: Uuid,
@@ -49,7 +60,7 @@ pub async fn approve_request(
     grant_id: Uuid,
     grant: &GrantParams,
     store: Option<StoreSecretParams<'_>>,
-) -> anyhow::Result<Option<Uuid>> {
+) -> anyhow::Result<ApproveOutcome> {
     let mut tx = db.begin().await?;
     // Only the stored-secret path inserts a KEYSET-wrapped DEK. A passthrough
     // payload is wrapped under the process-local ephemeral KEK, which is not in
@@ -74,7 +85,7 @@ pub async fn approve_request(
     .execute(&mut *tx)
     .await?;
     if updated.rows_affected() != 1 {
-        return Ok(None);
+        return Ok(ApproveOutcome::NotApprovable);
     }
 
     if let Some(s) = store {
@@ -82,11 +93,17 @@ pub async fn approve_request(
         // so the key this picks cannot be retired before the version row
         // commits (addendum #19).
         let sealed = (s.seal)().map_err(|e| anyhow::anyhow!("sealing secret: {e}"))?;
-        sqlx::query(
+        // The approval page rendered against "no such secret" and the handler
+        // rechecked it, but a client deposit (`POST /v1/secrets`) can claim the
+        // name in the gap. Losing that race must roll the approval back with a
+        // 409 the operator can act on — not a unique violation surfacing as a
+        // 500 — and must never touch the bytes the winner stored.
+        let inserted = sqlx::query(
             "INSERT INTO secrets \
              (id, name, description, max_tier, injection_kind, injection_header, \
               injection_username, current_version) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, 1)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 1) \
+             ON CONFLICT (name) DO NOTHING",
         )
         .bind(s.secret_id)
         .bind(&s.name)
@@ -96,7 +113,12 @@ pub async fn approve_request(
         .bind(&s.injection_header)
         .bind(&s.injection_username)
         .execute(&mut *tx)
-        .await?;
+        .await?
+        .rows_affected();
+        if inserted == 0 {
+            tx.rollback().await?;
+            return Ok(ApproveOutcome::SecretNameTaken);
+        }
         sqlx::query(
             "INSERT INTO secret_versions \
              (secret_id, version, ciphertext, nonce, wrapped_dek, kek_id, created_by_request) \
@@ -166,7 +188,7 @@ pub async fn approve_request(
     )
     .await?;
     tx.commit().await?;
-    Ok(Some(grant_id))
+    Ok(ApproveOutcome::Approved(grant_id))
 }
 
 /// Create a secret with its version 1 from the admin UI (`POST /ui/secrets`),
@@ -502,7 +524,7 @@ mod tests {
         let mut params = grant_params(None);
         params.not_after = Utc::now() - Duration::seconds(1);
         let got = approve_request(db, row.id, "andrew", Uuid::new_v4(), &params, None).await?;
-        assert!(got.is_none());
+        assert_eq!(got, ApproveOutcome::NotApprovable);
         // Nothing was written: the request is still pending and approvable.
         let r = crate::db::get_request(db, row.id).await?.unwrap();
         assert_eq!(r.state, "pending");
@@ -549,7 +571,7 @@ mod tests {
             Some(store),
         )
         .await?;
-        assert_eq!(got, Some(grant_id));
+        assert_eq!(got, ApproveOutcome::Approved(grant_id));
         let secret = crate::db::get_secret_by_name(db, "s1").await?.unwrap();
         assert_eq!(secret.current_version, 1);
         let version = crate::db::get_secret_version(db, secret.id, 1)
@@ -570,7 +592,7 @@ mod tests {
                 None
             )
             .await?,
-            None
+            ApproveOutcome::NotApprovable
         );
 
         // Passthrough path.
@@ -580,7 +602,7 @@ mod tests {
             PassthroughPayload::seal(&ephemeral, g2, &SecretBox::new(b"once".as_slice().into()))
                 .unwrap();
         let got = approve_request(db, row2.id, "andrew", g2, &grant_params(Some(pt)), None).await?;
-        assert_eq!(got, Some(g2));
+        assert_eq!(got, ApproveOutcome::Approved(g2));
         let grant = crate::db::get_grant(db, g2).await?.unwrap();
         assert!(grant.passthrough_ephemeral);
         let opened = ephemeral
@@ -606,8 +628,103 @@ mod tests {
                 None
             )
             .await?,
-            None
+            ApproveOutcome::NotApprovable
         );
+
+        t.teardown().await;
+        Ok(())
+    }
+
+    /// A client deposit can claim the name between the approval page rendering
+    /// and the approve transaction. That must roll the whole approval back —
+    /// no grant, request still pending — rather than fail on a unique
+    /// violation (a 500 for the operator) or touch the winner's bytes.
+    #[tokio::test]
+    async fn approve_with_store_loses_a_name_race_cleanly() -> anyhow::Result<()> {
+        let Some(t) = setup().await? else {
+            return Ok(());
+        };
+        let db = &t.pool;
+        let keyset = test_keyset();
+
+        // The client's deposit lands first.
+        let deposited_id = Uuid::new_v4();
+        crate::db::create_secret_from_client(
+            db,
+            StoreSecretParams {
+                secret_id: deposited_id,
+                name: "contested".into(),
+                description: "from the client".into(),
+                max_tier: 0,
+                injection_kind: "bearer".into(),
+                injection_header: None,
+                injection_username: None,
+                seal: Box::new(|| {
+                    keyset.seal(
+                        &SecretBox::new(b"client-value".as_slice().into()),
+                        AadContext::SecretVersion {
+                            secret_id: deposited_id,
+                            version: 1,
+                        },
+                    )
+                }),
+            },
+            "k8s-agent",
+            crate::db::DepositRate {
+                max_per_window: 10,
+                window_hours: 1,
+            },
+        )
+        .await?;
+
+        // The operator approves with "also store this", against a page that
+        // rendered before the deposit existed.
+        let row = insert_pending(
+            db,
+            "contested",
+            "k-race",
+            Utc::now() + Duration::seconds(600),
+        )
+        .await?;
+        let secret_id = Uuid::new_v4();
+        let got = approve_request(
+            db,
+            row.id,
+            "andrew",
+            Uuid::new_v4(),
+            &grant_params(None),
+            Some(StoreSecretParams {
+                secret_id,
+                name: "contested".into(),
+                description: "from the operator".into(),
+                max_tier: 2,
+                injection_kind: "bearer".into(),
+                injection_header: None,
+                injection_username: None,
+                seal: Box::new(|| {
+                    keyset.seal(
+                        &SecretBox::new(b"operator-value".as_slice().into()),
+                        AadContext::SecretVersion {
+                            secret_id,
+                            version: 1,
+                        },
+                    )
+                }),
+            }),
+        )
+        .await?;
+        assert_eq!(got, ApproveOutcome::SecretNameTaken);
+
+        // Nothing was written: the request is still pending and approvable,
+        // and the deposited row is untouched.
+        let r = crate::db::get_request(db, row.id).await?.unwrap();
+        assert_eq!(r.state, "pending");
+        let secret = crate::db::get_secret_by_name(db, "contested")
+            .await?
+            .unwrap();
+        assert_eq!(secret.id, deposited_id);
+        assert_eq!(secret.description, "from the client");
+        assert_eq!(secret.current_version, 1);
 
         t.teardown().await;
         Ok(())

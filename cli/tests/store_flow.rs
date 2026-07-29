@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use axum::extract::State;
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 
@@ -16,13 +17,36 @@ struct MockState {
     bodies: Arc<Mutex<Vec<serde_json::Value>>>,
     /// Answer every deposit with 409 `secret-exists`.
     conflict: bool,
+    /// Answer every deposit with a 307 to `/relocated`, and record whatever
+    /// arrives there.
+    redirect: bool,
+    relocated: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+
+async fn relocated(State(st): State<MockState>, Json(body): Json<serde_json::Value>) -> StatusCode {
+    st.relocated.lock().unwrap().push(body);
+    StatusCode::CREATED
 }
 
 async fn store_secret(
     State(st): State<MockState>,
     Json(body): Json<serde_json::Value>,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> Response {
     st.bodies.lock().unwrap().push(body.clone());
+    if st.redirect {
+        // 307 preserves method AND body: a followed redirect would deliver the
+        // credential to the new location.
+        return (
+            StatusCode::TEMPORARY_REDIRECT,
+            [(axum::http::header::LOCATION, "/relocated")],
+            "",
+        )
+            .into_response();
+    }
+    store_response(st, body).into_response()
+}
+
+fn store_response(st: MockState, body: serde_json::Value) -> (StatusCode, Json<serde_json::Value>) {
     if st.conflict {
         return (
             StatusCode::CONFLICT,
@@ -44,13 +68,16 @@ async fn store_secret(
     )
 }
 
-async fn start_mock(conflict: bool) -> (String, MockState) {
+async fn start_mock(conflict: bool, redirect: bool) -> (String, MockState) {
     let state = MockState {
         bodies: Arc::new(Mutex::new(Vec::new())),
         conflict,
+        redirect,
+        relocated: Arc::new(Mutex::new(Vec::new())),
     };
     let app = Router::new()
         .route("/v1/secrets", post(store_secret))
+        .route("/relocated", post(relocated))
         .with_state(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -81,7 +108,16 @@ async fn store_against(
     args: Vec<String>,
     stdin: Vec<u8>,
 ) -> (std::process::Output, MockState) {
-    let (url, state) = start_mock(conflict).await;
+    store_against_mock(conflict, false, args, stdin).await
+}
+
+async fn store_against_mock(
+    conflict: bool,
+    redirect: bool,
+    args: Vec<String>,
+    stdin: Vec<u8>,
+) -> (std::process::Output, MockState) {
+    let (url, state) = start_mock(conflict, redirect).await;
     let out = tokio::task::spawn_blocking(move || {
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
         run_store(&url, &refs, &stdin)
@@ -193,4 +229,24 @@ async fn empty_input_is_a_usage_error_before_any_request() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("empty"), "{stderr}");
     assert!(state.bodies.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_redirect_never_carries_the_secret_onward() {
+    let (out, state) = store_against_mock(
+        false,
+        true,
+        args(&["store", "redirected"]),
+        b"s3kr1t-value".to_vec(),
+    )
+    .await;
+
+    // The CLI does not follow it: a 3xx from a secrets API is a
+    // misconfiguration or an attack, and 307/308 would replay the credential
+    // body at the new origin.
+    assert_ne!(out.status.code(), Some(0));
+    assert!(
+        state.relocated.lock().unwrap().is_empty(),
+        "the redirect target must never receive the secret"
+    );
 }

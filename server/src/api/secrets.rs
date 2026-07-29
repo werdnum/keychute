@@ -86,12 +86,26 @@ pub async fn store(
     body: Bytes,
 ) -> Result<Response, ApiFailure> {
     let client = authenticate_client(&state, &headers).await?;
-    let mut req: StoreSecretRequest = serde_json::from_slice(&body)
-        .map_err(|_| ApiFailure::InvalidRequest("malformed request body"))?;
-    // The parsed body owns a copy of the plaintext: move it out of the struct
-    // into a buffer that zeroizes on drop, whichever way the handler exits.
+    let parsed: Result<StoreSecretRequest, _> = serde_json::from_slice(&body);
+    // The raw JSON body holds the plaintext too. Wipe it as soon as it has been
+    // parsed — including on a parse failure, where the bytes are just as
+    // sensitive. Best-effort by nature: `try_into_mut` only succeeds while this
+    // is the sole owner of the buffer, and the bytes upstream of us (TLS and
+    // socket read buffers) were never ours to clear. That is the same bound the
+    // approval-form ingestion path works under.
+    wipe(body);
+    let mut req = parsed.map_err(|_| ApiFailure::InvalidRequest("malformed request body"))?;
+    // The parsed struct owns its own copy: move it into a buffer that zeroizes
+    // on drop, whichever way the handler exits.
     let value_field = zeroize::Zeroizing::new(std::mem::take(&mut req.value));
     store_inner(&state, &client, &req, &value_field).await
+}
+
+/// Zero a request body we are done with, if we hold the only reference to it.
+fn wipe(body: Bytes) {
+    if let Ok(mut owned) = body.try_into_mut() {
+        owned.as_mut().zeroize();
+    }
 }
 
 async fn store_inner(
