@@ -28,11 +28,17 @@ image:
   # Either a digest (preferred, set by CI) or a tag. Digest wins if both set.
   #
   # Seeded by hand with the digest `:latest` resolved to when the kube-config
-  # wiring landed, because the bump step above had not yet run against a tree
-  # that contained the chart — leaving `digest: ""`, i.e. a `:latest` pull with
-  # `pullPolicy: IfNotPresent`, which never refreshes. The k8s-agent image pins
-  # the same digest to lift the client CLI out of it, so server and CLI ship as
-  # a matched pair. CI overwrites this on the next push to main.
+  # wiring landed. The bump above has never actually run: on main it fails at
+  # the "Generate GitHub App token" step with
+  # `[@octokit/auth-app] appId option is required`, because the repo has no
+  # IMAGE_UPDATER_APP_ID / IMAGE_UPDATER_PRIVATE_KEY secrets. The image itself
+  # pushes fine — only the commit-back fails — so `:latest` is current while
+  # `digest` stayed empty, and an empty digest means a `:latest` pull under
+  # `pullPolicy: IfNotPresent`, which never refreshes.
+  #
+  # Until those two secrets exist, this value is the pin and has to be bumped
+  # by hand alongside the k8s-agent image, which lifts the client CLI out of
+  # this same digest so server and CLI ship as a matched pair.
   digest: "sha256:33b39a0b90f3d52f6f34f76750f3c92f5a4caf1b411d6165411c282c260ca0f8"
   tag: "latest"
   pullPolicy: IfNotPresent
