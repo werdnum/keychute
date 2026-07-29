@@ -313,6 +313,18 @@ impl Config {
             if c.mechanisms.is_empty() {
                 bail!("client {} has no allowed mechanisms", c.name);
             }
+            // Service-account auth is resolved by Kubernetes TokenReview;
+            // without an endpoint `authenticate_client` has nothing to call
+            // and falls through to unauthenticated. Same trap as a malformed
+            // token digest: the deployment looks healthy while the client can
+            // never authenticate.
+            if c.auth.service_account.is_some() && self.tokenreview_url.is_none() {
+                bail!(
+                    "client {} uses service_account auth but tokenreview_url is not set: \
+                     no presented service-account token could ever be verified",
+                    c.name
+                );
+            }
             for m in &c.mechanisms {
                 if m.tier() > c.max_tier {
                     bail!(
@@ -457,7 +469,8 @@ clients:
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("no auth binding"), "{err}");
 
-        // Service account alone: accepted.
+        // Service account alone: accepted, but only with a TokenReview
+        // endpoint to verify presented tokens against.
         let mut cfg: Config = serde_yaml::from_str(BASE_YAML).unwrap();
         cfg.clients[0].auth.api_token_sha256 = None;
         cfg.clients[0].auth.service_account = Some(ServiceAccountAuth {
@@ -465,6 +478,11 @@ clients:
             subject: "system:serviceaccount:ns:agent".into(),
         });
         cfg.normalize();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("tokenreview_url is not set"), "{err}");
+        cfg.tokenreview_url = Some(
+            "https://kubernetes.default.svc/apis/authentication.k8s.io/v1/tokenreviews".into(),
+        );
         cfg.validate().unwrap();
     }
 

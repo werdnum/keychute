@@ -531,16 +531,29 @@ async fn render_request_detail(
     // valid for the state this page was rendered against and the hidden field
     // cannot be swapped independently of it.
     let secret_present = secret_present_marker(secret.is_some());
+    // CSRF tokens are minted on the PROCESS clock because `check_post` ->
+    // `verify_token` measures their TTL against `Utc::now()`. `now` here is
+    // the database clock (it gates request expiry, which SQL enforces), and
+    // issuing against one clock while verifying against the other would let
+    // even a second of skew reject a freshly submitted form — or, with real
+    // NTP drift, every form forever.
+    let csrf_now = Utc::now();
     let approve_token = csrf::issue_token(
         &state.keyset,
         R_APPROVE,
         &id.to_string(),
         &op.subject,
         secret_present,
-        now,
+        csrf_now,
     );
-    let deny_token =
-        csrf::issue_token(&state.keyset, R_DENY, &id.to_string(), &op.subject, "", now);
+    let deny_token = csrf::issue_token(
+        &state.keyset,
+        R_DENY,
+        &id.to_string(),
+        &op.subject,
+        "",
+        csrf_now,
+    );
     let default_tier = mechanism.tier();
 
     Ok(html_page(
@@ -584,15 +597,13 @@ async fn render_request_detail(
                             " Store this secret in Keychute (otherwise it is released once, to this grant only)"
                         }
                         label {
-                            "Max tier when stored: "
-                            select name="store_max_tier" {
-                                @for t in [Tier::Brokered, Tier::TrustedClient, Tier::CooperatingClient, Tier::Direct] {
-                                    option value=(t.as_str()) selected[t == default_tier] {
-                                        (t.as_str())
-                                    }
-                                }
+                            "Max tier when stored: " b { (default_tier.as_str()) }
+                            input type="hidden" name="store_max_tier" value=(default_tier.as_str());
+                            span .muted {
+                                " (the requested mechanism's tier — approving here cannot store \
+                                 the secret at a broader tier than the access being approved; \
+                                 widen it later from the secrets page if you mean to)"
                             }
-                            span .muted { " (defaults to the requested mechanism's tier — never broader)" }
                         }
                         label {
                             "Injection kind: "
@@ -938,9 +949,18 @@ async fn approve(
                     Some(raw) => tier_from_str(raw)
                         .ok_or_else(|| UiError::bad_request("invalid max_tier"))?,
                 };
-                if max_tier < mechanism.tier() {
+                // Exactly the approved mechanism's tier. Below it, the secret
+                // could not serve the very request being approved; above it,
+                // approving a cli-read would mint a stored secret releasable
+                // at `direct` forever after — widening future access beyond
+                // the access actually approved. Widening is a deliberate act
+                // and belongs on the secrets page, not as a side effect of an
+                // approval.
+                if max_tier != mechanism.tier() {
                     return Err(UiError::bad_request(
-                        "stored max_tier cannot be below the requested mechanism's tier",
+                        "stored max_tier must equal the requested mechanism's tier: \
+                         an approval cannot store a secret at a broader tier than the \
+                         access it grants",
                     ));
                 }
                 let kind = non_empty(&form.injection_kind).unwrap_or("bearer");
@@ -1499,6 +1519,10 @@ async fn secrets_page(State(state): State<AppState>, headers: HeaderMap) -> UiRe
 struct SecretForm {
     csrf_token: String,
     name: String,
+    /// Operator-typed production credential. Wiped on drop for the same
+    /// reason as [`ApproveForm`]: `save_secret` has fallible checks (stale
+    /// CSRF token, empty name) that return before the value is taken and
+    /// zeroized.
     #[serde(default)]
     secret_value: Option<String>,
     #[serde(default)]
@@ -1509,6 +1533,14 @@ struct SecretForm {
     injection_kind: Option<String>,
     #[serde(default)]
     injection_header: Option<String>,
+}
+
+impl Drop for SecretForm {
+    fn drop(&mut self) {
+        if let Some(v) = &mut self.secret_value {
+            v.zeroize();
+        }
+    }
 }
 
 async fn save_secret(

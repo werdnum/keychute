@@ -23,6 +23,7 @@ use futures::StreamExt;
 use keychute_types::{Constraints, Mechanism, Origin};
 use secrecy::ExposeSecret;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 /// Headers never forwarded from the caller (addendum #4), lowercase.
 const STRIP_LIST: &[&str] = &[
@@ -205,11 +206,17 @@ pub(crate) fn injection_header(
             Ok((name, value(secret.to_vec())?))
         }
         InjectionSpec::BasicPassword { username } => {
-            let mut credentials = Vec::with_capacity(username.len() + 1 + secret.len());
+            // `username:secret` staged in the clear before base64: zeroizing
+            // buffers, so neither the staging copy nor the encoded form is
+            // left in freed memory after the call (the header value itself is
+            // marked sensitive by `value`).
+            let mut credentials =
+                Zeroizing::new(Vec::with_capacity(username.len() + 1 + secret.len()));
             credentials.extend_from_slice(username.as_bytes());
             credentials.push(b':');
             credentials.extend_from_slice(secret);
-            let encoded = base64::engine::general_purpose::STANDARD.encode(&credentials);
+            let encoded =
+                Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(&*credentials));
             let mut bytes = b"Basic ".to_vec();
             bytes.extend_from_slice(encoded.as_bytes());
             Ok((name, value(bytes)?))
