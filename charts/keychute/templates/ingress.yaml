@@ -48,20 +48,23 @@ spec:
 
           /ui covers every route in server/src/ui/mod.rs (requests, grants,
           policies, secrets) and is the target of every Pushover approval link
-          (`{external_url}/ui/requests/{id}`). The two OIDC paths are consumed
-          by Envoy Gateway itself, not the backend, but must be matched by the
+          (`{external_url}/ui/requests/{id}`). "/" is the landing page and is
+          matched EXACTLY — as a Prefix it would match everything and hand the
+          internet /v1, /healthz and /readyz, which is precisely the boundary
+          this path list exists to draw. The two OIDC paths are consumed by
+          Envoy Gateway itself, not the backend, but must be matched by the
           HTTPRoute for the SecurityPolicy to intercept them — they come
           straight from ingress.oidc.{redirectPath,logoutPath} so overriding
           those values keeps this in sync.
           */ -}}
-          {{- $paths := list "/ui" }}
+          {{- $paths := list (dict "path" "/" "type" "Exact") (dict "path" "/ui" "type" "Prefix") }}
           {{- if .Values.ingress.oidc.enabled }}
-          {{- $paths = append $paths .Values.ingress.oidc.redirectPath }}
-          {{- $paths = append $paths .Values.ingress.oidc.logoutPath }}
+          {{- $paths = append $paths (dict "path" .Values.ingress.oidc.redirectPath "type" "Prefix") }}
+          {{- $paths = append $paths (dict "path" .Values.ingress.oidc.logoutPath "type" "Prefix") }}
           {{- end }}
           {{- range $paths }}
-          - path: {{ . | quote }}
-            pathType: Prefix
+          - path: {{ .path | quote }}
+            pathType: {{ .type }}
             backend:
               service:
                 name: {{ include "keychute.fullname" $ }}

@@ -48,6 +48,13 @@ pub async fn list_policies(db: &PgPool) -> anyhow::Result<Vec<PolicyRow>> {
     )
 }
 
+/// Policy rows — the count only, for the overview page.
+pub async fn count_policies(db: &PgPool) -> anyhow::Result<i64> {
+    Ok(sqlx::query_scalar("SELECT count(*) FROM policies")
+        .fetch_one(db)
+        .await?)
+}
+
 pub async fn insert_policy(db: &PgPool, p: &NewPolicy) -> anyhow::Result<PolicyRow> {
     Ok(sqlx::query_as::<_, PolicyRow>(
         "INSERT INTO policies \

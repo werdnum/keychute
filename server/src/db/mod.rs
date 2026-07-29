@@ -83,15 +83,17 @@ pub use grants::{
     begin_grant_use, get_grant, list_grants, purge_passthrough, revoke_grant,
     sweep_purge_passthroughs, AuditTarget, GrantRow, GrantUse,
 };
-pub use policies::{delete_policy, insert_policy, list_policies, NewPolicy, PolicyRow};
+pub use policies::{
+    count_policies, delete_policy, insert_policy, list_policies, NewPolicy, PolicyRow,
+};
 pub use requests::{
-    count_pending_for_client, expire_stale, get_request, increment_push_attempts,
+    count_pending, count_pending_for_client, expire_stale, get_request, increment_push_attempts,
     insert_access_request, list_notify_only_needing_push, list_pending, list_pending_needing_push,
     mark_push_delivered, purge_request_context, resolve_approve, resolve_deny, AccessRequestRow,
     GrantParams, InsertedRequest, NewAccessRequest, PassthroughPayload,
 };
 pub use secrets::{
-    create_secret, get_secret_by_name, get_secret_version, get_secret_version_by_id,
+    count_secrets, create_secret, get_secret_by_name, get_secret_version, get_secret_version_by_id,
     get_tags_for_secret, insert_secret_version, list_secrets, set_secret_tags, SecretRow,
     SecretVersionRow,
 };
