@@ -257,6 +257,12 @@ pub async fn create_secret_with_version(
 /// Rotate a stored secret: bump `current_version`, seal the new payload with
 /// the version-bound AAD (the closure receives the new version number), insert
 /// the version row, and audit `secret-rotated` — one transaction.
+///
+/// Rotation is operator-only, and the value being rotated in is the operator's
+/// own: it clears any unvetted flag left by a client deposit (migration 0007)
+/// in the same statement that bumps the version. Leaving it set would keep
+/// forcing manual approval for a credential the operator just typed, and would
+/// label their own value "not yet reviewed".
 pub async fn rotate_secret_version(
     db: &PgPool,
     secret_id: Uuid,
@@ -267,7 +273,8 @@ pub async fn rotate_secret_version(
     let mut tx = db.begin().await?;
     take_kek_shared_lock(&mut tx).await?;
     let version: i32 = sqlx::query_scalar(
-        "UPDATE secrets SET current_version = current_version + 1, updated_at = now() \
+        "UPDATE secrets \
+         SET current_version = current_version + 1, operator_vetted = true, updated_at = now() \
          WHERE id = $1 RETURNING current_version",
     )
     .bind(secret_id)
@@ -892,6 +899,14 @@ mod tests {
         )
         .await?;
 
+        // Pretend this row arrived as a client deposit: rotating in the
+        // operator's own value must clear the unvetted flag, or the clamp
+        // would keep forcing approval for a credential they just typed.
+        sqlx::query("UPDATE secrets SET operator_vetted = false WHERE id = $1")
+            .bind(secret_id)
+            .execute(db)
+            .await?;
+
         let row = rotate_secret_version(db, secret_id, "rot", "andrew", |version| {
             assert_eq!(version, 2);
             keyset.seal(
@@ -903,6 +918,10 @@ mod tests {
         assert_eq!(row.version, 2);
         let secret = crate::db::get_secret_by_name(db, "rot").await?.unwrap();
         assert_eq!(secret.current_version, 2);
+        assert!(
+            secret.operator_vetted,
+            "an operator rotation vets the secret"
+        );
         // Rotated payload opens with the version-bound AAD.
         use secrecy::ExposeSecret;
         let opened = keyset

@@ -600,6 +600,25 @@ async fn create_secret_from_client_never_replaces_an_existing_secret() -> anyhow
     use secrecy::ExposeSecret;
     assert_eq!(opened.expose_secret(), b"v1");
 
+    // A deposit lands unvetted: until an operator looks at it, the policy
+    // engine treats it like a secret that does not exist.
+    assert!(!row.operator_vetted, "a client deposit starts unvetted");
+    // Marking it reviewed is idempotent and audited once.
+    assert!(crate::db::mark_secret_vetted(&t.pool, row.id, "andrew").await?);
+    assert!(
+        !crate::db::mark_secret_vetted(&t.pool, row.id, "andrew").await?,
+        "a second review is a no-op, not a second audit row"
+    );
+    let row = get_secret_by_name(&t.pool, "minted").await?.unwrap();
+    assert!(row.operator_vetted);
+    let vetted_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_log WHERE kind = $1 AND secret_name = 'minted'",
+    )
+    .bind(audit::kinds::SECRET_VETTED)
+    .fetch_one(&t.pool)
+    .await?;
+    assert_eq!(vetted_rows, 1);
+
     // The rate cap is decided inside the same transaction as the write, on
     // the audit rows the deposits themselves left: one deposit has landed, so
     // a cap of 1 refuses the next one and stores nothing.

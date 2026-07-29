@@ -930,7 +930,7 @@ async fn run_store(cfg: &Config, http: &reqwest::Client, args: StoreArgs) -> Cli
         ),
     };
 
-    let body = StoreSecretRequest {
+    let mut body = StoreSecretRequest {
         name: secret_name,
         value: encoded.to_string(),
         encoding,
@@ -939,12 +939,25 @@ async fn run_store(cfg: &Config, http: &reqwest::Client, args: StoreArgs) -> Cli
         injection_kind: Some(injection_kind),
         injection_header,
     };
+    // Serialize here rather than handing the struct to `.json()`, so the
+    // plaintext copy inside the DTO can be wiped immediately instead of living
+    // through the whole HTTP exchange and being freed intact. The serialized
+    // buffer zeroizes on drop. Best-effort past this point, same as the server
+    // side: reqwest and rustls make their own copies we do not own.
+    let payload = Zeroizing::new(serde_json::to_vec(&body).map_err(|e| {
+        fail(
+            EXIT_OTHER,
+            format!("failed encoding the store request: {e}"),
+        )
+    })?);
+    body.value.zeroize();
 
     let resp = http
         .post(format!("{}/v1/secrets", cfg.url))
         .bearer_auth(cfg.bearer()?)
         .timeout(Duration::from_secs(HTTP_TIMEOUT_SECONDS))
-        .json(&body)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(payload.to_vec())
         .send()
         .await
         .map_err(|e| fail(EXIT_OTHER, ambiguous(format!("store request failed: {e}"))))?;
