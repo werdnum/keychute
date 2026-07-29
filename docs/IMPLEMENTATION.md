@@ -258,11 +258,13 @@ or Envoy-forwarded JWT in oidc mode):
   `POST /ui/policies/{id}/delete`.
 - Admin secret management (human-auth too): `POST /ui/secrets` (create/rotate:
   name, value, max_tier, injection template), `GET /ui/secrets`,
-  `POST /ui/secrets/{id}/review` (decrypt and display a client-deposited value
-  so the operator can actually read it; audits `secret-revealed`) and
+  `POST /ui/secrets/{id}/review` (the decision page for a client deposit:
+  depositing client, injection template, tier, and which standing policies would
+  begin releasing it with no human once vetted — with the plaintext shown only
+  on an explicit `reveal=1`, which is what audits `secret-revealed`) and
   `POST /ui/secrets/{id}/reviewed` (lift the unvetted clamp; audits
-  `secret-vetted`). The value renders verbatim in a `<pre>` — base64 when it is
-  not valid UTF-8 — so the operator vets what is actually stored rather than a
+  `secret-vetted`). A revealed value renders verbatim in a `<pre>` — base64 when
+  it is not valid UTF-8 — so what the operator sees is what is stored, not a
   whitespace-collapsed or lossily-decoded rendering of it. The confirmation is
   bound to the displayed version — in the
   CSRF token AND in the `UPDATE ... AND current_version = $2` — so a rotation

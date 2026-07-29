@@ -318,10 +318,10 @@ async fn store_accepts_base64_for_non_utf8_values() {
             .await
             .unwrap()
             .to_string();
-    let reveal = format!("/ui/secrets/{secret_id}/review");
-    let token = extract_csrf(&secrets_page, &reveal).expect("reveal csrf token");
+    let review = format!("/ui/secrets/{secret_id}/review");
+    let token = extract_csrf(&secrets_page, &review).expect("review csrf token");
     let (status, page) = env
-        .ui_post(&reveal, &[("csrf_token", &token)])
+        .ui_post(&review, &[("csrf_token", &token), ("reveal", "1")])
         .await
         .unwrap();
     assert_eq!(status, 200, "review page failed: {page}");
@@ -443,16 +443,42 @@ async fn a_deposit_cannot_satisfy_a_standing_auto_approve_policy() {
         "the secrets page offers the review action"
     );
 
-    let reveal = format!("/ui/secrets/{secret_id}/review");
-    let token = extract_csrf(&secrets_page, &reveal).expect("reveal csrf token");
+    let review = format!("/ui/secrets/{secret_id}/review");
+    let token = extract_csrf(&secrets_page, &review).expect("review csrf token");
     let (status, page) = env
-        .ui_post(&reveal, &[("csrf_token", &token)])
+        .ui_post(&review, &[("csrf_token", &token)])
         .await
         .unwrap();
     assert_eq!(status, 200, "review page failed: {page}");
+
+    // The decision page leads with what an operator can actually judge: who
+    // deposited it, and what vetting would switch on.
+    assert!(page.contains("k8s-agent"), "names the depositing client");
+    assert!(
+        page.contains("would begin releasing this secret"),
+        "names the consequence of vetting: {page}"
+    );
+    assert!(
+        page.contains("reserved-name") && page.contains("auto-approve"),
+        "the matching standing policy is listed: {page}"
+    );
+    // The bytes are NOT on the default path.
+    assert!(
+        !page.contains("client-chosen"),
+        "the value is hidden until explicitly revealed"
+    );
+    assert!(page.contains("Reveal stored value"), "reveal is offered");
+
+    // Revealing is an explicit, audited act.
+    let token = extract_csrf(&page, &review).expect("reveal csrf token");
+    let (status, page) = env
+        .ui_post(&review, &[("csrf_token", &token), ("reveal", "1")])
+        .await
+        .unwrap();
+    assert_eq!(status, 200, "reveal failed: {page}");
     assert!(
         page.contains("client-chosen"),
-        "the operator is shown the deposited value before vetting it"
+        "the deposited value is shown on request"
     );
 
     let confirm = format!("/ui/secrets/{secret_id}/reviewed");

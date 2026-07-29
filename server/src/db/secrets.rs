@@ -332,6 +332,35 @@ pub async fn mark_secret_vetted(
     Ok(true)
 }
 
+/// Which client deposited this secret, and when, from the audit log — the
+/// deposit's own append-only record (`secret-created` with a client_name;
+/// operator-created rows have none). Powers the review page's "who put this
+/// here", which is the part of a deposit an operator can actually judge.
+pub async fn client_deposit_origin(
+    db: &PgPool,
+    secret_name: &str,
+) -> anyhow::Result<Option<(String, DateTime<Utc>)>> {
+    Ok(sqlx::query_as::<_, (String, DateTime<Utc>)>(
+        "SELECT client_name, at FROM audit_log \
+         WHERE kind = 'secret-created' AND secret_name = $1 AND client_name IS NOT NULL \
+         ORDER BY id LIMIT 1",
+    )
+    .bind(secret_name)
+    .fetch_optional(db)
+    .await?)
+}
+
+/// Names of secrets no operator has reviewed yet. Small by construction (a
+/// deposit is rate-capped and reviewing clears the flag), so the policy page
+/// can warn about them without pagination.
+pub async fn list_unvetted_secret_names(db: &PgPool) -> anyhow::Result<Vec<String>> {
+    Ok(
+        sqlx::query_scalar("SELECT name FROM secrets WHERE NOT operator_vetted ORDER BY name")
+            .fetch_all(db)
+            .await?,
+    )
+}
+
 /// Replace the tag set for a secret.
 pub async fn set_secret_tags(db: &PgPool, secret_id: Uuid, tags: &[String]) -> anyhow::Result<()> {
     let mut tx = db.begin().await?;
