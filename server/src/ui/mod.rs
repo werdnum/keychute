@@ -873,7 +873,7 @@ fn grant_block(mechanism: Mechanism, constraints: &Constraints, secret_line: Mar
     let tier = mechanism.tier();
     html! {
         section .grant-block {
-            span .block-label { "Authoritative · server-parsed" }
+            span .block-label { "What the server will enforce" }
             h2 { "What you are approving" }
             table .kv {
                 tr { th { "Secret" } td { (secret_line) } }
@@ -927,19 +927,17 @@ fn grant_block(mechanism: Mechanism, constraints: &Constraints, secret_line: Mar
 fn context_block(context: Option<&RequestContext>, mechanism: Mechanism) -> Markup {
     html! {
         section .context-block {
-            span .block-label { "Untrusted · client-asserted" }
+            span .block-label { "What the client claims" }
             h2 { "Context supplied by the client" }
             p .muted {
-                "Everything below was supplied by the requesting client and may be "
-                "influenced by a prompt-injected agent. It is NOT what the server "
-                "will enforce."
+                "An agent under prompt injection can put anything here. None of it "
+                "is checked, and none of it changes what the server enforces."
             }
             @if mechanism == Mechanism::CliRead {
                 p .caveat {
-                    "Tier-2 caveat: this request is tagged as coming from the keychute "
-                    "CLI, but any pipeline or reason shown is agent-asserted, captured "
-                    "inside the agent's own container. The agent CAN read the released "
-                    "secret from stdout."
+                    "Tier-2 caveat: this is tagged as coming from the keychute CLI, "
+                    "but the reason above is the agent's own words — and the agent can "
+                    "read the released secret from stdout."
                 }
             }
             @match context {
@@ -1025,10 +1023,9 @@ async fn overview_page(
         "/",
         html! {
             (page_head("Keychute", html! {
-                "Secrets storage and delivery broker for AI agents. Every "
-                "delivery path has an operator-chosen risk tier, and every "
-                "release is either matched by a standing policy or approved "
-                "here by you."
+                "Secrets broker for AI agents. You pick the risk tier of every "
+                "delivery path; every release is either matched by a standing policy "
+                "or approved here, by you."
             }))
             p .muted { "Signed in as " span .mono { (op.subject) } "." }
 
@@ -1112,8 +1109,8 @@ async fn requests_page(
         "/ui/requests",
         html! {
             (page_head("Pending access requests", html! {
-                "Each row is an agent waiting on you. Open one to see the "
-                "server-parsed grant before deciding."
+                "Each row is an agent waiting on you. Open one to see exactly what "
+                "it would get."
             }))
             @if rows.is_empty() { (empty_state("No pending requests.")) }
             @else {
@@ -1161,10 +1158,9 @@ const F_SECRET_PRESENT: &str = "secret_present";
 
 /// Wording shared by the GET banner and the 409 body.
 const SECRET_STATE_CHANGED: &str =
-    "the stored state of this secret changed while you were reviewing this \
-     request — it was stored, removed, or rotated to a new version — so this \
-     form no longer means what it said: nothing was approved. Re-check the \
-     details below and decide again.";
+    "This secret changed while you were reviewing: it was stored, removed, or \
+     rotated since the page loaded, so the form no longer meant what it said. \
+     Nothing was approved. Check the details below and decide again.";
 
 async fn request_detail_page(
     State(state): State<AppState>,
@@ -1353,7 +1349,8 @@ async fn render_request_detail(
                     input type="hidden" name="csrf_token" value=(approve_token);
                     input type="hidden" name=(F_SECRET_PRESENT) value=(secret_present);
                     fieldset {
-                        legend { "Narrow the grant (optional — values may only shrink the request)" }
+                        legend { "Narrow the grant (optional)" }
+                        p .muted { "Either value can only shrink what was requested." }
                         div .field-grid {
                             label {
                                 "TTL seconds (≤ " (constraints.ttl_seconds) ")"
@@ -1386,9 +1383,8 @@ async fn render_request_detail(
                                 "Max tier when stored: " b { (default_tier.as_str()) }
                                 input type="hidden" name="store_max_tier" value=(default_tier.as_str());
                                 span .muted {
-                                    " (the requested mechanism's tier — approving here cannot store \
-                                     the secret at a broader tier than the access being approved; \
-                                     widen it later from the secrets page if you mean to)"
+                                    " — fixed to the tier you are approving. Widen it later from "
+                                    "the secrets page if you mean to."
                                 }
                             }
                             div .field-grid {
@@ -1404,7 +1400,7 @@ async fn render_request_detail(
                                     "Header name / basic-auth username"
                                     input type="text" name="injection_header"
                                         autocapitalize="off" autocorrect="off" spellcheck="false";
-                                    span .muted { "Used by injection kinds " b { "header" } " and " b { "basic-password" } "." }
+                                    span .muted { "Only for kinds " b { "header" } " and " b { "basic-password" } "." }
                                 }
                             }
                             label {
@@ -1986,9 +1982,8 @@ async fn policies_page(
         "/ui/policies",
         html! {
             (page_head("Standing policies", html! {
-                "Rules applied to a request before you ever see it — the highest-priority "
-                "match decides whether it is auto-approved, pushed as an FYI, sent to you "
-                "for approval, or denied outright."
+                "Applied before a request ever reaches you. The highest-priority match "
+                "wins, and its outcome decides the request."
             }))
             @if policies.is_empty() { (empty_state("No policy rows.")) }
             @else {
@@ -2352,8 +2347,8 @@ async fn secrets_page(State(state): State<AppState>, headers: HeaderMap) -> UiRe
         "/ui/secrets",
         html! {
             (page_head("Stored secrets", html! {
-                "Credentials Keychute holds, each capped at the broadest delivery tier "
-                "it may ever be released through."
+                "Credentials Keychute holds. Each one is capped at the broadest tier "
+                "it can ever be released through."
             }))
             @if secrets.is_empty() { (empty_state("No stored secrets.")) }
             @else {
@@ -2439,7 +2434,7 @@ async fn secrets_page(State(state): State<AppState>, headers: HeaderMap) -> UiRe
                             "Header name / basic-auth username"
                             input type="text" name="injection_header"
                                 autocapitalize="off" autocorrect="off" spellcheck="false";
-                            span .muted { "Used by injection kinds " b { "header" } " and " b { "basic-password" } "." }
+                            span .muted { "Only for kinds " b { "header" } " and " b { "basic-password" } "." }
                         }
                     }
                     div .actions-bar {
