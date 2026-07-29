@@ -12,6 +12,11 @@ pub struct SecretRow {
     pub max_tier: i32,
     pub injection_kind: String,
     pub injection_header: Option<String>,
+    /// Basic-auth username (migration 0003). Selected alongside the header so
+    /// the UI can show which account a template targets — for kind 'basic' the
+    /// proxy builds the Authorization header from THIS field, so an operator
+    /// reviewing a client deposit has to be able to see it.
+    pub injection_username: Option<String>,
     pub current_version: i32,
     pub enabled: bool,
     /// Has an operator ever seen this value? False for a client deposit until
@@ -273,16 +278,26 @@ pub async fn count_secrets(db: &PgPool) -> anyhow::Result<i64> {
 }
 
 /// Record that an operator has reviewed a client-deposited secret, lifting the
-/// policy engine's "never auto-approve an unvetted secret" clamp. Idempotent;
-/// returns false when the row is already vetted (or absent) so the caller does
-/// not write a second audit row for a no-op.
-pub async fn mark_secret_vetted(db: &PgPool, secret_id: Uuid, actor: &str) -> anyhow::Result<bool> {
+/// policy engine's "never auto-approve an unvetted secret" clamp.
+///
+/// `reviewed_version` is the version whose plaintext the operator was actually
+/// shown: the update only lands if that is still `current_version`. Without
+/// that binding "reviewed" would mean "clicked a button" — a rotation landing
+/// between the reveal and the confirmation would vet bytes nobody saw. Returns
+/// false when the row is already vetted, absent, or has moved on.
+pub async fn mark_secret_vetted(
+    db: &PgPool,
+    secret_id: Uuid,
+    reviewed_version: i32,
+    actor: &str,
+) -> anyhow::Result<bool> {
     let mut tx = db.begin().await?;
     let updated = sqlx::query(
         "UPDATE secrets SET operator_vetted = true, updated_at = now() \
-         WHERE id = $1 AND NOT operator_vetted",
+         WHERE id = $1 AND NOT operator_vetted AND current_version = $2",
     )
     .bind(secret_id)
+    .bind(reviewed_version)
     .execute(&mut *tx)
     .await?
     .rows_affected();
@@ -300,6 +315,8 @@ pub async fn mark_secret_vetted(db: &PgPool, secret_id: Uuid, actor: &str) -> an
             kind: crate::audit::kinds::SECRET_VETTED,
             secret_name: Some(name),
             actor: Some(actor.to_owned()),
+            // Which bytes the operator signed off on.
+            detail: Some(serde_json::json!({"version": reviewed_version})),
             ..Default::default()
         },
     )

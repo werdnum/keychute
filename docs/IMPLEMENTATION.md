@@ -258,8 +258,13 @@ or Envoy-forwarded JWT in oidc mode):
   `POST /ui/policies/{id}/delete`.
 - Admin secret management (human-auth too): `POST /ui/secrets` (create/rotate:
   name, value, max_tier, injection template), `GET /ui/secrets`,
-  `POST /ui/secrets/{id}/reviewed` (lift the unvetted clamp on a client
-  deposit; audits `secret-vetted`).
+  `POST /ui/secrets/{id}/review` (decrypt and display a client-deposited value
+  so the operator can actually read it; audits `secret-revealed`) and
+  `POST /ui/secrets/{id}/reviewed` (lift the unvetted clamp; audits
+  `secret-vetted`). The confirmation is bound to the displayed version — in the
+  CSRF token AND in the `UPDATE ... AND current_version = $2` — so a rotation
+  between the two steps cannot vet bytes nobody saw. Both are POST: a URL that
+  renders a credential would sit in browser history.
 - CSRF: session-less double-submit is NOT enough with header auth; since auth is
   a header (no cookies), CSRF risk is minimal, but implement `Origin`/
   `Sec-Fetch-Site` checks on all POSTs + a per-rendered-form token MAC'd with the

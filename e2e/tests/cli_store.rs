@@ -405,7 +405,8 @@ async fn a_deposit_cannot_satisfy_a_standing_auto_approve_policy() {
         "approval page flags the unreviewed deposit"
     );
 
-    // Once the operator marks it reviewed, the standing policy applies again.
+    // Reviewing is a two-step flow: the operator is SHOWN the bytes, then
+    // confirms for the version they actually saw.
     let secrets_page = env.ui_get("/ui/secrets").await.unwrap();
     let secret_id: String =
         sqlx::query_scalar::<_, uuid::Uuid>("SELECT id FROM secrets WHERE name = 'reserved-name'")
@@ -414,19 +415,47 @@ async fn a_deposit_cannot_satisfy_a_standing_auto_approve_policy() {
             .unwrap()
             .to_string();
     assert!(
-        secrets_page.contains("Mark reviewed"),
+        secrets_page.contains("Review value"),
         "the secrets page offers the review action"
     );
-    let action = format!("/ui/secrets/{secret_id}/reviewed");
-    let token = extract_csrf(&secrets_page, &action).expect("review csrf token");
+
+    let reveal = format!("/ui/secrets/{secret_id}/review");
+    let token = extract_csrf(&secrets_page, &reveal).expect("reveal csrf token");
+    let (status, page) = env
+        .ui_post(&reveal, &[("csrf_token", &token)])
+        .await
+        .unwrap();
+    assert_eq!(status, 200, "review page failed: {page}");
+    assert!(
+        page.contains("client-chosen"),
+        "the operator is shown the deposited value before vetting it"
+    );
+
+    let confirm = format!("/ui/secrets/{secret_id}/reviewed");
+    let token = extract_csrf(&page, &confirm).expect("confirm csrf token");
+    let version = extract_form_field(&page, &confirm, "reviewed_version").expect("version marker");
+    assert_eq!(version, "1");
     let (status, body) = env
-        .ui_post(&action, &[("csrf_token", &token)])
+        .ui_post(
+            &confirm,
+            &[("csrf_token", &token), ("reviewed_version", &version)],
+        )
         .await
         .unwrap();
     assert!(
         status.is_redirection(),
         "mark reviewed failed: {status} {body}"
     );
+
+    // Seeing a credential is an event, not a page view.
+    let revealed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_log WHERE kind = 'secret-revealed' \
+         AND secret_name = 'reserved-name'",
+    )
+    .fetch_one(&env.db)
+    .await
+    .unwrap();
+    assert_eq!(revealed, 1);
 
     let (status, body) = env
         .k8s()

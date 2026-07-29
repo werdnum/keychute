@@ -604,9 +604,14 @@ async fn create_secret_from_client_never_replaces_an_existing_secret() -> anyhow
     // engine treats it like a secret that does not exist.
     assert!(!row.operator_vetted, "a client deposit starts unvetted");
     // Marking it reviewed is idempotent and audited once.
-    assert!(crate::db::mark_secret_vetted(&t.pool, row.id, "andrew").await?);
+    // The wrong version is refused: "reviewed" is bound to the bytes shown.
     assert!(
-        !crate::db::mark_secret_vetted(&t.pool, row.id, "andrew").await?,
+        !crate::db::mark_secret_vetted(&t.pool, row.id, 2, "andrew").await?,
+        "vetting must name the version that was actually displayed"
+    );
+    assert!(crate::db::mark_secret_vetted(&t.pool, row.id, 1, "andrew").await?);
+    assert!(
+        !crate::db::mark_secret_vetted(&t.pool, row.id, 1, "andrew").await?,
         "a second review is a no-op, not a second audit row"
     );
     let row = get_secret_by_name(&t.pool, "minted").await?.unwrap();

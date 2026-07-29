@@ -131,9 +131,11 @@ and is agent-influenceable. The approval UI therefore renders tier-2 context as
      notify-only, every release needs a decision. Without this, depositing
      under a name a standing policy selects — by name OR by the wildcard row —
      would let a client hand itself bytes nobody reviewed and have them
-     released with no human in the loop. An operator lifts the clamp with
-     "Mark reviewed" on the secrets page, which is the moment a human first
-     takes responsibility for the value.
+     released with no human in the loop. To lift the clamp the operator opens
+     the deposit, is SHOWN the credential the client stored, and confirms for
+     that specific version — the moment a human first takes responsibility for
+     the value. A button that vetted without displaying the bytes would only
+     record that someone clicked.
 3. The operator gets an FYI push ("k8s-agent stored a new secret …") and an audit
    row (`secret-created`, actor `client:k8s-agent`). Getting the secret back out
    is the ordinary CUJ 2 flow, approval and all — and the approval page says the

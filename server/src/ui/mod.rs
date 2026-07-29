@@ -14,6 +14,7 @@
 pub mod csrf;
 mod policy_store;
 
+use crate::audit;
 use crate::authn::human::{authenticate_human, Operator};
 use crate::crypto::{AadContext, SecretBytes, EPHEMERAL_KEK_ID};
 use crate::db;
@@ -41,6 +42,7 @@ const R_REVOKE: &str = "/ui/grants/revoke";
 const R_POLICY_CREATE: &str = "/ui/policies/create";
 const R_POLICY_DELETE: &str = "/ui/policies/delete";
 const R_SECRET_SAVE: &str = "/ui/secrets/save";
+const R_SECRET_REVEAL: &str = "/ui/secrets/reveal";
 const R_SECRET_VET: &str = "/ui/secrets/vet";
 
 pub fn router(state: AppState) -> Router {
@@ -62,6 +64,7 @@ pub fn router(state: AppState) -> Router {
         .route("/ui/policies/{id}/delete", post(delete_policy))
         .route("/ui/secrets", get(secrets_page))
         .route("/ui/secrets", post(save_secret))
+        .route("/ui/secrets/{id}/review", post(review_secret))
         .route("/ui/secrets/{id}/reviewed", post(mark_reviewed))
         .layer(axum::middleware::from_fn(security_headers))
         .with_state(state)
@@ -2306,7 +2309,8 @@ async fn secrets_page(State(state): State<AppState>, headers: HeaderMap) -> UiRe
                         "Some secrets below were deposited by a client and nobody has "
                         "reviewed them. Until you do, every release of them needs your "
                         "approval — a standing auto-approve or notify-only policy will "
-                        "NOT release a secret you have never seen."
+                        "NOT release a secret you have never seen. "
+                        "\"Review value\" shows you the credential the client stored."
                     }
                 }
             }
@@ -2339,7 +2343,13 @@ async fn secrets_page(State(state): State<AppState>, headers: HeaderMap) -> UiRe
                                     td data-label="Injection" {
                                         span .mono {
                                             (s.injection_kind)
+                                            // Both free-text fields are shown: for kind 'basic'
+                                            // the account identity lives in injection_username,
+                                            // and the proxy builds the Authorization header from
+                                            // it — an operator vetting a deposit has to see whose
+                                            // account the client picked.
                                             @if let Some(h) = &s.injection_header { " (" (h) ")" }
+                                            @if let Some(u) = &s.injection_username { " (user: " (u) ")" }
                                         }
                                     }
                                     td data-label="Enabled" {
@@ -2355,10 +2365,10 @@ async fn secrets_page(State(state): State<AppState>, headers: HeaderMap) -> UiRe
                                     td .actions data-label="" {
                                         @if !s.operator_vetted {
                                             form method="post"
-                                                action={ "/ui/secrets/" (s.id) "/reviewed" } .inline {
+                                                action={ "/ui/secrets/" (s.id) "/review" } .inline {
                                                 input type="hidden" name="csrf_token"
-                                                    value=(csrf::issue_token(&state.keyset, R_SECRET_VET, &s.id.to_string(), &op.subject, "", now));
-                                                button .small type="submit" { "Mark reviewed" }
+                                                    value=(csrf::issue_token(&state.keyset, R_SECRET_REVEAL, &s.id.to_string(), &op.subject, "", now));
+                                                button .small type="submit" { "Review value" }
                                             }
                                         }
                                     }
@@ -2451,11 +2461,15 @@ impl Drop for SecretForm {
     }
 }
 
-/// POST /ui/secrets/{id}/reviewed — the operator has looked at a
-/// client-deposited value and accepts it. Until this happens the policy engine
-/// treats the secret like one that does not exist: no auto-approve, no
-/// notify-only, every release needs a decision (migration 0007).
-async fn mark_reviewed(
+/// POST /ui/secrets/{id}/review — show the operator the credential a client
+/// deposited, so "reviewed" means they actually saw the bytes rather than
+/// clicked a button. POST, not GET: a URL that renders a secret would land in
+/// browser history and be re-fetchable, and every UI response is already
+/// `no-store`. The reveal is audited.
+///
+/// The confirmation form on this page is bound to the version displayed here,
+/// so a rotation landing in between cannot get unseen bytes vetted.
+async fn review_secret(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
@@ -2465,19 +2479,165 @@ async fn mark_reviewed(
     check_post(
         &state,
         &headers,
-        R_SECRET_VET,
+        R_SECRET_REVEAL,
         &id.to_string(),
         &op.subject,
         "",
         &form.csrf_token,
     )?;
-    // Already reviewed (or gone): nothing was written and nothing audited, so
-    // say so rather than redirecting as if this call did the work — same as
-    // the revoke handler.
-    if !db::mark_secret_vetted(&state.db, id, &op.subject).await? {
+    let secret = db::list_secrets(&state.db)
+        .await?
+        .into_iter()
+        .find(|s| s.id == id)
+        .ok_or_else(|| UiError::new(StatusCode::NOT_FOUND, "no such secret"))?;
+    if secret.operator_vetted {
         return Err(UiError::new(
             StatusCode::CONFLICT,
-            "that secret is already marked reviewed, or no longer exists",
+            "that secret is already marked reviewed",
+        ));
+    }
+    let version = db::get_secret_version(&state.db, secret.id, secret.current_version)
+        .await?
+        .ok_or_else(|| UiError::new(StatusCode::NOT_FOUND, "no stored version to review"))?;
+    let plaintext = state
+        .keyset
+        .open(
+            &version.ciphertext,
+            &version.nonce,
+            &version.wrapped_dek,
+            &version.kek_id,
+            AadContext::SecretVersion {
+                secret_id: secret.id,
+                version: version.version,
+            },
+        )
+        .map_err(|e| {
+            tracing::warn!(secret_id = %secret.id, error = %e, "secret version undecryptable");
+            UiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "that secret's stored value could not be decrypted",
+            )
+        })?;
+    audit::insert_audit(
+        &state.db,
+        &audit::AuditEvent {
+            kind: audit::kinds::SECRET_REVEALED,
+            secret_name: Some(secret.name.clone()),
+            secret_version_id: Some(version.id),
+            actor: Some(op.subject.clone()),
+            ..Default::default()
+        },
+    )
+    .await
+    .map_err(|e| UiError::from(anyhow::Error::from(e)))?;
+
+    let now = Utc::now();
+    let marker = version.version.to_string();
+    let token = csrf::issue_token(
+        &state.keyset,
+        R_SECRET_VET,
+        &id.to_string(),
+        &op.subject,
+        &marker,
+        now,
+    );
+    // Rendered as TEXT (auto-escaped), like every other client-derived string
+    // on these pages. Lossy UTF-8 because a credential may be binary; the
+    // operator is deciding whether to trust it, not copying it out.
+    let shown = String::from_utf8_lossy({
+        use secrecy::ExposeSecret;
+        plaintext.expose_secret()
+    })
+    .into_owned();
+    Ok(html_page_at(
+        "Review secret",
+        "/ui/secrets",
+        html! {
+            (page_head("Review a deposited secret", html! {
+                "A client stored this credential. Nobody has looked at it yet, so "
+                "Keychute refuses to release it without your approval — even under a "
+                "standing auto-approve policy. Read it, then decide."
+            }))
+            div .card {
+                h2 { span .mono { (secret.name) } }
+                p .muted {
+                    "version " (version.version)
+                    ", max tier: "
+                    (Tier::from_int(secret.max_tier).map(|t| t.as_str()).unwrap_or("?"))
+                    ", injection: " (secret.injection_kind)
+                    @if let Some(h) = &secret.injection_header { " (" (h) ")" }
+                    @if let Some(u) = &secret.injection_username { " (user: " (u) ")" }
+                }
+                @if !secret.description.is_empty() {
+                    p { "Client-supplied description: " (secret.description) }
+                }
+                div .callout .callout-danger {
+                    p { "The stored value, as deposited:" }
+                    p { code .mono { (shown) } }
+                }
+                p .muted {
+                    "Marking this reviewed applies to version " (version.version)
+                    " specifically. If it is rotated before you confirm, you will be "
+                    "asked to look again."
+                }
+                div .actions-bar {
+                    form method="post" action={ "/ui/secrets/" (secret.id) "/reviewed" } .inline {
+                        input type="hidden" name="csrf_token" value=(token);
+                        input type="hidden" name="reviewed_version" value=(marker);
+                        button .primary type="submit" {
+                            "Mark reviewed (version " (version.version) ")"
+                        }
+                    }
+                    a .button href="/ui/secrets" { "Back without reviewing" }
+                }
+            }
+        },
+    )
+    .into_response())
+}
+
+#[derive(Deserialize)]
+struct ReviewedForm {
+    csrf_token: String,
+    /// The version whose plaintext was displayed. Echoed back and bound into
+    /// the CSRF token, so it cannot be swapped for another.
+    reviewed_version: String,
+}
+
+/// POST /ui/secrets/{id}/reviewed — the operator has looked at a
+/// client-deposited value and accepts it. Until this happens the policy engine
+/// treats the secret like one that does not exist: no auto-approve, no
+/// notify-only, every release needs a decision (migration 0007).
+async fn mark_reviewed(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    Form(form): Form<ReviewedForm>,
+) -> UiResult<Response> {
+    let op = operator(&state, &headers).await?;
+    // The version is part of the token's binding: only the page that actually
+    // displayed those bytes can produce a token that verifies here.
+    check_post(
+        &state,
+        &headers,
+        R_SECRET_VET,
+        &id.to_string(),
+        &op.subject,
+        &form.reviewed_version,
+        &form.csrf_token,
+    )?;
+    let reviewed_version: i32 = form
+        .reviewed_version
+        .parse()
+        .map_err(|_| UiError::bad_request("invalid reviewed version"))?;
+    // Already reviewed, gone, or rotated since the reveal: nothing was written
+    // and nothing audited, so say so rather than redirecting as if this call
+    // did the work — same as the revoke handler.
+    if !db::mark_secret_vetted(&state.db, id, reviewed_version, &op.subject).await? {
+        return Err(UiError::new(
+            StatusCode::CONFLICT,
+            "that secret is already reviewed, no longer exists, or has been rotated \
+             since you looked at it — open it again to review the current value",
         ));
     }
     Ok(Redirect::to("/ui/secrets").into_response())
