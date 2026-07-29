@@ -28,4 +28,4 @@ futures = { workspace = true }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 rcgen = "0.13"
 # Both ring and aws-lc-rs end up in the dep graph; pick one explicitly.
-rustls = { version = "0.23", features = ["ring"] }
+rustls = { workspace = true }
