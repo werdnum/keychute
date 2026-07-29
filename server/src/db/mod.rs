@@ -80,8 +80,8 @@ pub async fn db_now(db: &sqlx::PgPool) -> anyhow::Result<chrono::DateTime<chrono
 
 pub use clients::{get_client_by_name, list_clients, reconcile_clients, ClientRow};
 pub use grants::{
-    begin_grant_use, get_grant, list_grants, purge_passthrough, revoke_grant,
-    sweep_purge_passthroughs, AuditTarget, GrantRow, GrantUse,
+    begin_grant_use, get_grant, get_grant_for_request, list_grants, purge_passthrough,
+    revoke_grant, sweep_purge_passthroughs, AuditTarget, GrantRow, GrantUse,
 };
 pub use policies::{
     count_policies, delete_policy, insert_policy, list_policies, NewPolicy, PolicyRow,

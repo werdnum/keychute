@@ -235,7 +235,9 @@ One binary, several logical components:
 - **Approval UI**: minimal server-rendered (or tiny static SPA) pages behind
   Envoy Gateway OIDC (`id.andrewgarrett.dev` Keycloak, the cluster's standard
   `SecurityPolicy` pattern). Shows request context verbatim, tier in plain language,
-  secret-entry form for not-yet-stored secrets, and standing-grant management.
+  secret-entry form for not-yet-stored secrets (which also lets the operator
+  release one of the stored secrets instead, for the common case of a client
+  guessing the name wrong), and standing-grant management.
 - **Policy engine**: evaluates (client, secret, mechanism/tier, constraints,
   context) → `auto-approve` / `notify-only` / `require-approval` / `deny`.
 - **Notifier**: Pushover, using the cluster's existing convention (secret with

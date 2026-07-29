@@ -633,6 +633,18 @@ impl TestEnv {
     /// Approve a pending request through the real UI flow: fetch the page,
     /// extract the approve form's CSRF token, POST with extra form fields.
     pub async fn approve(&self, request_id: &str, extra: &[(&str, &str)]) -> anyhow::Result<()> {
+        let (status, body) = self.approve_raw(request_id, extra).await?;
+        anyhow::ensure!(status.is_redirection(), "approve failed: {status}: {body}");
+        Ok(())
+    }
+
+    /// [`Self::approve`] without the success assertion: for tests that expect
+    /// the approval to be refused (4xx) rather than redirect.
+    pub async fn approve_raw(
+        &self,
+        request_id: &str,
+        extra: &[(&str, &str)],
+    ) -> anyhow::Result<(reqwest::StatusCode, String)> {
         let page = self.ui_get(&format!("/ui/requests/{request_id}")).await?;
         let action = format!("/ui/requests/{request_id}/approve");
         let token = extract_csrf(&page, &action).context("approve form csrf token not found")?;
@@ -645,11 +657,8 @@ impl TestEnv {
         let mut form: Vec<(&str, &str)> =
             vec![("csrf_token", &token), ("secret_present", &present)];
         form.extend_from_slice(extra);
-        let (status, body) = self
-            .ui_post(&format!("/ui/requests/{request_id}/approve"), &form)
-            .await?;
-        anyhow::ensure!(status.is_redirection(), "approve failed: {status}: {body}");
-        Ok(())
+        self.ui_post(&format!("/ui/requests/{request_id}/approve"), &form)
+            .await
     }
 
     pub async fn deny(&self, request_id: &str) -> anyhow::Result<()> {
@@ -895,6 +904,25 @@ pub fn extract_form_field(html: &str, action: &str, field: &str) -> Option<Strin
     let rest = &rest[at..];
     let end = rest.find('"')?;
     Some(rest[..end].to_owned())
+}
+
+/// Value of the `<option>` whose visible label contains `label_contains` —
+/// what a browser would submit if the operator picked that entry. Used for the
+/// approval page's "release a stored secret instead" picker, whose option
+/// values carry the secret's current version.
+pub fn extract_option_value(html: &str, label_contains: &str) -> Option<String> {
+    let mut rest = html;
+    while let Some(at) = rest.find("<option value=\"") {
+        let tail = &rest[at + "<option value=\"".len()..];
+        let end = tail.find('"')?;
+        let value = &tail[..end];
+        let label_end = tail.find("</option>")?;
+        if tail[end..label_end].contains(label_contains) && !value.is_empty() {
+            return Some(value.to_owned());
+        }
+        rest = &tail[label_end..];
+    }
+    None
 }
 
 /// Extract all request ids linked from the pending-requests page.

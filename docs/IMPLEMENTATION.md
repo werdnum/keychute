@@ -251,7 +251,8 @@ or Envoy-forwarded JWT in oidc mode):
 - `GET /ui/requests` — pending list. `GET /ui/requests/{id}` — approval page.
 - `POST /ui/requests/{id}/approve` — form fields: `csrf_token`, optional
   `secret_value` (when secret not stored), `store_secret` checkbox,
-  `ttl_seconds`/`max_uses` overrides (may only narrow the request).
+  optional `substitute_secret` (also only when the secret is not stored — see
+  addendum #20), `ttl_seconds`/`max_uses` overrides (may only narrow the request).
 - `POST /ui/requests/{id}/deny`.
 - `GET /ui/grants` + `POST /ui/grants/{id}/revoke`.
 - `GET /ui/policies` + `POST /ui/policies` (create standing grant row) +
@@ -581,6 +582,30 @@ These override anything above where they conflict.
     caller can reintroduce the "seal first, lock later" shape by attaching a
     durable payload to a grant. The read path matches: a passthrough is only
     ever opened with the ephemeral KEK, never by guessing an active keyset key.
+20. **Substituting a stored secret at approval time.** When a request names a
+    secret Keychute does not hold, the approval page also offers the stored
+    secrets that could serve the requested tier (`substitute_secret`, value
+    `"<current_version>:<name>"`). Picking one issues the grant against THAT
+    secret: `grants.secret_name` is the released name, nothing is stored under
+    the name the client asked for, and the `request-approved` audit row carries
+    `detail.substituted_for_requested_name` so the two names are both on the
+    record. `substitute_secret` is mutually exclusive with `secret_value` /
+    `store_secret`, and is rejected outright on the stored-secret form.
+    Before releasing, the handler re-checks the chosen row against LIVE state:
+    still present, enabled, `current_version` unchanged since the page rendered
+    (otherwise the same 409 re-render as the requested name's own state marker,
+    `secret_state_marker`), tier ≤ its `max_tier`, and — because the
+    request's stored decision was evaluated against a name no rule could match
+    — a full re-run of the policy engine for the chosen secret. A `deny` row
+    scoped to it (by name or tag) refuses the approval, and the winning row's
+    `not_after` caps the grant alongside the request's own cap. That re-run
+    uses the EFFECTIVE constraints (the operator's narrowed `ttl_seconds` /
+    `max_uses`), not the requested ones: narrowing makes the request a subset
+    of more rows, and a tighter row that only now matches is exactly the one
+    whose cap must apply.
+    The resolved request page reads the released name off the grant rather than
+    the request row, so revisiting a substituted approval shows what was
+    actually released, plus the name the client asked for.
 
 ## Definition of done per module
 
