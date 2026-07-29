@@ -198,6 +198,21 @@ pub async fn get_grant(db: &PgPool, id: Uuid) -> anyhow::Result<Option<GrantRow>
     )
 }
 
+/// The grant minted for `request_id`, if the request was approved. One row at
+/// most: a request resolves once, and its approval transaction inserts exactly
+/// one grant.
+pub async fn get_grant_for_request(
+    db: &PgPool,
+    request_id: Uuid,
+) -> anyhow::Result<Option<GrantRow>> {
+    Ok(
+        sqlx::query_as::<_, GrantRow>("SELECT * FROM grants WHERE request_id = $1")
+            .bind(request_id)
+            .fetch_optional(db)
+            .await?,
+    )
+}
+
 pub async fn list_grants(db: &PgPool) -> anyhow::Result<Vec<GrantRow>> {
     Ok(
         sqlx::query_as::<_, GrantRow>("SELECT * FROM grants ORDER BY created_at DESC")

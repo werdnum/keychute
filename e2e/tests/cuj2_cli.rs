@@ -284,6 +284,17 @@ async fn unstored_request_released_from_an_existing_secret() {
         .unwrap();
     assert_eq!(stored, 0, "substitution stores nothing");
 
+    // Revisiting the resolved request reports what was RELEASED, and says the
+    // requested name was not it.
+    let resolved = env
+        .ui_get(&format!("/ui/requests/{request_id}"))
+        .await
+        .unwrap();
+    assert!(
+        resolved.contains("released in place of my-api-key"),
+        "resolved page names the substitution: {resolved}"
+    );
+
     // The audit row records both names: released, and asked for.
     let (secret_name, detail): (Option<String>, Option<serde_json::Value>) = sqlx::query_as(
         "SELECT secret_name, detail FROM audit_log \

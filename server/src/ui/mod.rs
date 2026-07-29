@@ -1216,19 +1216,37 @@ async fn render_request_detail(
         // — not just the bare state.
         let mechanism = parse_mechanism(&row.mechanism)?;
         let constraints = parse_constraints(row)?;
-        let secret = db::get_secret_by_name(&state.db, &row.secret_name).await?;
+        // What was RELEASED, which is not always what was asked for: an
+        // approval may substitute a stored secret for a name the client got
+        // wrong, and only the grant records which one. The request row keeps
+        // the requested name forever, so read the released name off the grant
+        // and say so — this page exists to show what actually happened.
+        let released = db::get_grant_for_request(&state.db, row.id)
+            .await?
+            .map(|g| g.secret_name)
+            .unwrap_or_else(|| row.secret_name.clone());
+        let substituted = released != row.secret_name;
+        let secret = db::get_secret_by_name(&state.db, &released).await?;
         let context = decrypt_context(state, row);
-        let secret_line = match &secret {
-            Some(s) => html! {
-                span .mono { (s.name) } " "
-                span .muted {
-                    "(stored, version " (s.current_version)
-                    ", max tier: "
-                    (Tier::from_int(s.max_tier).map(|t| t.as_str()).unwrap_or("?"))
-                    ")"
+        let secret_line = html! {
+            @match &secret {
+                Some(s) => {
+                    span .mono { (s.name) } " "
+                    span .muted {
+                        "(stored, version " (s.current_version)
+                        ", max tier: "
+                        (Tier::from_int(s.max_tier).map(|t| t.as_str()).unwrap_or("?"))
+                        ")"
+                    }
                 }
-            },
-            None => html! { (row.secret_name) },
+                None => { span .mono { (released) } }
+            }
+            @if substituted {
+                " "
+                span .caveat {
+                    "(released in place of " (row.secret_name) ", which is not stored)"
+                }
+            }
         };
         let badge_class = match label {
             "approved" => "badge badge-ok",
@@ -1937,8 +1955,19 @@ async fn approve(
             // name must not be able to hand over a credential the policy table
             // refuses this client, and any cap on the winning row applies to the
             // grant minted from it.
+            // Evaluated against the grant as it will actually be issued, not as
+            // it was requested: narrowing makes the request a subset of MORE
+            // rows, and a tighter row that only now matches is exactly the one
+            // whose `not_after` should cap this grant. Using the un-narrowed
+            // constraints would let a broad uncapped row keep winning and drop
+            // that cap.
+            let effective = Constraints {
+                ttl_seconds: ttl,
+                max_uses: max_uses.map(|u| u.min(u64::from(u32::MAX)) as u32),
+                ..constraints.clone()
+            };
             let evaluation =
-                evaluate_substitution(&state, &row, &chosen, mechanism, &constraints, now).await?;
+                evaluate_substitution(&state, &row, &chosen, mechanism, &effective, now).await?;
             if let policy::Decision::Deny { reason } = evaluation.decision {
                 return Err(UiError::bad_request(format!(
                     "standing policy refuses that secret for {}: {reason}",

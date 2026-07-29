@@ -548,7 +548,14 @@ These override anything above where they conflict.
     request's stored decision was evaluated against a name no rule could match
     — a full re-run of the policy engine for the chosen secret. A `deny` row
     scoped to it (by name or tag) refuses the approval, and the winning row's
-    `not_after` caps the grant alongside the request's own cap.
+    `not_after` caps the grant alongside the request's own cap. That re-run
+    uses the EFFECTIVE constraints (the operator's narrowed `ttl_seconds` /
+    `max_uses`), not the requested ones: narrowing makes the request a subset
+    of more rows, and a tighter row that only now matches is exactly the one
+    whose cap must apply.
+    The resolved request page reads the released name off the grant rather than
+    the request row, so revisiting a substituted approval shows what was
+    actually released, plus the name the client asked for.
 
 ## Definition of done per module
 
