@@ -574,9 +574,11 @@ async fn approve_token_is_bound_to_the_rendered_secret_state() {
         .await
         .unwrap();
     let stored_token = extract_csrf(&page, &stored_action).expect("approve csrf token");
+    // "1:<current_version>" — the version is part of the marker so a
+    // rotation mid-review invalidates the form (see `secret_state_marker`).
     assert_eq!(
         extract_form_field(&page, &stored_action, "secret_present").as_deref(),
-        Some("1")
+        Some("1:1")
     );
 
     // Downgrading the marker to "0" (which would open the operator-supplied

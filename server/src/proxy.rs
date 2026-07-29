@@ -518,9 +518,18 @@ async fn handle_inner(
     // caller's query string is forwarded verbatim, so it is part of "where":
     // it is recorded alongside the path — otherwise `?limit=10` and
     // `?transfer_to=attacker` would produce identical audit rows.
-    let audited_path = match parts.uri.query() {
-        Some(q) => format!("{canonical}?{q}"),
-        None => canonical.clone(),
+    // Audited in ENCODED (wire) form, not the decoded canonical one: `%3F`
+    // canonicalizes to a literal `?`, so `"{canonical}?{query}"` would record
+    // `/a%3Fb?x=1` as `/a?b?x=1` — ambiguous about where the credential
+    // actually went. Deriving it from `outbound_url` makes the audit row
+    // exactly the target that is about to be requested.
+    let audited_path = {
+        let sent = outbound_url(&origin.to_display(), &canonical, parts.uri.query())
+            .map_err(|e| ApiFailure::Internal(anyhow::anyhow!("origin parse: {e}")))?;
+        match sent.query() {
+            Some(q) => format!("{}?{}", sent.path(), q),
+            None => sent.path().to_owned(),
+        }
     };
     let target = db::AuditTarget {
         method: method.clone(),

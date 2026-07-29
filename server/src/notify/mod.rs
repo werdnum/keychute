@@ -77,6 +77,11 @@ impl PushoverNotifier {
         let http = reqwest::Client::builder()
             .connect_timeout(PUSH_CONNECT_TIMEOUT)
             .timeout(PUSH_REQUEST_TIMEOUT)
+            // The form body carries the app token AND the user key: a 307/308
+            // to another origin would re-POST both there. Same policy as the
+            // proxy leg and the TokenReview client — credentials go only to
+            // the configured endpoint.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             // Same failure mode as `reqwest::Client::new()`: only a broken TLS
             // backend can get here, and that is not a recoverable runtime state.

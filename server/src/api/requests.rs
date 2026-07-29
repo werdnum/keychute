@@ -30,13 +30,22 @@ const MAX_USES: u32 = i32::MAX as u32;
 /// Validate a create-access-request body and return the normalized
 /// constraints to store (canonical path prefixes, uppercased methods,
 /// releasing-tier max_uses defaulted to 1). Pure; unit-tested.
-pub(crate) fn validate_request(req: &CreateAccessRequest) -> Result<Constraints, ApiFailure> {
+/// Bounds on the idempotency key alone. Split out of [`validate_request`]
+/// because the create handler must be able to look a retry up — and return
+/// the committed request — BEFORE validating fields that are not part of the
+/// idempotency identity (see `create`).
+pub(crate) fn validate_idempotency_key(req: &CreateAccessRequest) -> Result<(), ApiFailure> {
     if req.idempotency_key.is_empty() {
         return Err(ApiFailure::InvalidRequest("idempotency_key is required"));
     }
     if req.idempotency_key.len() > MAX_IDEM_KEY_BYTES {
         return Err(ApiFailure::RequestTooLarge("idempotency_key too long"));
     }
+    Ok(())
+}
+
+pub(crate) fn validate_request(req: &CreateAccessRequest) -> Result<Constraints, ApiFailure> {
+    validate_idempotency_key(req)?;
     if req.secret_name.is_empty() || req.secret_name.len() > 256 {
         return Err(ApiFailure::InvalidRequest("invalid secret_name"));
     }
@@ -208,9 +217,23 @@ fn policy_inputs(
             let mechanism = Mechanism::from_str_opt(&r.mechanism)?;
             let outcome = policy::Outcome::from_str_opt(&r.outcome)?;
             let origins = serde_json::from_value(r.origins.clone()).ok()?;
-            Some((mechanism, outcome, origins))
+            // `methods` and `path_prefixes` are plain text[]: a row written
+            // outside the UI can hold values the UI would reject. An invalid
+            // prefix silently fails `prefix_matches`, so a DENY row carrying
+            // one would stop overlapping and lose to a permissive row —
+            // exactly the widening this fail-closed parse exists to prevent.
+            // Validate them here so such a row errors instead.
+            if !r.methods.iter().all(|m| policy::is_valid_http_method(m)) {
+                return None;
+            }
+            let path_prefixes = r
+                .path_prefixes
+                .iter()
+                .map(|p| policy::paths::canonicalize(p).ok())
+                .collect::<Option<Vec<String>>>()?;
+            Some((mechanism, outcome, origins, path_prefixes))
         })();
-        let Some((mechanism, outcome, origins)) = parsed else {
+        let Some((mechanism, outcome, origins, path_prefixes)) = parsed else {
             if applicable {
                 // Generic reason: never echo the malformed content back.
                 tracing::error!(
@@ -234,7 +257,8 @@ fn policy_inputs(
             priority: r.priority,
             origins,
             methods: r.methods.clone(),
-            path_prefixes: r.path_prefixes.clone(),
+            // Canonical form, as `prefix_matches` expects.
+            path_prefixes,
             max_ttl_seconds: r.max_ttl_seconds.map(|v| v.max(0) as u64),
             max_uses: r.max_uses.map(|v| v.max(0) as u32),
             not_after: r.not_after,
@@ -295,17 +319,24 @@ pub async fn create(
 
     let req: CreateAccessRequest = serde_json::from_slice(&body)
         .map_err(|_| ApiFailure::InvalidRequest("malformed request body"))?;
-    let constraints = validate_request(&req)?;
+    // Only the key's own bounds here — it is about to be used as a lookup
+    // key. Everything else is validated AFTER the idempotent short-circuit
+    // below, so a retry is never rejected on a field that is not part of the
+    // idempotency identity: `context.structured` is excluded from the MAC
+    // precisely because a rerun captures different machine context, and it
+    // would be incoherent to then refuse that rerun for a size limit on it.
+    validate_idempotency_key(&req)?;
     let idem_mac = state
         .keyset
         .idem_mac(client.name(), &canonical::canonical_request_payload(&req));
 
-    // Idempotent retry short-circuit, BEFORE policy evaluation: the original
-    // response may have been lost, and the retry must recover the committed
-    // request even when policy state has degraded since (a row that no longer
-    // parses fails `policy_inputs` closed, which would otherwise hide the
-    // original request id from its owner forever). The insert's ON CONFLICT
-    // branch below stays as the backstop for the concurrent-create race.
+    // Idempotent retry short-circuit, BEFORE validation and policy
+    // evaluation: the original response may have been lost, and the retry
+    // must recover the committed request even when policy state has degraded
+    // since (a row that no longer parses fails `policy_inputs` closed, which
+    // would otherwise hide the original request id from its owner forever).
+    // The insert's ON CONFLICT branch below stays as the backstop for the
+    // concurrent-create race.
     if let Some(row) =
         db::api_ext::get_request_by_idem(&state.db, client.name(), &req.idempotency_key).await?
     {
@@ -315,6 +346,9 @@ pub async fn create(
         let status = status_from_row(&state, &row).await?;
         return Ok((StatusCode::OK, Json(status)).into_response());
     }
+
+    // Genuinely new request: full validation.
+    let constraints = validate_request(&req)?;
 
     // Policy evaluation is pure; run it before the insert so the pending cap
     // can be enforced without creating an orphan row (slight race accepted).

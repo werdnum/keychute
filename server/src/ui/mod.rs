@@ -416,8 +416,9 @@ const F_SECRET_PRESENT: &str = "secret_present";
 /// Wording shared by the GET banner and the 409 body.
 const SECRET_STATE_CHANGED: &str =
     "the stored state of this secret changed while you were reviewing this \
-     request, so this form no longer means what it said: nothing was approved. \
-     Re-check the details below and decide again.";
+     request — it was stored, removed, or rotated to a new version — so this \
+     form no longer means what it said: nothing was approved. Re-check the \
+     details below and decide again.";
 
 async fn request_detail_page(
     State(state): State<AppState>,
@@ -530,7 +531,8 @@ async fn render_request_detail(
     // The marker is folded into the approve token's MAC, so the token is only
     // valid for the state this page was rendered against and the hidden field
     // cannot be swapped independently of it.
-    let secret_present = secret_present_marker(secret.is_some());
+    let secret_present = secret_state_marker(secret.as_ref());
+    let secret_present = secret_present.as_str();
     // CSRF tokens are minted on the PROCESS clock because `check_post` ->
     // `verify_token` measures their TTL against `Utc::now()`. `now` here is
     // the database clock (it gates request expiry, which SQL enforces), and
@@ -782,19 +784,31 @@ fn validate_injection(
 /// `None` = no usable marker (malformed form).
 fn parse_secret_present(rendered: Option<&str>) -> Option<bool> {
     match rendered {
-        Some("1") => Some(true),
         Some("0") => Some(false),
-        _ => None,
+        Some(s) => s.strip_prefix("1:")?.parse::<i32>().ok().map(|_| true),
+        None => None,
     }
 }
 
-/// Canonical spelling of the marker, used both for the hidden field and as the
-/// CSRF token's form-state binding so the two can never disagree.
-fn secret_present_marker(present: bool) -> &'static str {
-    if present {
-        "1"
-    } else {
-        "0"
+/// Canonical spelling of the render-time secret-state marker, used both for
+/// the hidden field and as the CSRF token's form-state binding so the two can
+/// never disagree: `"0"` when no secret is stored under the requested name,
+/// `"1:<current_version>"` when one is.
+///
+/// The VERSION is part of the marker because the approval page displays it
+/// while the release path resolves the current version at read time. Without
+/// it, an operator who reviewed version 3 could approve moments after a
+/// rotation and the client would receive version 4 — a credential nobody
+/// reviewed on that page. Including it turns that race into the same 409
+/// re-render as a secret appearing or disappearing.
+///
+/// The grant deliberately still resolves the current version at read time
+/// rather than pinning the reviewed one: pinning would keep releasing a
+/// retired credential after a rotation, which is the worse failure.
+fn secret_state_marker(secret: Option<&db::SecretRow>) -> String {
+    match secret {
+        Some(s) => format!("1:{}", s.current_version),
+        None => "0".to_owned(),
     }
 }
 
@@ -844,12 +858,12 @@ async fn approve(
         submitted_marker,
         &form.csrf_token,
     )?;
-    // Past the guard the marker is provably one this server rendered, but parse
-    // rather than assume: never guess a branch from an unrecognised value.
-    let rendered_present =
-        parse_secret_present(non_empty(&form.secret_present)).ok_or_else(|| {
-            UiError::bad_request("malformed approval form; reload the page and retry")
-        })?;
+    // Past the guard the marker is provably one this server rendered, but
+    // parse rather than assume: never accept an unrecognised value (the
+    // comparison against current state below is the actual gate).
+    parse_secret_present(non_empty(&form.secret_present)).ok_or_else(|| {
+        UiError::bad_request("malformed approval form; reload the page and retry")
+    })?;
     let row = db::get_request(&state.db, id)
         .await?
         .ok_or_else(|| UiError::new(StatusCode::NOT_FOUND, "no such request"))?;
@@ -908,7 +922,10 @@ async fn approve(
     // "resolved concurrently" case below).
     // The marker is authenticated (it is part of the token's MAC input), so a
     // mismatch here can only mean the world moved, never a doctored field.
-    if rendered_present != secret.is_some() {
+    // Whole-marker comparison: catches the secret appearing or disappearing
+    // AND a rotation that changed its current version since the page was
+    // rendered (see `secret_state_marker`).
+    if submitted_marker != secret_state_marker(secret.as_ref()) {
         let page =
             render_request_detail(&state, &op, &row, now, Some(SECRET_STATE_CHANGED)).await?;
         return Ok((StatusCode::CONFLICT, page).into_response());
@@ -1780,24 +1797,21 @@ mod tests {
         // Rendered against an absent secret, still absent: the form means what
         // it said (operator's typed value is the one released).
         assert_eq!(parse_secret_present(Some("0")), Some(false));
-        // Rendered against a stored secret.
-        assert_eq!(parse_secret_present(Some("1")), Some(true));
+        // Rendered against a stored secret, at a specific version.
+        assert_eq!(parse_secret_present(Some("1:3")), Some(true));
         // No usable marker: never guess a branch.
         assert_eq!(parse_secret_present(None), None);
         assert_eq!(parse_secret_present(Some("yes")), None);
-        // The marker round-trips through the spelling used for both the hidden
-        // field and the CSRF binding, so the two can never disagree.
-        for present in [true, false] {
-            assert_eq!(
-                parse_secret_present(Some(secret_present_marker(present))),
-                Some(present)
-            );
-        }
-        // A rendered marker that no longer matches reality is the 409 case: a
-        // secret appeared under an "absent" form, or vanished under a "stored"
-        // one. The handler compares exactly these two booleans.
-        assert_ne!(parse_secret_present(Some("0")), Some(true));
-        assert_ne!(parse_secret_present(Some("1")), Some(false));
+        // Bare "1" is not a marker this server ever renders.
+        assert_eq!(parse_secret_present(Some("1")), None);
+        assert_eq!(parse_secret_present(Some("1:")), None);
+        assert_eq!(parse_secret_present(Some("1:v3")), None);
+
+        // The handler compares the WHOLE marker against current state, so the
+        // 409 covers three transitions: appeared, vanished, and rotated.
+        assert_ne!("0", "1:3"); // secret appeared under an "absent" form
+        assert_ne!("1:3", "0"); // ...or vanished under a "stored" one
+        assert_ne!("1:3", "1:4"); // ...or was rotated mid-review
     }
 
     /// The approve token is minted against the render-time secret state, so a
@@ -1808,27 +1822,21 @@ mod tests {
         let ks = csrf::test_keyset();
         let now = Utc::now();
         let (route, id, subj) = (R_APPROVE, "req-1", "andrew");
-        for present in [true, false] {
-            let token =
-                csrf::issue_token(&ks, route, id, subj, secret_present_marker(present), now);
-            assert!(csrf::verify_token(
-                &ks,
-                route,
-                id,
-                subj,
-                secret_present_marker(present),
-                &token,
-                now
-            ));
-            assert!(!csrf::verify_token(
-                &ks,
-                route,
-                id,
-                subj,
-                secret_present_marker(!present),
-                &token,
-                now
-            ));
+        // Absent, stored-at-v3, stored-at-v4: a token minted for any one of
+        // these must not verify against either of the others, so neither a
+        // secret appearing/vanishing nor a rotation can be replayed past the
+        // guard.
+        let markers = ["0", "1:3", "1:4"];
+        for minted in markers {
+            let token = csrf::issue_token(&ks, route, id, subj, minted, now);
+            for candidate in markers {
+                let ok = csrf::verify_token(&ks, route, id, subj, candidate, &token, now);
+                assert_eq!(
+                    ok,
+                    candidate == minted,
+                    "token for {minted:?} verified against {candidate:?}"
+                );
+            }
         }
     }
 
