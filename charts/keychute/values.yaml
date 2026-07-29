@@ -26,7 +26,21 @@ namespace: keychute
 image:
   repository: ghcr.io/werdnum/keychute
   # Either a digest (preferred, set by CI) or a tag. Digest wins if both set.
-  digest: ""
+  #
+  # Seeded by hand with the digest `:latest` resolved to when the kube-config
+  # wiring landed, because the bump above had not yet produced one: it failed
+  # on main at "Generate GitHub App token" (`[@octokit/auth-app] appId option
+  # is required` — the IMAGE_UPDATER_* secrets were missing). The image push
+  # itself always worked; only the commit-back failed, which is how `:latest`
+  # stayed current while `digest` stayed empty — and an empty digest means a
+  # `:latest` pull under `pullPolicy: IfNotPresent`, which never refreshes.
+  #
+  # The workflow has since been fixed, so CI owns this value again and will
+  # overwrite it on the next push to main. The seed remains as a floor: it
+  # keeps the chart out of the `digest: ""` state in git, and it is the digest
+  # the k8s-agent image in kube-config lifts the client CLI out of, so server
+  # and CLI ship as a matched pair.
+  digest: "sha256:33b39a0b90f3d52f6f34f76750f3c92f5a4caf1b411d6165411c282c260ca0f8"
   tag: "latest"
   pullPolicy: IfNotPresent
 
