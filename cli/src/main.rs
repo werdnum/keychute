@@ -1,6 +1,8 @@
-//! keychute CLI: request secrets from a Keychute server (CUJ 2, tier-2 cli-read).
+//! keychute CLI: request secrets from a Keychute server (CUJ 2, tier-2 cli-read),
+//! and deposit new ones (`keychute store`, reading the value from stdin).
 //!
 //! The secret goes to STDOUT and nowhere else; all diagnostics go to stderr.
+//! Nothing ever puts a secret value in argv — `store` reads stdin or a file.
 //!
 //! Exit codes: 0 success, 2 usage/config error, 3 denied, 4 timeout/expired
 //! (including an expired grant), 5 payload lost, 1 anything else (including a
@@ -8,7 +10,7 @@
 
 mod pipeline;
 
-use std::io::{IsTerminal, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -16,10 +18,11 @@ use base64::Engine as _;
 use clap::{Parser, Subcommand};
 use keychute_types::{
     ApiError, Constraints, CreateAccessRequest, Mechanism, ReadGrantRequest, ReadGrantResponse,
-    RequestContext, RequestState, SecretEncoding,
+    RequestContext, RequestState, SecretEncoding, StoreSecretRequest, StoreSecretResponse, Tier,
 };
 use serde::Deserialize;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 const EXIT_OTHER: i32 = 1;
 const EXIT_CONFIG: i32 = 2;
@@ -55,6 +58,8 @@ struct Cli {
 enum Cmd {
     /// Request a secret; once approved, print it to stdout.
     Request(RequestArgs),
+    /// Store a NEW secret, read from stdin (never printed, never in argv).
+    Store(StoreArgs),
     /// Print the state of an access request as JSON (never the secret).
     Status {
         /// The access request id.
@@ -85,6 +90,36 @@ struct RequestArgs {
     /// (default: only when stdout is a TTY).
     #[arg(long)]
     newline: bool,
+}
+
+#[derive(clap::Args)]
+struct StoreArgs {
+    /// Name for the new secret. Must not already exist: this command never
+    /// replaces a stored secret (rotation is an operator action in the UI).
+    secret_name: String,
+    /// Read the value from this file instead of stdin ("-" means stdin).
+    #[arg(long)]
+    value_file: Option<PathBuf>,
+    /// Operator-facing description, shown in the Keychute UI.
+    #[arg(long, default_value = "")]
+    description: String,
+    /// Most permissive delivery this secret may ever get: brokered,
+    /// trusted-client, cooperating-client or direct. Defaults to the tightest
+    /// (brokered) and may not exceed this client's own maximum tier.
+    #[arg(long, default_value = "brokered")]
+    max_tier: String,
+    /// How the brokered proxy injects this credential: bearer, header, basic.
+    #[arg(long, default_value = "bearer")]
+    injection_kind: String,
+    /// Header name for --injection-kind header; username for basic.
+    #[arg(long)]
+    injection_header: Option<String>,
+    /// Store the input bytes verbatim, including any trailing newline.
+    /// Without this, exactly one trailing newline is stripped — `echo secret |
+    /// keychute store …` is the common case and the newline is not part of
+    /// the credential.
+    #[arg(long)]
+    raw: bool,
 }
 
 /// A terminal failure: message for stderr plus the process exit code.
@@ -740,6 +775,148 @@ fn write_secret(released: &ReadGrantResponse, force_newline: bool) -> CliResult<
     Ok(())
 }
 
+/// Read the secret bytes for `store`: stdin by default, or `--value-file`.
+///
+/// Never an argv flag: process arguments are readable by every other process
+/// on the box (and land in shell history), which is exactly the exposure this
+/// tool exists to avoid.
+fn read_secret_input(source: Option<&PathBuf>, raw: bool) -> CliResult<Zeroizing<Vec<u8>>> {
+    let mut buf: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::new());
+    match source {
+        Some(path) if path.as_os_str() != "-" => {
+            let bytes = std::fs::read(path).map_err(|e| {
+                fail(
+                    EXIT_CONFIG,
+                    format!("cannot read --value-file {}: {e}", path.display()),
+                )
+            })?;
+            buf.extend_from_slice(&bytes);
+        }
+        _ => {
+            let stdin = std::io::stdin();
+            if stdin.is_terminal() {
+                eprintln!("keychute: reading the secret from stdin; end with Ctrl-D");
+            }
+            stdin.lock().read_to_end(&mut buf).map_err(|e| {
+                fail(
+                    EXIT_CONFIG,
+                    format!("cannot read the secret from stdin: {e}"),
+                )
+            })?;
+        }
+    }
+    if !raw && strip_trailing_newline(&mut buf) {
+        eprintln!("keychute: stripped the trailing newline (pass --raw to keep it)");
+    }
+    if buf.is_empty() {
+        return Err(fail(EXIT_CONFIG, "the secret value is empty"));
+    }
+    Ok(buf)
+}
+
+/// Drop exactly one trailing newline (`\n` or `\r\n`) — the one `echo` and
+/// heredocs add. Returns whether anything was stripped. A second trailing
+/// newline, or interior whitespace, is left alone: it could be part of the
+/// credential (a PEM block ends in a newline; two do not).
+fn strip_trailing_newline(buf: &mut Vec<u8>) -> bool {
+    if buf.last() != Some(&b'\n') {
+        return false;
+    }
+    buf.pop();
+    if buf.last() == Some(&b'\r') {
+        buf.pop();
+    }
+    true
+}
+
+/// Store a new secret. Deliberately a single attempt with no retry: unlike
+/// `request`, this call is not idempotent — a retry after a lost response
+/// would hit the server's create-only refusal and report a conflict for a
+/// secret this very invocation stored. The failure message says so, so the
+/// caller checks the store rather than blindly re-running.
+async fn run_store(cfg: &Config, http: &reqwest::Client, args: StoreArgs) -> CliResult<()> {
+    let StoreArgs {
+        secret_name,
+        value_file,
+        description,
+        max_tier,
+        injection_kind,
+        injection_header,
+        raw,
+    } = args;
+    let tier = parse_tier(&max_tier)
+        .ok_or_else(|| fail(EXIT_CONFIG, format!("unknown max-tier {max_tier:?}")))?;
+    let value = read_secret_input(value_file.as_ref(), raw)?;
+    // utf8 when it round-trips, base64 otherwise (binary keys, DER blobs).
+    let (encoded, encoding) = match std::str::from_utf8(&value) {
+        Ok(s) => (Zeroizing::new(s.to_owned()), SecretEncoding::Utf8),
+        Err(_) => (
+            Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(&*value)),
+            SecretEncoding::Base64,
+        ),
+    };
+
+    let body = StoreSecretRequest {
+        name: secret_name,
+        value: encoded.to_string(),
+        encoding,
+        description,
+        max_tier: Some(tier),
+        injection_kind: Some(injection_kind),
+        injection_header,
+    };
+
+    let resp = http
+        .post(format!("{}/v1/secrets", cfg.url))
+        .bearer_auth(cfg.bearer()?)
+        .timeout(Duration::from_secs(HTTP_TIMEOUT_SECONDS))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| fail(EXIT_OTHER, format!("store request failed: {e}")))?;
+    let status = resp.status();
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| fail(EXIT_OTHER, format!("failed reading store response: {e}")))?;
+    if !status.is_success() {
+        let msg = api_error_message(status, &text);
+        let code = match status.as_u16() {
+            401 => EXIT_CONFIG,
+            403 => EXIT_DENIED,
+            _ => EXIT_OTHER,
+        };
+        if status == reqwest::StatusCode::CONFLICT {
+            return Err(fail(
+                code,
+                format!(
+                    "store failed: {msg}. Keychute never replaces a stored secret from the CLI: \
+                     pick a different name, or ask the operator to rotate it"
+                ),
+            ));
+        }
+        return Err(fail(code, format!("store failed: {msg}")));
+    }
+    let stored: StoreSecretResponse = serde_json::from_str(&text)
+        .map_err(|e| fail(EXIT_OTHER, format!("unexpected store response: {e}")))?;
+    // Diagnostics only, and never the value: stdout stays free for pipelines.
+    eprintln!(
+        "keychute: stored {} (version {}, id {})",
+        stored.name, stored.version, stored.secret_id
+    );
+    Ok(())
+}
+
+fn parse_tier(s: &str) -> Option<Tier> {
+    match s {
+        "brokered" => Some(Tier::Brokered),
+        "trusted-client" => Some(Tier::TrustedClient),
+        "cooperating-client" => Some(Tier::CooperatingClient),
+        "direct" => Some(Tier::Direct),
+        _ => None,
+    }
+}
+
 async fn run_status(cfg: &Config, http: &reqwest::Client, request_id: &str) -> CliResult<()> {
     let id: Uuid = request_id
         .parse()
@@ -771,6 +948,7 @@ async fn run(cli: Cli) -> CliResult<()> {
     let http = build_http_client(&cfg)?;
     match cli.cmd {
         Cmd::Request(args) => run_request(&cfg, &http, args).await,
+        Cmd::Store(args) => run_store(&cfg, &http, args).await,
         Cmd::Status { request_id } => run_status(&cfg, &http, &request_id).await,
     }
 }
@@ -863,6 +1041,62 @@ mod tests {
             }
             _ => panic!("expected request subcommand"),
         }
+    }
+
+    #[test]
+    fn store_arg_defaults_are_the_tightest() {
+        let cli = Cli::parse_from(["keychute", "store", "new-key"]);
+        match cli.cmd {
+            Cmd::Store(args) => {
+                assert_eq!(args.secret_name, "new-key");
+                assert_eq!(args.value_file, None);
+                assert_eq!(args.description, "");
+                // Tightest tier by default: a deposit must not quietly become
+                // the most releasable thing in the store.
+                assert_eq!(args.max_tier, "brokered");
+                assert_eq!(args.injection_kind, "bearer");
+                assert_eq!(args.injection_header, None);
+                assert!(!args.raw);
+            }
+            _ => panic!("expected store subcommand"),
+        }
+    }
+
+    #[test]
+    fn store_has_no_value_flag() {
+        // The value never travels in argv (visible in `ps`, shell history).
+        assert!(Cli::try_parse_from(["keychute", "store", "k", "--value", "s3kr1t"]).is_err());
+    }
+
+    #[test]
+    fn store_tier_parsing() {
+        assert_eq!(parse_tier("brokered"), Some(Tier::Brokered));
+        assert_eq!(
+            parse_tier("cooperating-client"),
+            Some(Tier::CooperatingClient)
+        );
+        assert_eq!(parse_tier("direct"), Some(Tier::Direct));
+        assert_eq!(parse_tier("Brokered"), None);
+        assert_eq!(parse_tier("nonsense"), None);
+    }
+
+    #[test]
+    fn trailing_newline_stripping_is_exactly_one() {
+        let mut b = b"s3kr1t\n".to_vec();
+        assert!(strip_trailing_newline(&mut b));
+        assert_eq!(b, b"s3kr1t");
+        // CRLF counts as the same one newline.
+        let mut b = b"s3kr1t\r\n".to_vec();
+        assert!(strip_trailing_newline(&mut b));
+        assert_eq!(b, b"s3kr1t");
+        // A second newline is content, not shell noise.
+        let mut b = b"pem\n\n".to_vec();
+        assert!(strip_trailing_newline(&mut b));
+        assert_eq!(b, b"pem\n");
+        // Nothing to strip.
+        let mut b = b"s3kr1t".to_vec();
+        assert!(!strip_trailing_newline(&mut b));
+        assert_eq!(b, b"s3kr1t");
     }
 
     #[test]

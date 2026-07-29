@@ -113,6 +113,9 @@ oidc:
 #   - name: k8s-agent
 #     maxTier: cooperating-client
 #     mechanisms: [cli-read]
+#     # Optional, default false: allows `keychute store` (POST /v1/secrets) to
+#     # deposit NEW secrets. Never permits replacing an existing one.
+#     mayStoreSecrets: true
 #     auth:
 #       serviceAccount:
 #         audience: keychute.andrewgarrett.dev

@@ -94,6 +94,98 @@ pub async fn insert_secret_version(
     Ok(row)
 }
 
+/// Client-initiated deposit (`POST /v1/secrets`): create a secret with its
+/// version 1, but ONLY if the name is free. Returns `Ok(None)` when a secret
+/// of that name already exists — the caller turns that into a 409.
+///
+/// Create-only by construction: `ON CONFLICT (name) DO NOTHING` decides inside
+/// the transaction, so two concurrent deposits (or a deposit racing an
+/// operator's `POST /ui/secrets`) cannot both win, and a client can never
+/// replace credential bytes an operator already reviewed. Rotation stays
+/// operator-only.
+///
+/// Same crypto discipline as [`crate::db::ui_ext::create_secret_with_version`]:
+/// the KEK shared lock is taken first and the payload is sealed inside the
+/// writing transaction (addendum #19). The `secret-created` audit row joins the
+/// same transaction and records the depositing client.
+pub async fn create_secret_from_client(
+    db: &PgPool,
+    store: crate::db::ui_ext::StoreSecretParams<'_>,
+    client_name: &str,
+) -> anyhow::Result<Option<Uuid>> {
+    let mut tx = db.begin().await?;
+    super::take_kek_shared_lock(&mut tx).await?;
+    let inserted = sqlx::query(
+        "INSERT INTO secrets \
+         (id, name, description, max_tier, injection_kind, injection_header, \
+          injection_username, current_version) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 1) \
+         ON CONFLICT (name) DO NOTHING",
+    )
+    .bind(store.secret_id)
+    .bind(&store.name)
+    .bind(&store.description)
+    .bind(store.max_tier)
+    .bind(&store.injection_kind)
+    .bind(&store.injection_header)
+    .bind(&store.injection_username)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if inserted == 0 {
+        tx.rollback().await?;
+        return Ok(None);
+    }
+    let sealed = (store.seal)().map_err(|e| anyhow::anyhow!("sealing secret: {e}"))?;
+    sqlx::query(
+        "INSERT INTO secret_versions \
+         (secret_id, version, ciphertext, nonce, wrapped_dek, kek_id) \
+         VALUES ($1, 1, $2, $3, $4, $5)",
+    )
+    .bind(store.secret_id)
+    .bind(&sealed.ciphertext)
+    .bind(&sealed.nonce)
+    .bind(&sealed.wrapped_dek)
+    .bind(&sealed.kek_id)
+    .execute(&mut *tx)
+    .await?;
+    crate::audit::insert_audit(
+        &mut *tx,
+        &crate::audit::AuditEvent {
+            kind: crate::audit::kinds::SECRET_CREATED,
+            client_name: Some(client_name.to_owned()),
+            secret_name: Some(store.name.clone()),
+            actor: Some(format!("client:{client_name}")),
+            // Server vocabulary only — how the row got here, never its content.
+            detail: Some(serde_json::json!({"source": "client-api"})),
+            ..Default::default()
+        },
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Some(store.secret_id))
+}
+
+/// How many secrets this client has deposited in the last `hours` hour(s),
+/// read off the append-only audit log — the deposit's own record, so the count
+/// cannot drift from what actually happened (and survives a secret being
+/// deleted). Backs the per-client deposit rate cap.
+pub async fn count_client_deposits_since(
+    db: &PgPool,
+    client_name: &str,
+    hours: i32,
+) -> anyhow::Result<i64> {
+    Ok(sqlx::query_scalar(
+        "SELECT count(*) FROM audit_log \
+         WHERE kind = $1 AND client_name = $2 AND at > now() - make_interval(hours => $3)",
+    )
+    .bind(crate::audit::kinds::SECRET_CREATED)
+    .bind(client_name)
+    .bind(hours)
+    .fetch_one(db)
+    .await?)
+}
+
 pub async fn get_secret_by_name(db: &PgPool, name: &str) -> anyhow::Result<Option<SecretRow>> {
     Ok(
         sqlx::query_as::<_, SecretRow>("SELECT * FROM secrets WHERE name = $1")

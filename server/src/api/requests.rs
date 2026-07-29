@@ -893,6 +893,7 @@ mod tests {
             sa_audience: None,
             sa_subject: None,
             enabled: true,
+            may_store_secrets: false,
         }
     }
 

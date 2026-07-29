@@ -6,6 +6,7 @@ pub mod authn;
 pub mod config;
 pub mod crypto;
 pub mod db;
+pub mod injection;
 pub mod notify;
 pub mod policy;
 pub mod proxy;

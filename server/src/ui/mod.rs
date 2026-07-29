@@ -1484,91 +1484,14 @@ fn parse_narrow_u64(input: Option<&str>, requested: u64, what: &str) -> UiResult
     }
 }
 
-/// Addendum #4/#17 subset: validate operator-supplied injection template.
-/// Returns `(injection_kind, injection_header, injection_username)`: the form
-/// has one free-text field (named `injection_header`), routed to the header
-/// column for kind 'header' and to `injection_username` for kind 'basic'
-/// (migration 0003). 'basic-password' is accepted as an alias for 'basic'
-/// (both spellings are also valid in the DB CHECK since migration 0004).
+/// Operator-facing wrapper around [`crate::injection::validate_injection`]
+/// (shared with the client deposit endpoint): same rules, UI error shape.
 #[allow(clippy::type_complexity)]
 fn validate_injection(
     kind: &str,
     header: Option<&str>,
 ) -> UiResult<(String, Option<String>, Option<String>)> {
-    const RESERVED: &[&str] = &[
-        "host",
-        "authorization",
-        "proxy-authorization",
-        "cookie",
-        "set-cookie",
-        "forwarded",
-        "x-real-ip",
-        "x-http-method-override",
-        "x-method-override",
-        "x-original-url",
-        "x-rewrite-url",
-        "x-original-method",
-        "connection",
-        "keep-alive",
-        "proxy-connection",
-        "te",
-        "trailer",
-        "transfer-encoding",
-        "upgrade",
-        "content-length",
-        "expect",
-    ];
-    match kind {
-        "bearer" => Ok(("bearer".into(), None, None)),
-        "header" => {
-            let name = header.ok_or_else(|| {
-                UiError::bad_request("injection kind 'header' requires a header name")
-            })?;
-            let lower = name.to_ascii_lowercase();
-            let valid_token = !name.is_empty()
-                && name.bytes().all(|b| {
-                    b.is_ascii_alphanumeric()
-                        || matches!(
-                            b,
-                            b'!' | b'#'
-                                | b'$'
-                                | b'%'
-                                | b'&'
-                                | b'\''
-                                | b'*'
-                                | b'+'
-                                | b'-'
-                                | b'.'
-                                | b'^'
-                                | b'_'
-                                | b'`'
-                                | b'|'
-                                | b'~'
-                        )
-                });
-            if !valid_token {
-                return Err(UiError::bad_request(
-                    "injection header is not a valid header name",
-                ));
-            }
-            if RESERVED.contains(&lower.as_str()) || lower.starts_with("x-forwarded-") {
-                return Err(UiError::bad_request("injection header is reserved"));
-            }
-            Ok(("header".into(), Some(name.to_owned()), None))
-        }
-        "basic" | "basic-password" => {
-            let username = header.ok_or_else(|| {
-                UiError::bad_request("injection kind 'basic-password' requires a username")
-            })?;
-            if username.contains(':') || username.chars().any(|c| c.is_control()) {
-                return Err(UiError::bad_request("invalid basic-auth username"));
-            }
-            // Username goes to injection_username; injection_header stays NULL
-            // (the proxy still falls back to injection_header for old rows).
-            Ok(("basic".into(), None, Some(username.to_owned())))
-        }
-        _ => Err(UiError::bad_request("unknown injection kind")),
-    }
+    crate::injection::validate_injection(kind, header).map_err(UiError::bad_request)
 }
 
 /// Parse the approval form's render-time marker: `Some(true)` = the page was

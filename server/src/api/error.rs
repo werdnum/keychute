@@ -26,6 +26,10 @@ pub enum ApiFailure {
     WrongMechanism,
     /// 409 — idempotency key reused with a different payload MAC.
     IdempotencyKeyReuse,
+    /// 409 — deposit (`POST /v1/secrets`) named a secret that already exists.
+    /// The endpoint is create-only: replacing stored credential bytes is an
+    /// operator action, never a client one.
+    SecretExists,
     /// 403 — policy denied the request (server-vocabulary reason only).
     PolicyDenied(String),
     /// 403 — access-time revalidation failed (addendum #15).
@@ -36,6 +40,8 @@ pub enum ApiFailure {
     TooManyWaits,
     /// 429 — per-client concurrent proxy-stream cap.
     TooManyStreams,
+    /// 429 — per-client hourly secret-deposit cap.
+    TooManyDeposits,
     /// 410 — grant has no uses left.
     GrantExhausted,
     /// 410 — grant revoked or past `not_after`.
@@ -80,6 +86,11 @@ impl ApiFailure {
                 "idempotency-key-reuse",
                 "idempotency key was already used with a different payload".into(),
             ),
+            ApiFailure::SecretExists => (
+                StatusCode::CONFLICT,
+                "secret-exists",
+                "a secret with this name already exists; rotation is operator-only".into(),
+            ),
             ApiFailure::PolicyDenied(reason) => {
                 (StatusCode::FORBIDDEN, "policy-denied", reason.clone())
             }
@@ -102,6 +113,11 @@ impl ApiFailure {
                 StatusCode::TOO_MANY_REQUESTS,
                 "too-many-streams",
                 "per-client concurrent proxy stream cap reached".into(),
+            ),
+            ApiFailure::TooManyDeposits => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "too-many-deposits",
+                "per-client secret deposit rate cap reached".into(),
             ),
             ApiFailure::GrantExhausted => (
                 StatusCode::GONE,

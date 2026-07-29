@@ -58,6 +58,11 @@ data:
           {{- range .mechanisms }}
           - {{ . | quote }}
           {{- end }}
+        {{- if .mayStoreSecrets }}
+        # Lets this client DEPOSIT new secrets (POST /v1/secrets). Create-only:
+        # it can never replace a stored secret, and never raises its own tier.
+        may_store_secrets: true
+        {{- end }}
         auth:
           {{- with .auth.apiTokenSha256 }}
           api_token_sha256: {{ . | lower | quote }}

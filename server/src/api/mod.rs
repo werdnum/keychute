@@ -5,6 +5,7 @@ pub mod canonical;
 pub mod error;
 pub mod grants;
 pub mod requests;
+pub mod secrets;
 
 use crate::authn::client::AuthedClient;
 use crate::db;
@@ -66,6 +67,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/access-requests", post(requests::create))
         .route("/v1/access-requests/{id}", get(requests::status))
         .route("/v1/access-requests/{id}/wait", get(requests::wait))
+        .route("/v1/secrets", post(secrets::store))
         .route("/v1/grants/{id}/read", post(grants::read))
         .route("/v1/grants/{id}/proxy", any(crate::proxy::proxy_root))
         .route(

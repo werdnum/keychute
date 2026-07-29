@@ -99,6 +99,11 @@ pub struct ClientConfig {
     pub max_tier: Tier,
     pub mechanisms: Vec<Mechanism>,
     pub auth: ClientAuthConfig,
+    /// May this client deposit NEW secrets via `POST /v1/secrets`? Default
+    /// false: depositing is a write the operator opts into per client, and it
+    /// never permits replacing an existing secret (rotation stays operator-only).
+    #[serde(default)]
+    pub may_store_secrets: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -144,6 +149,12 @@ pub struct Limits {
     pub proxy_stream_deadline_seconds: u64,
     pub replay_window_seconds: i64,
     pub max_proxy_streams_per_client: usize,
+    /// Client-initiated secret deposits (`POST /v1/secrets`) allowed per
+    /// client per rolling hour. Each deposit pushes the operator and adds a
+    /// row they may have to review, so an opted-in client that goes haywire
+    /// (or is prompt-injected) must not be able to bury them. Counted from
+    /// the audit log.
+    pub max_deposits_per_hour_per_client: i64,
     /// How long the server keeps draining in-flight responses after a
     /// shutdown signal before closing what is left. 0 disables draining.
     ///
@@ -170,6 +181,7 @@ impl Default for Limits {
             proxy_stream_deadline_seconds: 300,
             replay_window_seconds: 60,
             max_proxy_streams_per_client: 8,
+            max_deposits_per_hour_per_client: 20,
             drain_seconds: 25,
         }
     }

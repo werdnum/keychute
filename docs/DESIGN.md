@@ -103,6 +103,33 @@ and is agent-influenceable. The approval UI therefore renders tier-2 context as
    transcript unless the agent deliberately captures it — which is exactly the
    residual risk tier 2 declares.
 
+### CUJ 2b — k8s-agent deposits a credential it just minted (client write)
+
+1. The agent has just created a credential elsewhere (an API key it provisioned,
+   a token it rotated in a third-party console) and needs Keychute to hold it:
+   `… | keychute store my-service-api-key --description "provisioned by the agent"`.
+   The value arrives on **stdin** — never argv, which every other process on the
+   box can read.
+2. The CLI posts it to `POST /v1/secrets`. No approval gate: nothing is being
+   *released*, and holding the deposit pending would strip the agent of a
+   credential it already has in hand. What the deposit does get is the four
+   guardrails that keep it from becoming a back door:
+   - the client must be marked `may_store_secrets` in config (default off);
+   - it is **create-only** — an existing name is a 409, never a rotation, so a
+     compromised client cannot substitute the credential behind a standing grant
+     or overwrite bytes an operator reviewed. Rotation stays operator-only;
+   - the new secret's `max_tier` defaults to `brokered` and may not exceed the
+     depositing client's own cap, so a deposit cannot mint something more
+     releasable than its depositor;
+   - the client may not tag its deposit, because tags select policy rows —
+     self-tagging would be self-selecting its own approval rules.
+3. The operator gets an FYI push ("k8s-agent stored a new secret …") and an audit
+   row (`secret-created`, actor `client:k8s-agent`). Getting the secret back out
+   is the ordinary CUJ 2 flow, approval and all.
+
+This is the second ingestion path alongside approval-time entry (CUJ 2 step 3);
+both exist so credentials never have to transit an LLM chat to get into the store.
+
 ### CUJ 3 — Secure agentic autofill for family-assistant (tier 1)
 
 1. I pre-approve a **standing grant**: secret `hellofresh-login` may be released to

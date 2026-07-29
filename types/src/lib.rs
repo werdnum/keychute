@@ -319,6 +319,46 @@ pub struct ReadGrantResponse {
     pub secret_version_id: Uuid,
 }
 
+/// Client-initiated deposit of a NEW secret (`POST /v1/secrets`).
+///
+/// Create-only: the server refuses a name that already exists rather than
+/// rotating it, so a client can never replace credential bytes an operator
+/// reviewed. Tags are deliberately absent — tag membership selects policy
+/// rows, so letting a client tag its own deposit would let it pick the
+/// approval rules that apply to it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoreSecretRequest {
+    pub name: String,
+    /// Payload: utf8 string, or base64 when `encoding` says so.
+    pub value: String,
+    #[serde(default = "utf8_encoding")]
+    pub encoding: SecretEncoding,
+    #[serde(default)]
+    pub description: String,
+    /// Most permissive delivery this secret will ever allow. Defaults to
+    /// `brokered` (the tightest), and may not exceed the client's own cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tier: Option<Tier>,
+    /// 'bearer' | 'header' | 'basic' (alias 'basic-password'). Default 'bearer'.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub injection_kind: Option<String>,
+    /// Header name for kind 'header'; username for kind 'basic'.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub injection_header: Option<String>,
+}
+
+fn utf8_encoding() -> SecretEncoding {
+    SecretEncoding::Utf8
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoreSecretResponse {
+    pub secret_id: Uuid,
+    pub name: String,
+    /// Always 1: the endpoint only ever creates a secret's first version.
+    pub version: i32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SecretEncoding {
     #[serde(rename = "utf8")]

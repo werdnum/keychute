@@ -64,6 +64,7 @@ fn token_client(name: &str) -> ClientConfig {
             api_token_sha256: Some("ab".repeat(32)),
             service_account: None,
         },
+        may_store_secrets: false,
     }
 }
 
@@ -79,6 +80,7 @@ fn sa_client(name: &str) -> ClientConfig {
                 subject: format!("system:serviceaccount:{name}:{name}"),
             }),
         },
+        may_store_secrets: false,
     }
 }
 
@@ -493,6 +495,100 @@ async fn begin_grant_use_single_use_semantics() -> anyhow::Result<()> {
         GrantUse::ExpiredOrRevoked => {}
         other => panic!("expected ExpiredOrRevoked, got {other:?}"),
     }
+
+    t.teardown().await;
+    Ok(())
+}
+
+/// The deposit path is create-only: the first call stores version 1, and a
+/// second call under the same name changes nothing at all — no new version,
+/// no metadata edit, no extra audit row. That is what stops a client from
+/// substituting the credential behind a standing grant.
+#[tokio::test]
+async fn create_secret_from_client_never_replaces_an_existing_secret() -> anyhow::Result<()> {
+    let Some(t) = setup().await? else {
+        return Ok(());
+    };
+    let keyset = crate::ui::csrf::test_keyset();
+
+    let deposit = |name: &str, description: &str, payload: &'static [u8]| {
+        let name = name.to_owned();
+        let description = description.to_owned();
+        let keyset = &keyset;
+        let pool = &t.pool;
+        async move {
+            let secret_id = Uuid::new_v4();
+            crate::db::create_secret_from_client(
+                pool,
+                ui_ext::StoreSecretParams {
+                    secret_id,
+                    name,
+                    description,
+                    max_tier: Tier::Brokered.as_int(),
+                    injection_kind: "bearer".into(),
+                    injection_header: None,
+                    injection_username: None,
+                    seal: Box::new(move || {
+                        keyset.seal(
+                            &secrecy::SecretBox::new(payload.into()),
+                            crate::crypto::AadContext::SecretVersion {
+                                secret_id,
+                                version: 1,
+                            },
+                        )
+                    }),
+                },
+                "k8s-agent",
+            )
+            .await
+        }
+    };
+
+    let first = deposit("minted", "first", b"v1").await?;
+    assert!(first.is_some(), "the first deposit stores the secret");
+
+    let second = deposit("minted", "second", b"v2").await?;
+    assert!(second.is_none(), "a taken name is refused, not rotated");
+
+    let row = get_secret_by_name(&t.pool, "minted").await?.unwrap();
+    assert_eq!(row.current_version, 1, "no version was appended");
+    assert_eq!(row.description, "first", "metadata was not overwritten");
+    assert_eq!(row.id, first.unwrap(), "the original row survived");
+
+    // The refused deposit left nothing behind — including its audit row.
+    let versions: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM secret_versions WHERE secret_id = $1")
+            .bind(row.id)
+            .fetch_one(&t.pool)
+            .await?;
+    assert_eq!(versions, 1);
+    let created: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_log WHERE kind = $1 AND secret_name = 'minted'",
+    )
+    .bind(audit::kinds::SECRET_CREATED)
+    .fetch_one(&t.pool)
+    .await?;
+    assert_eq!(created, 1, "one deposit, one audit row");
+    let actor: String =
+        sqlx::query_scalar("SELECT actor FROM audit_log WHERE secret_name = 'minted' LIMIT 1")
+            .fetch_one(&t.pool)
+            .await?;
+    assert_eq!(actor, "client:k8s-agent");
+
+    // The stored payload is the FIRST deposit's, decryptable under its AAD.
+    let version = get_secret_version(&t.pool, row.id, 1).await?.unwrap();
+    let opened = keyset.open(
+        &version.ciphertext,
+        &version.nonce,
+        &version.wrapped_dek,
+        &version.kek_id,
+        crate::crypto::AadContext::SecretVersion {
+            secret_id: row.id,
+            version: 1,
+        },
+    )?;
+    use secrecy::ExposeSecret;
+    assert_eq!(opened.expose_secret(), b"v1");
 
     t.teardown().await;
     Ok(())

@@ -25,7 +25,7 @@ Milestones M0–M3 server-side, minus cluster wiring:
 - Human authn: pluggable — `static` mode (bearer token hash + subject, for
   dev/e2e) or `oidc` mode (JWT validation: issuer, audience, signature via JWKS,
   exp/nbf with skew, group/subject allowlist).
-- `keychute` CLI (request → wait → read → stdout).
+- `keychute` CLI (request → wait → read → stdout; `store` for deposits).
 - TLS: rustls listener when cert/key paths configured; plain HTTP otherwise
   (dev/e2e). Production charts always configure TLS.
 - Abuse guards: per-client pending-request cap, per-client concurrent wait cap,
@@ -105,6 +105,7 @@ clients:                   # declarative client provisioning (reconciled at star
   - name: k8s-agent
     max_tier: cooperating-client
     mechanisms: [cli-read]
+    may_store_secrets: true   # optional, default false: allows POST /v1/secrets
     auth:
       service_account:
         audience: "keychute.example.dev"
@@ -124,6 +125,7 @@ limits:
   proxy_max_body_bytes: 10485760
   proxy_stream_deadline_seconds: 300
   replay_window_seconds: 60
+  max_deposits_per_hour_per_client: 20   # POST /v1/secrets, per client
 ```
 
 ## KEK file format (`keyset.json`)
@@ -199,6 +201,32 @@ Client authn: `Authorization: Bearer <api-token>` or
   "utf8"|"base64", "secret_version_id": "..."}`. Only for mechanisms cli-read /
   autofill / direct-read. 410 with code `payload-lost` if a passthrough payload
   was lost to restart.
+- `POST /v1/secrets` — client-initiated deposit of a NEW secret (DESIGN
+  CUJ 2b). Body:
+  ```json
+  {
+    "name": "my-api-key",
+    "value": "<utf8 or base64>",
+    "encoding": "utf8",              // default "utf8"
+    "description": "provisioned by the agent",
+    "max_tier": "brokered",          // default "brokered"
+    "injection_kind": "bearer",      // 'bearer' | 'header' | 'basic'; default 'bearer'
+    "injection_header": "X-Api-Key"  // header name for 'header', username for 'basic'
+  }
+  ```
+  → `201 {"secret_id": "...", "name": "...", "version": 1}`.
+  Guardrails, all server-enforced: the client must have `may_store_secrets` in
+  config (else `403 policy-denied`); the endpoint is **create-only**, so an
+  existing name is `409 secret-exists` and never a rotation; `max_tier` may not
+  exceed the client's own cap (`400`); tags cannot be set by a client (tag
+  membership selects policy rows); `429 too-many-deposits` past
+  `limits.max_deposits_per_hour_per_client` (counted off the audit log).
+  Bounds: name ≤ 128 bytes of
+  `[A-Za-z0-9._-]` (not leading `.`), description ≤ 1 KiB, decoded value ≤
+  64 KiB. Writes `secret-created` with `client_name` set and actor
+  `client:<name>`, plus a best-effort FYI push. Not idempotent by design — a
+  blind retry conflicts rather than silently rotating — so the CLI does not
+  retry it.
 - `ANY /v1/grants/{id}/proxy/{path...}` — brokered. Query string passthrough.
   The target origin comes from the grant (single-origin grants in v1: a brokered
   request must name exactly one origin). Method+path validated against grant.
@@ -251,7 +279,7 @@ Use `uuid` PKs (`gen_random_uuid()` via pgcrypto or app-generated), `timestamptz
 - `secret_tags(secret_id, tag, pk both)`
 - `clients(id, name unique, max_tier int, mechanisms text[], auth_kind text,
   api_token_sha256 text null, sa_audience text null, sa_subject text null,
-  enabled bool)` — reconciled from config at startup (upsert by name; disable
+  may_store_secrets bool default false, enabled bool)` — reconciled from config at startup (upsert by name; disable
   rows absent from config).
 - `policies(id, client_name text null /*null = any*/, secret_name text null,
   secret_tag text null, mechanism text, outcome text
