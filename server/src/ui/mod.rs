@@ -44,6 +44,12 @@ const R_SECRET_SAVE: &str = "/ui/secrets/save";
 
 pub fn router(state: AppState) -> Router {
     Router::new()
+        // Landing page: what a browser gets when the operator types the
+        // hostname and nothing else. `/ui` and `/ui/` are the paths people
+        // guess from the section links, so send both here rather than 404.
+        .route("/", get(overview_page))
+        .route("/ui", get(ui_root))
+        .route("/ui/", get(ui_root))
         .route("/ui/requests", get(requests_page))
         .route("/ui/requests/{id}", get(request_detail_page))
         .route("/ui/requests/{id}/approve", post(approve))
@@ -197,6 +203,7 @@ fn layout(title: &str, body: Markup) -> Markup {
             }
             body {
                 nav {
+                    a href="/" { "Overview" }
                     a href="/ui/requests" { "Requests" }
                     a href="/ui/grants" { "Grants" }
                     a href="/ui/policies" { "Policies" }
@@ -353,6 +360,92 @@ fn decrypt_context(state: &AppState, row: &AccessRequestRow) -> Option<RequestCo
             None
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// GET / — landing page
+
+/// `/ui` and `/ui/` are not pages of their own: they are what an operator
+/// types after seeing a `/ui/...` link. Send them to the overview.
+async fn ui_root() -> Redirect {
+    Redirect::to("/")
+}
+
+/// The page a browser lands on at the bare hostname. It answers "is anything
+/// waiting for me?" first — that is the only time-critical thing Keychute
+/// asks of a human — and then signposts the rest of the UI.
+///
+/// Authenticated like every other UI page: the counts describe which secrets
+/// exist and who is currently holding a grant, so they are not public.
+async fn overview_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> UiResult<Html<String>> {
+    let op = operator(&state, &headers).await?;
+    // Database clock, for the same reason requests_page uses it: a skewed
+    // process clock must not report a request as pending that the approve
+    // transition would reject as expired.
+    let now = db::db_now(&state.db).await?;
+    let pending = db::list_pending(&state.db)
+        .await?
+        .into_iter()
+        .filter(|r| r.expires_at > now)
+        .count();
+    let grants =
+        db::ui_ext::list_active_grants(&state.db, state.config.limits.replay_window_seconds)
+            .await?
+            .len();
+    let policies = db::list_policies(&state.db).await?.len();
+    let secrets = db::list_secrets(&state.db).await?.len();
+
+    Ok(html_page(
+        "Overview",
+        html! {
+            h1 { "Keychute" }
+            p .muted {
+                "Secrets storage and delivery broker for AI agents. Every "
+                "delivery path has an operator-chosen risk tier, and every "
+                "release is either matched by a standing policy or approved "
+                "here by you."
+            }
+            p { "Signed in as " (op.subject) "." }
+
+            @if pending > 0 {
+                p .caveat {
+                    (pending)
+                    @if pending == 1 { " request is" } @else { " requests are" }
+                    " waiting for your decision. "
+                    a href="/ui/requests" { "Review now" }
+                }
+            } @else {
+                p { "Nothing is waiting for your decision." }
+            }
+
+            table {
+                tr { th { "Section" } th { "Now" } th { "What it is" } }
+                tr {
+                    td { a href="/ui/requests" { "Requests" } }
+                    td { (pending) " pending" }
+                    td { "Access requests awaiting approval or denial." }
+                }
+                tr {
+                    td { a href="/ui/grants" { "Grants" } }
+                    td { (grants) " active" }
+                    td { "Live grants; revoke one to cut off access immediately." }
+                }
+                tr {
+                    td { a href="/ui/policies" { "Policies" } }
+                    td { (policies) }
+                    td { "Standing rules that auto-approve matching requests." }
+                }
+                tr {
+                    td { a href="/ui/secrets" { "Secrets" } }
+                    td { (secrets) " stored" }
+                    td { "Stored credentials, their max tier and injection style." }
+                }
+            }
+        },
+    ))
 }
 
 // ---------------------------------------------------------------------------

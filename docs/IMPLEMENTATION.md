@@ -212,6 +212,10 @@ Client authn: `Authorization: Bearer <api-token>` or
 Human/UI routes (cookie-less; bearer via `Authorization` header in static mode,
 or Envoy-forwarded JWT in oidc mode):
 
+- `GET /` — landing page: pending-decision banner plus counts and links for
+  each section, so the bare hostname is a usable entry point. Human-authed like
+  the rest of the UI (the counts describe stored secrets and live grants).
+  `GET /ui` and `GET /ui/` redirect here.
 - `GET /ui/requests` — pending list. `GET /ui/requests/{id}` — approval page.
 - `POST /ui/requests/{id}/approve` — form fields: `csrf_token`, optional
   `secret_value` (when secret not stored), `store_secret` checkbox,
