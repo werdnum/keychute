@@ -46,6 +46,10 @@ const CREATE_ATTEMPTS: u32 = 3;
 const RETRY_BACKOFF_SECONDS: u64 = 1;
 /// Consecutive network failures tolerated while waiting for approval.
 const MAX_WAIT_NETWORK_ERRORS: u32 = 5;
+/// Largest secret `store` will send, matching the server's own cap. Enforced
+/// while reading so an oversize input fails locally instead of after a wasted
+/// upload.
+const MAX_SECRET_BYTES: usize = 64 * 1024;
 
 #[derive(Parser)]
 #[command(name = "keychute", version, about = "Keychute secret delivery CLI")]
@@ -784,20 +788,32 @@ fn read_secret_input(source: Option<&PathBuf>, raw: bool) -> CliResult<Zeroizing
     let mut buf: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::new());
     match source {
         Some(path) if path.as_os_str() != "-" => {
-            let bytes = std::fs::read(path).map_err(|e| {
+            let file = std::fs::File::open(path).map_err(|e| {
                 fail(
                     EXIT_CONFIG,
                     format!("cannot read --value-file {}: {e}", path.display()),
                 )
             })?;
-            buf.extend_from_slice(&bytes);
+            read_bounded(file, &mut buf).map_err(|e| {
+                fail(
+                    EXIT_CONFIG,
+                    format!("cannot read --value-file {}: {e}", path.display()),
+                )
+            })?;
         }
         _ => {
             let stdin = std::io::stdin();
             if stdin.is_terminal() {
-                eprintln!("keychute: reading the secret from stdin; end with Ctrl-D");
+                // The terminal driver echoes what is typed, so an interactive
+                // prompt would print the credential on screen and into any
+                // session recording — exactly what this tool exists to avoid.
+                return Err(fail(
+                    EXIT_CONFIG,
+                    "refusing to read a secret from a terminal (it would be echoed on screen): \
+                     pipe the value in, or use --value-file",
+                ));
             }
-            stdin.lock().read_to_end(&mut buf).map_err(|e| {
+            read_bounded(stdin.lock(), &mut buf).map_err(|e| {
                 fail(
                     EXIT_CONFIG,
                     format!("cannot read the secret from stdin: {e}"),
@@ -812,6 +828,22 @@ fn read_secret_input(source: Option<&PathBuf>, raw: bool) -> CliResult<Zeroizing
         return Err(fail(EXIT_CONFIG, "the secret value is empty"));
     }
     Ok(buf)
+}
+
+/// Read at most [`MAX_SECRET_BYTES`] + 1 bytes, then fail. Both sources are
+/// attacker-or-accident shaped — a mistaken `--value-file /dev/zero`, a stuck
+/// producer upstream in the pipe — and the server would refuse anything over
+/// the limit anyway, so the bound belongs here rather than after an unbounded
+/// read into memory.
+fn read_bounded(source: impl Read, buf: &mut Vec<u8>) -> std::io::Result<()> {
+    source.take(MAX_SECRET_BYTES as u64 + 1).read_to_end(buf)?;
+    if buf.len() > MAX_SECRET_BYTES {
+        buf.clear();
+        return Err(std::io::Error::other(format!(
+            "the secret value exceeds {MAX_SECRET_BYTES} bytes"
+        )));
+    }
+    Ok(())
 }
 
 /// Drop exactly one trailing newline (`\n` or `\r\n`) — the one `echo` and
@@ -873,12 +905,14 @@ async fn run_store(cfg: &Config, http: &reqwest::Client, args: StoreArgs) -> Cli
         .json(&body)
         .send()
         .await
-        .map_err(|e| fail(EXIT_OTHER, format!("store request failed: {e}")))?;
+        .map_err(|e| fail(EXIT_OTHER, ambiguous(format!("store request failed: {e}"))))?;
     let status = resp.status();
-    let text = resp
-        .text()
-        .await
-        .map_err(|e| fail(EXIT_OTHER, format!("failed reading store response: {e}")))?;
+    let text = resp.text().await.map_err(|e| {
+        fail(
+            EXIT_OTHER,
+            ambiguous(format!("failed reading store response: {e}")),
+        )
+    })?;
     if !status.is_success() {
         let msg = api_error_message(status, &text);
         let code = match status.as_u16() {
@@ -897,14 +931,30 @@ async fn run_store(cfg: &Config, http: &reqwest::Client, args: StoreArgs) -> Cli
         }
         return Err(fail(code, format!("store failed: {msg}")));
     }
-    let stored: StoreSecretResponse = serde_json::from_str(&text)
-        .map_err(|e| fail(EXIT_OTHER, format!("unexpected store response: {e}")))?;
+    let stored: StoreSecretResponse = serde_json::from_str(&text).map_err(|e| {
+        fail(
+            EXIT_OTHER,
+            ambiguous(format!("unexpected store response: {e}")),
+        )
+    })?;
     // Diagnostics only, and never the value: stdout stays free for pipelines.
     eprintln!(
         "keychute: stored {} (version {}, id {})",
         stored.name, stored.version, stored.secret_id
     );
     Ok(())
+}
+
+/// Annotate a `store` failure whose outcome the client cannot know: the server
+/// may well have committed the secret and lost only the response. Rerunning
+/// would then hit the create-only refusal and report a conflict for a secret
+/// this very invocation stored — so the caller has to look before choosing
+/// another name or retrying.
+fn ambiguous(message: String) -> String {
+    format!(
+        "{message}. The secret MAY already have been stored (the request was sent): \
+         check the store before retrying or picking another name"
+    )
 }
 
 fn parse_tier(s: &str) -> Option<Tier> {
@@ -1078,6 +1128,33 @@ mod tests {
         assert_eq!(parse_tier("direct"), Some(Tier::Direct));
         assert_eq!(parse_tier("Brokered"), None);
         assert_eq!(parse_tier("nonsense"), None);
+    }
+
+    #[test]
+    fn bounded_read_refuses_oversize_input() {
+        // At the limit: fine.
+        let mut buf = Vec::new();
+        let at_limit = vec![b'x'; MAX_SECRET_BYTES];
+        read_bounded(at_limit.as_slice(), &mut buf).unwrap();
+        assert_eq!(buf.len(), MAX_SECRET_BYTES);
+        // One byte over: rejected locally, and the buffer is not left holding
+        // a partial secret.
+        let mut buf = Vec::new();
+        let over = vec![b'x'; MAX_SECRET_BYTES + 1];
+        let err = read_bounded(over.as_slice(), &mut buf).unwrap_err();
+        assert!(err.to_string().contains("exceeds"), "{err}");
+        assert!(buf.is_empty());
+        // An endless producer stops at the bound instead of eating memory.
+        let mut buf = Vec::new();
+        assert!(read_bounded(std::io::repeat(b'x'), &mut buf).is_err());
+    }
+
+    #[test]
+    fn ambiguous_failures_say_the_secret_may_be_stored() {
+        let msg = ambiguous("store request failed: connection reset".into());
+        assert!(msg.contains("connection reset"));
+        assert!(msg.contains("MAY already have been stored"));
+        assert!(msg.contains("check the store"));
     }
 
     #[test]

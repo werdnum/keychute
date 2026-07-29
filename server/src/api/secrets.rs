@@ -152,17 +152,6 @@ async fn store_inner(
     )
     .map_err(ApiFailure::InvalidRequest)?;
 
-    // Rate cap: every deposit pushes the operator and adds a row they may have
-    // to review, so an opted-in client that goes haywire — or is prompt-injected
-    // into a loop — must not be able to bury them. Checked after validation and
-    // before the write, on the audit log's own record of past deposits.
-    let recent =
-        db::count_client_deposits_since(&state.db, client.name(), DEPOSIT_RATE_WINDOW_HOURS)
-            .await?;
-    if recent >= state.config.limits.max_deposits_per_hour_per_client {
-        return Err(ApiFailure::TooManyDeposits);
-    }
-
     let secret_id = Uuid::new_v4();
     let keyset = &state.keyset;
     let stored = db::create_secret_from_client(
@@ -188,10 +177,22 @@ async fn store_inner(
             }),
         },
         client.name(),
+        // Rate cap: every deposit pushes the operator and adds a row they may
+        // have to review, so an opted-in client that goes haywire — or is
+        // prompt-injected into a loop — must not be able to bury them. Decided
+        // inside the deposit's own transaction, under a per-client lock: a
+        // check out here would let N concurrent deposits all read the same
+        // pre-deposit count and all pass.
+        db::DepositRate {
+            max_per_window: state.config.limits.max_deposits_per_hour_per_client,
+            window_hours: DEPOSIT_RATE_WINDOW_HOURS,
+        },
     )
     .await?;
-    let Some(secret_id) = stored else {
-        return Err(ApiFailure::SecretExists);
+    let secret_id = match stored {
+        db::DepositOutcome::Created(id) => id,
+        db::DepositOutcome::NameTaken => return Err(ApiFailure::SecretExists),
+        db::DepositOutcome::RateLimited => return Err(ApiFailure::TooManyDeposits),
     };
 
     // FYI push: nothing is pending, but a credential just appeared in the

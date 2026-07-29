@@ -94,9 +94,21 @@ pub async fn insert_secret_version(
     Ok(row)
 }
 
+/// Outcome of a client-initiated deposit. The rate decision lives here rather
+/// than in the handler because it is only meaningful when taken atomically
+/// with the write (see [`create_secret_from_client`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DepositOutcome {
+    Created(Uuid),
+    /// A secret of that name already exists — 409, never a rotation.
+    NameTaken,
+    /// The client's hourly deposit cap is already spent — 429.
+    RateLimited,
+}
+
 /// Client-initiated deposit (`POST /v1/secrets`): create a secret with its
-/// version 1, but ONLY if the name is free. Returns `Ok(None)` when a secret
-/// of that name already exists — the caller turns that into a 409.
+/// version 1, but ONLY if the name is free and the client is under its hourly
+/// deposit cap.
 ///
 /// Create-only by construction: `ON CONFLICT (name) DO NOTHING` decides inside
 /// the transaction, so two concurrent deposits (or a deposit racing an
@@ -104,16 +116,44 @@ pub async fn insert_secret_version(
 /// replace credential bytes an operator already reviewed. Rotation stays
 /// operator-only.
 ///
+/// The rate cap is enforced in the SAME transaction, behind a per-client
+/// advisory lock taken first: without it, N concurrent deposits could each read
+/// the pre-deposit count, all pass, and all insert — the cap would bound
+/// nothing but a serial client. The lock serializes one client's deposits
+/// against each other only; different clients never contend.
+///
 /// Same crypto discipline as [`crate::db::ui_ext::create_secret_with_version`]:
-/// the KEK shared lock is taken first and the payload is sealed inside the
-/// writing transaction (addendum #19). The `secret-created` audit row joins the
-/// same transaction and records the depositing client.
+/// the KEK shared lock is taken before sealing and the payload is sealed inside
+/// the writing transaction (addendum #19). The `secret-created` audit row joins
+/// the same transaction and records the depositing client — which is also what
+/// the cap counts, so the count can never drift from what actually happened.
 pub async fn create_secret_from_client(
     db: &PgPool,
     store: crate::db::ui_ext::StoreSecretParams<'_>,
     client_name: &str,
-) -> anyhow::Result<Option<Uuid>> {
+    rate: DepositRate,
+) -> anyhow::Result<DepositOutcome> {
     let mut tx = db.begin().await?;
+    // Per-client serialization for the count-then-insert below. Taken before
+    // the KEK lock, and in that fixed order everywhere, so the two can never
+    // deadlock against each other.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('keychute-deposit'), hashtext($1))")
+        .bind(client_name)
+        .execute(&mut *tx)
+        .await?;
+    let recent: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_log \
+         WHERE kind = $1 AND client_name = $2 AND at > now() - make_interval(hours => $3)",
+    )
+    .bind(crate::audit::kinds::SECRET_CREATED)
+    .bind(client_name)
+    .bind(rate.window_hours)
+    .fetch_one(&mut *tx)
+    .await?;
+    if recent >= rate.max_per_window {
+        tx.rollback().await?;
+        return Ok(DepositOutcome::RateLimited);
+    }
     super::take_kek_shared_lock(&mut tx).await?;
     let inserted = sqlx::query(
         "INSERT INTO secrets \
@@ -134,7 +174,7 @@ pub async fn create_secret_from_client(
     .rows_affected();
     if inserted == 0 {
         tx.rollback().await?;
-        return Ok(None);
+        return Ok(DepositOutcome::NameTaken);
     }
     let sealed = (store.seal)().map_err(|e| anyhow::anyhow!("sealing secret: {e}"))?;
     sqlx::query(
@@ -163,27 +203,15 @@ pub async fn create_secret_from_client(
     )
     .await?;
     tx.commit().await?;
-    Ok(Some(store.secret_id))
+    Ok(DepositOutcome::Created(store.secret_id))
 }
 
-/// How many secrets this client has deposited in the last `hours` hour(s),
-/// read off the append-only audit log — the deposit's own record, so the count
-/// cannot drift from what actually happened (and survives a secret being
-/// deleted). Backs the per-client deposit rate cap.
-pub async fn count_client_deposits_since(
-    db: &PgPool,
-    client_name: &str,
-    hours: i32,
-) -> anyhow::Result<i64> {
-    Ok(sqlx::query_scalar(
-        "SELECT count(*) FROM audit_log \
-         WHERE kind = $1 AND client_name = $2 AND at > now() - make_interval(hours => $3)",
-    )
-    .bind(crate::audit::kinds::SECRET_CREATED)
-    .bind(client_name)
-    .bind(hours)
-    .fetch_one(db)
-    .await?)
+/// The deposit rate cap: at most `max_per_window` deposits per client per
+/// rolling `window_hours`.
+#[derive(Debug, Clone, Copy)]
+pub struct DepositRate {
+    pub max_per_window: i64,
+    pub window_hours: i32,
 }
 
 pub async fn get_secret_by_name(db: &PgPool, name: &str) -> anyhow::Result<Option<SecretRow>> {

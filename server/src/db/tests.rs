@@ -511,7 +511,7 @@ async fn create_secret_from_client_never_replaces_an_existing_secret() -> anyhow
     };
     let keyset = crate::ui::csrf::test_keyset();
 
-    let deposit = |name: &str, description: &str, payload: &'static [u8]| {
+    let deposit = |name: &str, description: &str, payload: &'static [u8], cap: i64| {
         let name = name.to_owned();
         let description = description.to_owned();
         let keyset = &keyset;
@@ -539,21 +539,31 @@ async fn create_secret_from_client_never_replaces_an_existing_secret() -> anyhow
                     }),
                 },
                 "k8s-agent",
+                DepositRate {
+                    max_per_window: cap,
+                    window_hours: 1,
+                },
             )
             .await
         }
     };
 
-    let first = deposit("minted", "first", b"v1").await?;
-    assert!(first.is_some(), "the first deposit stores the secret");
+    let first = deposit("minted", "first", b"v1", 10).await?;
+    let DepositOutcome::Created(first_id) = first else {
+        panic!("the first deposit should store the secret, got {first:?}");
+    };
 
-    let second = deposit("minted", "second", b"v2").await?;
-    assert!(second.is_none(), "a taken name is refused, not rotated");
+    let second = deposit("minted", "second", b"v2", 10).await?;
+    assert_eq!(
+        second,
+        DepositOutcome::NameTaken,
+        "a taken name is refused, not rotated"
+    );
 
     let row = get_secret_by_name(&t.pool, "minted").await?.unwrap();
     assert_eq!(row.current_version, 1, "no version was appended");
     assert_eq!(row.description, "first", "metadata was not overwritten");
-    assert_eq!(row.id, first.unwrap(), "the original row survived");
+    assert_eq!(row.id, first_id, "the original row survived");
 
     // The refused deposit left nothing behind — including its audit row.
     let versions: i64 =
@@ -589,6 +599,16 @@ async fn create_secret_from_client_never_replaces_an_existing_secret() -> anyhow
     )?;
     use secrecy::ExposeSecret;
     assert_eq!(opened.expose_secret(), b"v1");
+
+    // The rate cap is decided inside the same transaction as the write, on
+    // the audit rows the deposits themselves left: one deposit has landed, so
+    // a cap of 1 refuses the next one and stores nothing.
+    let capped = deposit("another", "third", b"v3", 1).await?;
+    assert_eq!(capped, DepositOutcome::RateLimited);
+    assert!(get_secret_by_name(&t.pool, "another").await?.is_none());
+    // ...and raising the cap lets the very same deposit through.
+    let allowed = deposit("another", "third", b"v3", 2).await?;
+    assert!(matches!(allowed, DepositOutcome::Created(_)));
 
     t.teardown().await;
     Ok(())

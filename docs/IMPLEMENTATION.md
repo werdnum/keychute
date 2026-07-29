@@ -220,7 +220,9 @@ Client authn: `Authorization: Bearer <api-token>` or
   existing name is `409 secret-exists` and never a rotation; `max_tier` may not
   exceed the client's own cap (`400`); tags cannot be set by a client (tag
   membership selects policy rows); `429 too-many-deposits` past
-  `limits.max_deposits_per_hour_per_client` (counted off the audit log).
+  `limits.max_deposits_per_hour_per_client` — counted off the audit log inside
+  the deposit's own transaction, behind a per-client advisory lock, so
+  concurrent deposits cannot each observe the same pre-deposit count.
   Bounds: name ≤ 128 bytes of
   `[A-Za-z0-9._-]` (not leading `.`), description ≤ 1 KiB, decoded value ≤
   64 KiB. Writes `secret-created` with `client_name` set and actor

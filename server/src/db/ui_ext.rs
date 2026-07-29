@@ -172,19 +172,25 @@ pub async fn approve_request(
 /// Create a secret with its version 1 from the admin UI (`POST /ui/secrets`),
 /// with the `secret-created` audit row in the same transaction. The payload is
 /// sealed inside that transaction, under the KEK shared lock (addendum #19).
+///
+/// Returns `Ok(false)` when the name was taken between the handler's
+/// "does this exist?" lookup and this insert — a real race now that clients can
+/// deposit secrets too (`POST /v1/secrets`). The caller re-renders instead of
+/// surfacing a unique-violation as a 500; nothing is overwritten either way.
 pub async fn create_secret_with_version(
     db: &PgPool,
     store: StoreSecretParams<'_>,
     actor: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let mut tx = db.begin().await?;
     take_kek_shared_lock(&mut tx).await?;
     let sealed = (store.seal)().map_err(|e| anyhow::anyhow!("sealing secret: {e}"))?;
-    sqlx::query(
+    let inserted = sqlx::query(
         "INSERT INTO secrets \
          (id, name, description, max_tier, injection_kind, injection_header, \
           injection_username, current_version) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, 1)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 1) \
+         ON CONFLICT (name) DO NOTHING",
     )
     .bind(store.secret_id)
     .bind(&store.name)
@@ -194,7 +200,12 @@ pub async fn create_secret_with_version(
     .bind(&store.injection_header)
     .bind(&store.injection_username)
     .execute(&mut *tx)
-    .await?;
+    .await?
+    .rows_affected();
+    if inserted == 0 {
+        tx.rollback().await?;
+        return Ok(false);
+    }
     sqlx::query(
         "INSERT INTO secret_versions \
          (secret_id, version, ciphertext, nonce, wrapped_dek, kek_id) \
@@ -218,7 +229,7 @@ pub async fn create_secret_with_version(
     )
     .await?;
     tx.commit().await?;
-    Ok(())
+    Ok(true)
 }
 
 /// Rotate a stored secret: bump `current_version`, seal the new payload with

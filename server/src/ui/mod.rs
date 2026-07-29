@@ -2463,7 +2463,7 @@ async fn save_secret(
                 validate_injection(kind, non_empty(&form.injection_header))?;
             let secret_id = Uuid::new_v4();
             let keyset = &state.keyset;
-            db::ui_ext::create_secret_with_version(
+            let created = db::ui_ext::create_secret_with_version(
                 &state.db,
                 StoreSecretParams {
                     secret_id,
@@ -2488,6 +2488,17 @@ async fn save_secret(
                 &op.subject,
             )
             .await?;
+            if !created {
+                // The name was claimed between the lookup above and the
+                // insert — a client deposit (`POST /v1/secrets`) racing this
+                // form. Nothing was overwritten either way; say so rather than
+                // surfacing a unique violation as a 500.
+                return Err(UiError::new(
+                    StatusCode::CONFLICT,
+                    "a secret with that name was just created by someone else. \
+                     Reload the page: submitting again would ROTATE it, not create it.",
+                ));
+            }
         }
     }
     Ok(Redirect::to("/ui/secrets").into_response())

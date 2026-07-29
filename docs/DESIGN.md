@@ -122,7 +122,10 @@ and is agent-influenceable. The approval UI therefore renders tier-2 context as
      depositing client's own cap, so a deposit cannot mint something more
      releasable than its depositor;
    - the client may not tag its deposit, because tags select policy rows —
-     self-tagging would be self-selecting its own approval rules.
+     self-tagging would be self-selecting its own approval rules;
+   - a per-client hourly deposit cap, decided inside the deposit's own
+     transaction under a per-client lock (a check outside it would bound only a
+     serial client), bounds how much operator attention one client can spend.
 3. The operator gets an FYI push ("k8s-agent stored a new secret …") and an audit
    row (`secret-created`, actor `client:k8s-agent`). Getting the secret back out
    is the ordinary CUJ 2 flow, approval and all.

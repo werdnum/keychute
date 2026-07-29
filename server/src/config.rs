@@ -378,6 +378,16 @@ impl Config {
         if l.max_proxy_streams_per_client == 0 {
             bail!("limits.max_proxy_streams_per_client must be positive");
         }
+        // Zero or negative here would not "disable deposits" — the endpoint
+        // stays routed and every deposit answers 429, a quiet outage for every
+        // opted-in client. Withdrawing the capability is `may_store_secrets:
+        // false` on the client, which says so.
+        if l.max_deposits_per_hour_per_client <= 0 {
+            bail!(
+                "limits.max_deposits_per_hour_per_client must be positive (got {});                  to withhold deposits, unset may_store_secrets on the client",
+                l.max_deposits_per_hour_per_client
+            );
+        }
         // Outbound endpoints that carry credentials must not be plaintext to
         // a non-loopback host (same rule as the listen side, same explicit
         // override): TokenReview posts the caller's SA token and the reviewer
