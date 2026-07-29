@@ -432,7 +432,10 @@ async fn overview_page(
                 tr {
                     td { a href="/ui/policies" { "Policies" } }
                     td { (policies) }
-                    td { "Standing rules that auto-approve matching requests." }
+                    // Not "auto-approve": a policy row's outcome is any of
+                    // auto-approve, notify-only, require-approval or deny, and
+                    // the count (like /ui/policies itself) covers all of them.
+                    td { "Standing rules applied to a request before you see it." }
                 }
                 tr {
                     td { a href="/ui/secrets" { "Secrets" } }
