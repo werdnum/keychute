@@ -20,7 +20,6 @@
 # and the namespace the BackendTLSPolicy + internal CA bundle ConfigMap must
 # live in (both of that policy's refs are namespace-local — DESIGN.md §7).
 namespace: keychute
-
 # Server container image. The digest is rewritten by the chart's build workflow
 # on each push to main; pin it here so deploys are reproducible.
 image:
@@ -40,16 +39,14 @@ image:
   # keeps the chart out of the `digest: ""` state in git, and it is the digest
   # the k8s-agent image in kube-config lifts the client CLI out of, so server
   # and CLI ship as a matched pair.
-  digest: "sha256:33b39a0b90f3d52f6f34f76750f3c92f5a4caf1b411d6165411c282c260ca0f8"
+  digest: "sha256:8f9c9c897d37746262918b4ce61e24adccf3f8c37201efcb9022f0bc14363096"
   tag: "latest"
   pullPolicy: IfNotPresent
-
 # imagePullSecrets are mirrored into the namespace out-of-band (e.g. by the
 # emberstack reflector in the reference cluster); conftest in kube-config
 # enforces that workloads reference one.
 imagePullSecrets:
   - name: ghcr-secret
-
 # Server resource requests/limits.
 resources:
   requests:
@@ -58,12 +55,10 @@ resources:
   limits:
     cpu: 500m
     memory: 512Mi
-
 # Public base URL Keychute advertises in Pushover approval links. Must match
 # the OIDC-fronted Ingress host below, since the links land on the human
 # approval UI.
 externalUrl: https://keychute.andrewgarrett.dev
-
 # ---------------------------------------------------------------------------
 # Human (approver) authentication.
 #
@@ -89,7 +84,6 @@ oidc:
   allowedSubjects: []
   # Allowed clock skew when checking exp/nbf, in seconds.
   clockSkewSeconds: 60
-
 # ---------------------------------------------------------------------------
 # Declarative client provisioning (DESIGN.md §5/§6, reconciled at startup).
 #
@@ -124,7 +118,6 @@ oidc:
 #         audience: keychute.andrewgarrett.dev
 #         subject: "system:serviceaccount:k8s-agent:k8s-agent"
 clients: []
-
 # ---------------------------------------------------------------------------
 # Database. The Zalando storage-cluster operator creates the role and drops a
 # credentials Secret into this namespace (cross-namespace secrets are enabled
@@ -168,7 +161,6 @@ database:
   # fields above (e.g. for a non-Zalando database with its own URL secret).
   urlSecret: ""
   urlKey: url
-
 # ---------------------------------------------------------------------------
 # KEK keyset Secret (`keyset.json`: active kek id, keys, mac_key). Created
 # out-of-band as a SealedSecret. Mounted read-only; Postgres never sees it.
@@ -181,7 +173,6 @@ kek:
   secretName: keychute-kek
   # Key within the Secret holding the JSON keyset.
   key: keyset.json
-
 # Pushover credentials for approval pushes. Cluster convention: keys `token`
 # and `user_key`. Created out-of-band as a SealedSecret; mounted as files so
 # the credentials never appear in the pod env or in the ConfigMap.
@@ -189,7 +180,6 @@ pushover:
   enabled: true
   secretName: keychute-pushover
   baseURL: https://api.pushover.net
-
 # ---------------------------------------------------------------------------
 # Internal TLS. Plaintext HTTP is not offered: static API tokens and tier-1/2
 # plaintext reads transit this connection and the cluster network is not in the
@@ -210,7 +200,6 @@ tls:
   dnsNames: []
   duration: 2160h
   renewBefore: 360h
-
 # ---------------------------------------------------------------------------
 # Public ingress for the human approval UI. In this cluster Ingresses are
 # materialized as Envoy Gateway HTTPRoutes, and the OIDC SecurityPolicy below
@@ -260,7 +249,6 @@ ingress:
     scopes: [openid, profile, email, groups]
     redirectPath: /oauth2/callback
     logoutPath: /logout
-
 # Gateway API BackendTLSPolicy so the gateway-to-Service hop speaks TLS — the
 # backend refuses plaintext. Both `targetRefs` and `validation.caCertificateRefs`
 # are namespace-local, so this policy and the CA bundle ConfigMap live in the
@@ -272,7 +260,6 @@ backendTLSPolicy:
   # only), fanned out by the reflector pattern. Not created by this chart.
   caBundleConfigMap: internal-ca-bundle
   caBundleKey: ca.crt
-
 # Server-side limits (see server/src/config.rs `Limits`). Defaults here match
 # the server's own defaults.
 limits:
@@ -297,7 +284,6 @@ limits:
   # the process-local ephemeral KEK, so a read cut off mid-flight is
   # unrecoverable rather than merely retried.
   drainSeconds: 25
-
 # TokenReview settings for audience-bound projected SA-token authentication.
 # The chart binds the ServiceAccount to `system:auth-delegator` so these calls
 # are permitted at all — without that binding the API server rejects every
@@ -310,26 +296,22 @@ tokenreview:
   # ServiceAccount volume.
   tokenPath: /var/run/secrets/kubernetes.io/serviceaccount/token
   caPath: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
-
 # Optional PEM bundle of extra roots trusted by the outbound brokered-proxy
 # HTTP client (for upstream origins behind an internal CA). System roots stay
 # trusted. Set `secretName` to mount one; empty disables it.
 upstreamCA:
   secretName: ""
   key: ca.crt
-
 # ServiceAccount created for the server.
 serviceAccount:
   create: true
   name: ""
   annotations: {}
-
 # Namespace-level Goldilocks (Fairwinds VPA recommender) opt-in.
 goldilocks:
   enabled: true
   vpaUpdateMode: "Off"
   vpaResourcePolicy: '{"containerPolicies":[{"containerName":"*","controlledValues":"RequestsOnly","maxAllowed":{"cpu":"1","memory":"1Gi"}}]}'
-
 # No `serviceMonitor` block: the server exposes only /healthz, /readyz and the API/UI
 # routes, so a ServiceMonitor would scrape a 404 and collect nothing. It (and
 # the matching NetworkPolicy rule for the monitoring namespace) will be added
@@ -349,12 +331,10 @@ networkPolicy:
   clientNamespaces:
     - family-assistant
     - k8s-agent
-
 # Extra pod annotations (e.g. to force a rollout).
 # Pod termination grace period. Must exceed limits.drainSeconds so in-flight
 # releases finish draining before the kubelet SIGKILLs the process.
 terminationGracePeriodSeconds: 30
-
 podAnnotations: {}
 nodeSelector: {}
 tolerations: []
