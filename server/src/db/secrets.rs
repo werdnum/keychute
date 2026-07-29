@@ -150,11 +150,18 @@ pub async fn create_secret_from_client(
         .bind(client_name)
         .execute(&mut *tx)
         .await?;
-    let recent: i64 = sqlx::query_scalar(
+    // `kind` is interpolated, not bound — it is a compile-time constant, never
+    // caller data, and the partial index this count relies on
+    // (`audit_log_client_deposits_idx`, migration 0008) is predicated on the
+    // literal. A bound `kind = $1` cannot be proven to imply that predicate
+    // when the planner builds a generic plan, so the index would sometimes be
+    // skipped and the count would fall back to scanning the window — inside
+    // the per-client lock.
+    let recent: i64 = sqlx::query_scalar(&format!(
         "SELECT count(*) FROM audit_log \
-         WHERE kind = $1 AND client_name = $2 AND at > now() - make_interval(hours => $3)",
-    )
-    .bind(crate::audit::kinds::SECRET_CREATED)
+         WHERE kind = '{}' AND client_name = $1 AND at > now() - make_interval(hours => $2)",
+        crate::audit::kinds::SECRET_CREATED
+    ))
     .bind(client_name)
     .bind(rate.window_hours)
     .fetch_one(&mut *tx)

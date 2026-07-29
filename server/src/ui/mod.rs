@@ -14,6 +14,8 @@
 pub mod csrf;
 mod policy_store;
 
+use base64::Engine as _;
+
 use crate::audit;
 use crate::authn::human::{authenticate_human, Operator};
 use crate::crypto::{AadContext, SecretBytes, EPHEMERAL_KEK_ID};
@@ -2541,14 +2543,24 @@ async fn review_secret(
         &marker,
         now,
     );
-    // Rendered as TEXT (auto-escaped), like every other client-derived string
-    // on these pages. Lossy UTF-8 because a credential may be binary; the
-    // operator is deciding whether to trust it, not copying it out.
-    let shown = String::from_utf8_lossy({
+    // A faithful rendering, or the operator is vetting something other than
+    // what is stored. Valid UTF-8 goes out verbatim; anything else (the CLI
+    // deposits non-UTF-8 credentials as base64, and binary keys are a real
+    // case) is shown as base64 rather than lossily mangled into replacement
+    // characters. Always a TEXT node — auto-escaped, like every other
+    // client-derived string on these pages — inside a <pre>, so repeated
+    // spaces and line breaks in a PEM survive the trip to the screen.
+    let (shown, is_base64) = {
         use secrecy::ExposeSecret;
-        plaintext.expose_secret()
-    })
-    .into_owned();
+        let bytes = plaintext.expose_secret();
+        match std::str::from_utf8(bytes) {
+            Ok(text) => (text.to_owned(), false),
+            Err(_) => (
+                base64::engine::general_purpose::STANDARD.encode(bytes),
+                true,
+            ),
+        }
+    };
     Ok(html_page_at(
         "Review secret",
         "/ui/secrets",
@@ -2572,8 +2584,16 @@ async fn review_secret(
                     p { "Client-supplied description: " (secret.description) }
                 }
                 div .callout .callout-danger {
-                    p { "The stored value, as deposited:" }
-                    p { code .mono { (shown) } }
+                    @if is_base64 {
+                        p {
+                            "The stored value, as deposited — "
+                            b { "not valid UTF-8" }
+                            ", shown base64-encoded:"
+                        }
+                    } @else {
+                        p { "The stored value, as deposited:" }
+                    }
+                    pre { (shown) }
                 }
                 p .muted {
                     "Marking this reviewed applies to version " (version.version)

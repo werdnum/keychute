@@ -261,7 +261,10 @@ or Envoy-forwarded JWT in oidc mode):
   `POST /ui/secrets/{id}/review` (decrypt and display a client-deposited value
   so the operator can actually read it; audits `secret-revealed`) and
   `POST /ui/secrets/{id}/reviewed` (lift the unvetted clamp; audits
-  `secret-vetted`). The confirmation is bound to the displayed version — in the
+  `secret-vetted`). The value renders verbatim in a `<pre>` — base64 when it is
+  not valid UTF-8 — so the operator vets what is actually stored rather than a
+  whitespace-collapsed or lossily-decoded rendering of it. The confirmation is
+  bound to the displayed version — in the
   CSRF token AND in the `UPDATE ... AND current_version = $2` — so a rotation
   between the two steps cannot vet bytes nobody saw. Both are POST: a URL that
   renders a credential would sit in browser history.
@@ -318,6 +321,9 @@ Use `uuid` PKs (`gen_random_uuid()` via pgcrypto or app-generated), `timestamptz
   secret_version_id uuid null, actor text null, method text null, origin text
   null, path text null, status int null, detail jsonb null)` — append-only.
   `detail` must never contain secret material or freeform client context.
+  Indexed on `at`, plus a partial `(client_name, at) WHERE kind =
+  'secret-created'` (migration 0008) for the deposit rate cap, which counts
+  inside the deposit's transaction while holding that client's lock.
 
 Atomicity requirements (single statements / explicit transactions):
 

@@ -308,6 +308,30 @@ async fn store_accepts_base64_for_non_utf8_values() {
     let out = cli.wait_with_output().expect("waiting for CLI");
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(out.stdout, vec![0xff, 0x00, 0xfe]);
+
+    // The review page must show the operator what is actually stored: bytes
+    // that are not UTF-8 render as base64, not as replacement characters.
+    let secrets_page = env.ui_get("/ui/secrets").await.unwrap();
+    let secret_id: String =
+        sqlx::query_scalar::<_, uuid::Uuid>("SELECT id FROM secrets WHERE name = 'binary-key'")
+            .fetch_one(&env.db)
+            .await
+            .unwrap()
+            .to_string();
+    let reveal = format!("/ui/secrets/{secret_id}/review");
+    let token = extract_csrf(&secrets_page, &reveal).expect("reveal csrf token");
+    let (status, page) = env
+        .ui_post(&reveal, &[("csrf_token", &token)])
+        .await
+        .unwrap();
+    assert_eq!(status, 200, "review page failed: {page}");
+    assert!(page.contains("not valid UTF-8"), "binary value is flagged");
+    // base64 of ff 00 fe.
+    assert!(page.contains("/wD+"), "the exact bytes are shown: {page}");
+    assert!(
+        !page.contains('\u{fffd}'),
+        "no lossy replacement characters"
+    );
 }
 
 /// The deposit rate cap: an opted-in client that runs away cannot bury the
