@@ -621,3 +621,82 @@ async fn approve_token_is_bound_to_the_rendered_secret_state() {
     // The honest submissions still work.
     env.approve(&stored_id, &[]).await.unwrap();
 }
+
+/// Approving with a substituted secret must be evaluated against the grant as
+/// it will actually be issued. A tighter policy row that the ORIGINAL request
+/// was too broad for can become the winning row once the operator narrows the
+/// TTL — and its expiry must then cap the grant, not be dropped because
+/// selection ran against the un-narrowed request.
+#[tokio::test(flavor = "multi_thread")]
+async fn substitution_is_evaluated_against_the_narrowed_grant() {
+    let env = TestEnv::spawn(SpawnOpts::default()).await.unwrap();
+    env.seed_secret(
+        "narrow-secret",
+        "narrow-value",
+        "cooperating-client",
+        "bearer",
+        "",
+    )
+    .await
+    .unwrap();
+
+    // A broad row any cli-read request matches, with no cap at all...
+    env.create_policy(&[
+        ("mechanism", "cli-read"),
+        ("outcome", "require-approval"),
+        ("priority", "0"),
+    ])
+    .await
+    .unwrap();
+    // ...and a tight one for the substituted secret: it only applies to
+    // requests of 10 minutes or less, and lapses in 2.
+    let policy_not_after = chrono::Utc::now() + chrono::Duration::minutes(2);
+    env.create_policy(&[
+        ("secret_name", "narrow-secret"),
+        ("mechanism", "cli-read"),
+        ("outcome", "require-approval"),
+        ("priority", "0"),
+        ("max_ttl_seconds", "600"),
+        (
+            "not_after",
+            &policy_not_after.format("%Y-%m-%dT%H:%M:%S").to_string(),
+        ),
+    ])
+    .await
+    .unwrap();
+
+    // An hour-long request for a name nothing is stored under: the tight row
+    // cannot match it (3600 > 600), and no row mentions this name anyway.
+    let (status, body) = env
+        .k8s()
+        .create_request(cli_read_request("narrow-1", "narow-secret", 3600, "typo"))
+        .await
+        .unwrap();
+    assert_eq!(status, 201, "{body}");
+    assert_eq!(body["state"], "pending");
+    let request_id = body["request_id"].as_str().unwrap().to_owned();
+
+    // Substitute the stored secret AND narrow to 5 minutes — which brings the
+    // tight row into play.
+    env.approve(
+        &request_id,
+        &[
+            ("substitute_secret", "1:narrow-secret"),
+            ("ttl_seconds", "300"),
+        ],
+    )
+    .await
+    .unwrap();
+
+    let grant_not_after: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT not_after FROM grants WHERE request_id = $1")
+            .bind(request_id.parse::<uuid::Uuid>().unwrap())
+            .fetch_one(&env.db)
+            .await
+            .unwrap();
+    assert!(
+        grant_not_after <= policy_not_after + chrono::Duration::seconds(1),
+        "grant outlives the substituted secret's policy: grant {grant_not_after}, \
+         policy {policy_not_after}"
+    );
+}

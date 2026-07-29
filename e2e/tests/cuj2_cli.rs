@@ -225,3 +225,147 @@ async fn passthrough_ciphertext_purged_after_replay_window() {
     })
     .await;
 }
+
+/// The client asked for a name Keychute does not have, and the operator
+/// recognises it as one of the secrets they DO have: the approval page offers
+/// them, and the grant is issued against the secret they pick.
+#[tokio::test(flavor = "multi_thread")]
+async fn unstored_request_released_from_an_existing_secret() {
+    let env = TestEnv::spawn(SpawnOpts::default()).await.unwrap();
+    env.seed_secret(
+        "real-api-key",
+        "real-value-v1",
+        "cooperating-client",
+        "bearer",
+        "",
+    )
+    .await
+    .unwrap();
+
+    // The agent guesses the name wrong.
+    let cli = spawn_cli(&env, &["request", "my-api-key", "--timeout", "30"]);
+    let request_id = wait_pending_request_id(&env).await;
+
+    let page = env
+        .ui_get(&format!("/ui/requests/{request_id}"))
+        .await
+        .unwrap();
+    assert!(
+        page.contains("Release a secret you already have"),
+        "picker offered for an unstored name"
+    );
+    let option = extract_option_value(&page, "real-api-key")
+        .expect("the stored secret is offered as a substitute");
+    assert_eq!(option, "1:real-api-key", "value carries the version");
+
+    env.approve(&request_id, &[("substitute_secret", &option)])
+        .await
+        .unwrap();
+
+    // The CLI receives the STORED secret's value, not anything typed in.
+    let (code, stdout, stderr) = wait_cli(cli);
+    assert_eq!(code, 0, "cli failed: {stderr}");
+    assert_eq!(stdout, b"real-value-v1");
+
+    // The grant names what was released, and nothing was stored under the name
+    // the client asked for.
+    let rid: uuid::Uuid = request_id.parse().unwrap();
+    let (granted,): (String,) =
+        sqlx::query_as("SELECT secret_name FROM grants WHERE request_id = $1")
+            .bind(rid)
+            .fetch_one(&env.db)
+            .await
+            .unwrap();
+    assert_eq!(granted, "real-api-key");
+    let (stored,): (i64,) = sqlx::query_as("SELECT count(*) FROM secrets WHERE name = $1")
+        .bind("my-api-key")
+        .fetch_one(&env.db)
+        .await
+        .unwrap();
+    assert_eq!(stored, 0, "substitution stores nothing");
+
+    // Revisiting the resolved request reports what was RELEASED, and says the
+    // requested name was not it.
+    let resolved = env
+        .ui_get(&format!("/ui/requests/{request_id}"))
+        .await
+        .unwrap();
+    assert!(
+        resolved.contains("released in place of my-api-key"),
+        "resolved page names the substitution: {resolved}"
+    );
+
+    // The audit row records both names: released, and asked for.
+    let (secret_name, detail): (Option<String>, Option<serde_json::Value>) = sqlx::query_as(
+        "SELECT secret_name, detail FROM audit_log \
+         WHERE request_id = $1 AND kind = 'request-approved'",
+    )
+    .bind(rid)
+    .fetch_one(&env.db)
+    .await
+    .unwrap();
+    assert_eq!(secret_name.as_deref(), Some("real-api-key"));
+    assert_eq!(
+        detail.unwrap()["substituted_for_requested_name"],
+        serde_json::json!("my-api-key"),
+    );
+}
+
+/// Substitution is not a way around the policy table: the standing rules for
+/// the secret the operator picks are evaluated before it is released, even
+/// though the request itself named something no rule could match.
+#[tokio::test(flavor = "multi_thread")]
+async fn substitution_re_evaluates_policy_for_the_chosen_secret() {
+    let env = TestEnv::spawn(SpawnOpts::default()).await.unwrap();
+    env.seed_secret(
+        "forbidden-secret",
+        "must-not-leak",
+        "cooperating-client",
+        "bearer",
+        "",
+    )
+    .await
+    .unwrap();
+    env.create_policy(&[
+        ("secret_name", "forbidden-secret"),
+        ("mechanism", "cli-read"),
+        ("outcome", "deny"),
+        ("priority", "10"),
+    ])
+    .await
+    .unwrap();
+
+    // A name no policy row mentions, so the request itself is merely pending.
+    let cli = spawn_cli(&env, &["request", "typo-secret", "--timeout", "30"]);
+    let request_id = wait_pending_request_id(&env).await;
+
+    let (status, body) = env
+        .approve_raw(&request_id, &[("substitute_secret", "1:forbidden-secret")])
+        .await
+        .unwrap();
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body.contains("standing policy refuses"),
+        "the deny rule is quoted back: {body}"
+    );
+
+    // Nothing was released, and the request is still the operator's to decide.
+    let rid: uuid::Uuid = request_id.parse().unwrap();
+    let (state,): (String,) = sqlx::query_as("SELECT state FROM access_requests WHERE id = $1")
+        .bind(rid)
+        .fetch_one(&env.db)
+        .await
+        .unwrap();
+    assert_eq!(state, "pending");
+    let (grants,): (i64,) = sqlx::query_as("SELECT count(*) FROM grants WHERE request_id = $1")
+        .bind(rid)
+        .fetch_one(&env.db)
+        .await
+        .unwrap();
+    assert_eq!(grants, 0);
+
+    env.deny(&request_id).await.unwrap();
+    let (code, stdout, _stderr) = wait_cli(cli);
+    assert_eq!(code, 3);
+    assert!(stdout.is_empty());
+}

@@ -19,6 +19,7 @@ use crate::crypto::{AadContext, SecretBytes, EPHEMERAL_KEK_ID};
 use crate::db;
 use crate::db::requests::{AccessRequestRow, GrantParams, PassthroughPayload};
 use crate::db::ui_ext::StoreSecretParams;
+use crate::policy;
 use crate::state::AppState;
 use axum::extract::{Path, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
@@ -1158,6 +1159,18 @@ async fn requests_page(
 /// stale form can never silently change which credential is released.
 const F_SECRET_PRESENT: &str = "secret_present";
 
+/// The picker offered when the requested name is not stored: "release one of
+/// the secrets you already have instead". Only rendered on that form, and the
+/// approve handler refuses it on the stored-secret form.
+const F_SUBSTITUTE: &str = "substitute_secret";
+
+/// 409 body when the stored secret the operator picked in [`F_SUBSTITUTE`]
+/// changed between render and submit.
+const SUBSTITUTE_STATE_CHANGED: &str =
+    "The stored secret you picked changed while you were reviewing: it was \
+     removed, disabled, or rotated since the page loaded, so approving would \
+     have released a version nobody reviewed. Nothing was approved. Pick again.";
+
 /// Wording shared by the GET banner and the 409 body.
 const SECRET_STATE_CHANGED: &str =
     "This secret changed while you were reviewing: it was stored, removed, or \
@@ -1203,19 +1216,37 @@ async fn render_request_detail(
         // — not just the bare state.
         let mechanism = parse_mechanism(&row.mechanism)?;
         let constraints = parse_constraints(row)?;
-        let secret = db::get_secret_by_name(&state.db, &row.secret_name).await?;
+        // What was RELEASED, which is not always what was asked for: an
+        // approval may substitute a stored secret for a name the client got
+        // wrong, and only the grant records which one. The request row keeps
+        // the requested name forever, so read the released name off the grant
+        // and say so — this page exists to show what actually happened.
+        let released = db::get_grant_for_request(&state.db, row.id)
+            .await?
+            .map(|g| g.secret_name)
+            .unwrap_or_else(|| row.secret_name.clone());
+        let substituted = released != row.secret_name;
+        let secret = db::get_secret_by_name(&state.db, &released).await?;
         let context = decrypt_context(state, row);
-        let secret_line = match &secret {
-            Some(s) => html! {
-                span .mono { (s.name) } " "
-                span .muted {
-                    "(stored, version " (s.current_version)
-                    ", max tier: "
-                    (Tier::from_int(s.max_tier).map(|t| t.as_str()).unwrap_or("?"))
-                    ")"
+        let secret_line = html! {
+            @match &secret {
+                Some(s) => {
+                    span .mono { (s.name) } " "
+                    span .muted {
+                        "(stored, version " (s.current_version)
+                        ", max tier: "
+                        (Tier::from_int(s.max_tier).map(|t| t.as_str()).unwrap_or("?"))
+                        ")"
+                    }
                 }
-            },
-            None => html! { (row.secret_name) },
+                None => { span .mono { (released) } }
+            }
+            @if substituted {
+                " "
+                span .caveat {
+                    "(released in place of " (row.secret_name) ", which is not stored)"
+                }
+            }
         };
         let badge_class = match label {
             "approved" => "badge badge-ok",
@@ -1296,6 +1327,14 @@ async fn render_request_detail(
         },
     };
 
+    // Nothing is stored under the requested name: the operator may have the
+    // credential under a name the client guessed wrong, so offer their stored
+    // secrets as an alternative to typing the value in again.
+    let substitutes = match &secret {
+        Some(_) => Vec::new(),
+        None => substitute_candidates(state, mechanism).await?,
+    };
+
     // The marker is folded into the approve token's MAC, so the token is only
     // valid for the state this page was rendered against and the hidden field
     // cannot be swapped independently of it.
@@ -1367,7 +1406,42 @@ async fn render_request_detail(
                     }
                     @if secret.is_none() {
                         fieldset {
-                            legend { "Secret value (not yet stored)" }
+                            legend { "Release a secret you already have" }
+                            p .muted {
+                                "Keychute has nothing stored under "
+                                span .mono { (row.secret_name) }
+                                ". If the client guessed the name wrong, pick the secret it "
+                                "actually needs — the grant is issued against the secret you "
+                                "pick, and everything below is ignored."
+                            }
+                            @if substitutes.is_empty() {
+                                p .caveat {
+                                    "No stored secret can serve this tier, so the value has to "
+                                    "be entered below."
+                                }
+                            } @else {
+                                label {
+                                    "Stored secret"
+                                    select name=(F_SUBSTITUTE) {
+                                        option value="" selected {
+                                            "— none: enter the value below —"
+                                        }
+                                        @for s in &substitutes {
+                                            option value=(substitute_option_value(s)) {
+                                                (s.name)
+                                                " (version " (s.current_version)
+                                                ", max tier: "
+                                                (Tier::from_int(s.max_tier)
+                                                    .map(|t| t.as_str()).unwrap_or("?"))
+                                                ")"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        fieldset {
+                            legend { "Or enter the secret value (not yet stored)" }
                             label {
                                 "Secret value"
                                 input type="password" name="secret_value" autocomplete="off"
@@ -1448,6 +1522,10 @@ struct ApproveForm {
     max_uses: Option<String>,
     #[serde(default)]
     secret_value: Option<String>,
+    /// [`F_SUBSTITUTE`]: `"<version>:<name>"` of a stored secret to release
+    /// instead of the (absent) requested one. Empty/absent = no substitution.
+    #[serde(default)]
+    substitute_secret: Option<String>,
     #[serde(default)]
     store_secret: Option<String>,
     #[serde(default)]
@@ -1597,6 +1675,42 @@ fn parse_secret_present(rendered: Option<&str>) -> Option<bool> {
 /// The grant deliberately still resolves the current version at read time
 /// rather than pinning the reviewed one: pinning would keep releasing a
 /// retired credential after a rotation, which is the worse failure.
+/// Option value for one entry in the substitute picker: `"<version>:<name>"`.
+///
+/// The version is carried for the same reason [`secret_state_marker`] carries
+/// it — the operator picks a secret whose current version the page showed them,
+/// and a rotation between render and submit would otherwise release a
+/// credential nobody reviewed. Splitting at the FIRST colon keeps names
+/// containing colons round-trippable (the version never does).
+fn substitute_option_value(secret: &db::SecretRow) -> String {
+    format!("{}:{}", secret.current_version, secret.name)
+}
+
+/// Inverse of [`substitute_option_value`]: `(version, name)`.
+fn parse_substitute_option(raw: &str) -> Option<(i32, &str)> {
+    let (version, name) = raw.split_once(':')?;
+    let version: i32 = version.parse().ok()?;
+    (!name.is_empty()).then_some((version, name))
+}
+
+/// Stored secrets that could serve `mechanism`, for the substitute picker.
+///
+/// Filtered exactly as the approve handler re-checks them (enabled, and the
+/// secret's own max tier covers the tier being approved) so the list never
+/// offers a choice that submission would reject. The handler re-checks anyway:
+/// this list is render-time convenience, not the gate.
+async fn substitute_candidates(
+    state: &AppState,
+    mechanism: Mechanism,
+) -> UiResult<Vec<db::SecretRow>> {
+    let tier = mechanism.tier().as_int();
+    Ok(db::list_secrets(&state.db)
+        .await?
+        .into_iter()
+        .filter(|s| s.enabled && tier <= s.max_tier)
+        .collect())
+}
+
 fn secret_state_marker(secret: Option<&db::SecretRow>) -> String {
     match secret {
         Some(s) => format!("1:{}", s.current_version),
@@ -1628,6 +1742,58 @@ fn take_secret_value(form: &mut ApproveForm) -> Option<SecretBytes> {
 /// elapsed.
 fn policy_cap_elapsed(policy_not_after: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
     matches!(policy_not_after, Some(cap) if cap <= now)
+}
+
+/// Re-run the policy engine for a SUBSTITUTED secret: the pending request's
+/// client, mechanism and normalized constraints, but the secret the operator
+/// picked in its place.
+///
+/// The request's stored decision (and its `policy_not_after` cap) was computed
+/// against a name no stored secret carried, so no rule scoped to the chosen
+/// secret — by name or by tag — was ever consulted. Substitution must not be a
+/// way around one.
+async fn evaluate_substitution(
+    state: &AppState,
+    row: &AccessRequestRow,
+    chosen: &db::SecretRow,
+    mechanism: Mechanism,
+    constraints: &Constraints,
+    now: DateTime<Utc>,
+) -> UiResult<policy::Evaluation> {
+    let client = db::get_client_by_name(&state.db, &row.client_name)
+        .await?
+        .ok_or_else(|| UiError::bad_request("the requesting client no longer exists"))?;
+    let tags = db::get_tags_for_secret(&state.db, chosen.id).await?;
+    let policies = db::list_policies(&state.db).await?;
+    let requested = policy::RequestedGrant {
+        secret_name: chosen.name.clone(),
+        mechanism,
+        constraints: constraints.clone(),
+    };
+    // Fails closed exactly as the create path does: a rule that applies to this
+    // secret but cannot be parsed could be the deny that forbids releasing it.
+    let (pclient, psecret, prows) = crate::api::requests::policy_inputs(
+        &client,
+        Some(chosen),
+        &tags,
+        &requested,
+        &policies,
+        now,
+    )
+    .map_err(|_| {
+        UiError::bad_request(
+            "the policy table holds a rule that applies to that secret and cannot be \
+             read; fix it before releasing this secret",
+        )
+    })?;
+    Ok(policy::evaluate(
+        &pclient,
+        psecret.as_ref(),
+        &tags,
+        &requested,
+        &prows,
+        now,
+    ))
 }
 
 async fn approve(
@@ -1724,9 +1890,11 @@ async fn approve(
     }
 
     let secret_value = take_secret_value(&mut form);
-    if secret.is_some() && secret_value.is_some() {
-        // The stored-secret form has no value field: a value here means the
-        // submission does not match the page it claims to come from.
+    let substitute = non_empty(&form.substitute_secret).map(str::to_owned);
+    if secret.is_some() && (secret_value.is_some() || substitute.is_some()) {
+        // The stored-secret form has neither a value field nor the substitute
+        // picker: either one here means the submission does not match the page
+        // it claims to come from.
         return Err(UiError::bad_request(
             "malformed approval form; reload the page and retry",
         ));
@@ -1736,9 +1904,86 @@ async fn approve(
     let grant_id = Uuid::new_v4();
     let mut store: Option<StoreSecretParams> = None;
     let mut passthrough: Option<PassthroughPayload> = None;
+    // The secret the grant is actually issued against. Equal to the requested
+    // name except on the substitution path below, where the operator chose a
+    // stored secret to answer a request that named something else.
+    let mut released_name = row.secret_name.clone();
+    // Extra grant cap from the policy row that governs the SUBSTITUTED secret
+    // (the request's own `policy_not_after` was computed against the name the
+    // client asked for, which by definition matched no stored secret).
+    let mut substitute_cap: Option<DateTime<Utc>> = None;
 
-    match secret {
-        Some(s) => {
+    match (secret, substitute) {
+        (None, Some(raw)) => {
+            // Release a stored secret under a different name than the client
+            // asked for. Nothing new enters the process here: the value is
+            // already stored, already reviewed, and already governed by its own
+            // max tier and policy rows — all of which are re-checked below
+            // against the LIVE row, not the rendered one.
+            if secret_value.is_some() || store_requested {
+                return Err(UiError::bad_request(
+                    "choose either a stored secret or a new value to store, not both",
+                ));
+            }
+            let (picked_version, picked_name) = parse_substitute_option(&raw).ok_or_else(|| {
+                UiError::bad_request("malformed approval form; reload the page and retry")
+            })?;
+            let chosen = db::get_secret_by_name(&state.db, picked_name).await?;
+            // Gone, disabled, or rotated since the page rendered: the operator
+            // picked a row that no longer says what it said. Same 409 re-render
+            // as a change to the requested name's own state.
+            let stale = match &chosen {
+                None => true,
+                Some(s) => !s.enabled || s.current_version != picked_version,
+            };
+            if stale {
+                let page =
+                    render_request_detail(&state, &op, &row, now, Some(SUBSTITUTE_STATE_CHANGED))
+                        .await?;
+                return Ok((StatusCode::CONFLICT, page).into_response());
+            }
+            let chosen = chosen.expect("checked above");
+            if mechanism.tier().as_int() > chosen.max_tier {
+                return Err(UiError::bad_request(
+                    "that secret's max tier is below the tier being approved",
+                ));
+            }
+            // Standing policy is evaluated per SECRET, and this one was never
+            // evaluated for this request — the request named a secret that does
+            // not exist, so a `deny` row scoped to the chosen secret (by name or
+            // tag) never applied. Re-evaluate now: an operator substituting a
+            // name must not be able to hand over a credential the policy table
+            // refuses this client, and any cap on the winning row applies to the
+            // grant minted from it.
+            // Evaluated against the grant as it will actually be issued, not as
+            // it was requested: narrowing makes the request a subset of MORE
+            // rows, and a tighter row that only now matches is exactly the one
+            // whose `not_after` should cap this grant. Using the un-narrowed
+            // constraints would let a broad uncapped row keep winning and drop
+            // that cap.
+            let effective = Constraints {
+                ttl_seconds: ttl,
+                max_uses: max_uses.map(|u| u.min(u64::from(u32::MAX)) as u32),
+                ..constraints.clone()
+            };
+            let evaluation =
+                evaluate_substitution(&state, &row, &chosen, mechanism, &effective, now).await?;
+            if let policy::Decision::Deny { reason } = evaluation.decision {
+                return Err(UiError::bad_request(format!(
+                    "standing policy refuses that secret for {}: {reason}",
+                    row.client_name
+                )));
+            }
+            if matches!(evaluation.policy_not_after, Some(cap) if cap <= now) {
+                return Err(UiError::bad_request(
+                    "the standing policy governing that secret has expired: any grant \
+                     issued now would already be past its cap",
+                ));
+            }
+            substitute_cap = evaluation.policy_not_after;
+            released_name = chosen.name;
+        }
+        (Some(s), _) => {
             if !s.enabled {
                 return Err(UiError::bad_request("secret is disabled"));
             }
@@ -1748,9 +1993,12 @@ async fn approve(
                 ));
             }
         }
-        None => {
+        (None, None) => {
             let value = secret_value.ok_or_else(|| {
-                UiError::bad_request("this secret is not stored: a secret value is required")
+                UiError::bad_request(
+                    "this secret is not stored: pick a stored secret to release instead, \
+                     or enter the value",
+                )
             })?;
             if store_requested {
                 let max_tier = match non_empty(&form.store_max_tier) {
@@ -1825,10 +2073,15 @@ async fn approve(
     if let Some(cap) = row.policy_not_after {
         not_after = not_after.min(cap);
     }
+    // Same rule for the row that governs a substituted secret: the grant may
+    // outlive neither policy row.
+    if let Some(cap) = substitute_cap {
+        not_after = not_after.min(cap);
+    }
 
     let grant = GrantParams {
         client_name: row.client_name.clone(),
-        secret_name: row.secret_name.clone(),
+        secret_name: released_name,
         mechanism: row.mechanism.clone(),
         constraints: row.constraints.clone(),
         not_after,
@@ -2645,6 +2898,43 @@ mod tests {
         assert!(rendered.contains("3600"));
         assert!(rendered.contains("unlimited within TTL"));
         assert!(rendered.contains("the client never sees the secret"));
+    }
+
+    fn secret_row(name: &str, version: i32) -> db::SecretRow {
+        db::SecretRow {
+            id: Uuid::new_v4(),
+            name: name.to_owned(),
+            description: String::new(),
+            max_tier: Tier::Direct.as_int(),
+            injection_kind: "bearer".into(),
+            injection_header: None,
+            current_version: version,
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn substitute_option_round_trips() {
+        let value = substitute_option_value(&secret_row("api-token", 3));
+        assert_eq!(value, "3:api-token");
+        assert_eq!(parse_substitute_option(&value), Some((3, "api-token")));
+
+        // Names may contain colons: the split takes the FIRST one, so only the
+        // version is consumed.
+        let value = substitute_option_value(&secret_row("ns:api-token", 12));
+        assert_eq!(parse_substitute_option(&value), Some((12, "ns:api-token")));
+
+        // Anything that is not "<int>:<non-empty name>" is not a value this
+        // page rendered.
+        for bad in ["", "api-token", ":api-token", "3:", "x:api-token", "3"] {
+            assert_eq!(
+                parse_substitute_option(bad),
+                None,
+                "expected reject: {bad:?}"
+            );
+        }
     }
 
     #[test]
