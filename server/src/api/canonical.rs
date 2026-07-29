@@ -1,7 +1,13 @@
 //! Canonical JSON serialization for the idempotency MAC (addendum #18).
 //!
 //! The MAC input is the request body serialized with object keys sorted
-//! (recursively) and no whitespace, MINUS the `idempotency_key` field.
+//! (recursively) and no whitespace, MINUS the `idempotency_key` field and
+//! MINUS `context`: context is advisory (and the CLI's pipeline capture is
+//! inherently nondeterministic across reruns — a background job finishing
+//! changes the snapshot), so folding it into the MAC would turn the ONLY
+//! recovery path for a lost response — rerunning with the same key — into a
+//! 409 for a request that is materially identical. Key reuse detection
+//! covers what defines the request: secret, mechanism, constraints.
 
 use keychute_types::CreateAccessRequest;
 
@@ -46,11 +52,13 @@ pub fn canonical_json(v: &serde_json::Value, out: &mut String) {
 }
 
 /// Canonical MAC payload for a create-access-request body: the typed request
-/// serialized to a Value, `idempotency_key` removed, canonicalized.
+/// serialized to a Value, `idempotency_key` and `context` removed (see module
+/// docs), canonicalized.
 pub fn canonical_request_payload(req: &CreateAccessRequest) -> Vec<u8> {
     let mut v = serde_json::to_value(req).expect("CreateAccessRequest serializes");
     if let serde_json::Value::Object(map) = &mut v {
         map.remove("idempotency_key");
+        map.remove("context");
     }
     let mut out = String::new();
     canonical_json(&v, &mut out);
@@ -113,5 +121,15 @@ mod tests {
         assert!(String::from_utf8(a)
             .unwrap()
             .contains("\"secret_name\":\"s\""));
+
+        // Context is advisory and excluded: a retry whose pipeline snapshot
+        // drifted must replay, not 409.
+        let mut with_ctx = mk("key-1");
+        with_ctx.context = RequestContext {
+            reason: "changed".into(),
+            structured: Some(serde_json::json!({"pipeline_siblings": ["kubeseal"]})),
+        };
+        assert_eq!(canonical_request_payload(&with_ctx), b);
+        assert!(!String::from_utf8(b).unwrap().contains("context"));
     }
 }

@@ -338,11 +338,7 @@ async fn push_phase(state: &AppState) -> anyhow::Result<()> {
     }
     let deadline = tokio::time::Instant::now() + PUSH_PHASE_BUDGET;
     let pending = db::list_pending_needing_push(&state.db, i32::MAX).await?;
-    let fyi = db::list_notify_only_needing_push(
-        &state.db,
-        Utc::now() - Duration::hours(FYI_RETRY_WINDOW_HOURS),
-    )
-    .await?;
+    let fyi = db::list_notify_only_needing_push(&state.db, FYI_RETRY_WINDOW_HOURS * 3600).await?;
     let mut skipped: usize = 0;
     for row in pending.iter().chain(fyi.iter()) {
         if tokio::time::Instant::now() >= deadline {

@@ -240,6 +240,21 @@ pub fn evaluate(
             {
                 decision = Decision::RequireApproval;
             }
+            // A brokered row with NO origin constraint is unconstrained in the
+            // one dimension that decides where the credential is sent: an
+            // empty `origins` matches whatever origin the client named, so
+            // auto-approving on it would inject the real credential into a
+            // request to a client-chosen host — with no push, since only
+            // notify-only pushes. Requests must name exactly one origin
+            // (`validate_request`); a standing row that grants without naming
+            // any is refused the same widening. Row creation rejects this too
+            // — this clamp also covers rows already in the table.
+            if req.mechanism == Mechanism::Brokered
+                && p.origins.is_empty()
+                && matches!(decision, Decision::AutoApprove | Decision::NotifyOnly)
+            {
+                decision = Decision::RequireApproval;
+            }
             Evaluation {
                 decision,
                 policy_not_after: p.not_after,
@@ -586,6 +601,12 @@ mod tests {
         }
     }
 
+    /// A row that is wildcard in every dimension EXCEPT origin, which names
+    /// the origin `req_brokered()` asks for: a brokered row that grants
+    /// without naming an origin is clamped to require-approval (it would
+    /// otherwise release the credential to any host the client picks), so the
+    /// precedence tests below would all measure that clamp instead of what
+    /// they mean to. Tests about origin matching set `origins` themselves.
     fn row(outcome: Outcome) -> PolicyRow {
         PolicyRow {
             id: Uuid::new_v4(),
@@ -595,7 +616,7 @@ mod tests {
             mechanism: Mechanism::Brokered,
             outcome,
             priority: 0,
-            origins: vec![],
+            origins: vec![origin("api.example.com")],
             methods: vec![],
             path_prefixes: vec![],
             max_ttl_seconds: None,
@@ -1027,6 +1048,47 @@ mod tests {
         );
         assert_eq!(e.decision, Decision::NotifyOnly);
         assert_eq!(e.policy_id, Some(notify.id));
+    }
+
+    #[test]
+    fn brokered_row_without_origins_never_grants_unattended() {
+        // An empty `origins` is "any origin", and a brokered grant sends the
+        // real credential TO that origin: auto-approving here would let a
+        // client name attacker.example and have the secret injected into a
+        // request to it, with no push (only notify-only pushes) and no
+        // operator in the loop. Both granting outcomes clamp to
+        // require-approval; the row still matches, it just cannot release.
+        for outcome in [Outcome::AutoApprove, Outcome::NotifyOnly] {
+            let mut p = row(outcome);
+            p.origins = vec![];
+            let mut r = req_brokered();
+            r.constraints.origins = vec![origin("attacker.example")];
+            let e = eval(&client(), Some(&secret()), &[], &r, &[p.clone()]);
+            assert_eq!(
+                e.decision,
+                Decision::RequireApproval,
+                "{outcome:?} row with no origins must not grant unattended"
+            );
+            assert_eq!(e.policy_id, Some(p.id));
+        }
+        // Naming the origin the client asked for is what makes it grantable.
+        let mut p = row(Outcome::AutoApprove);
+        p.origins = vec![origin("api.example.com")];
+        let e = eval(&client(), Some(&secret()), &[], &req_brokered(), &[p]);
+        assert_eq!(e.decision, Decision::AutoApprove);
+        // Non-brokered mechanisms are unaffected: they release to the caller,
+        // not to a client-named host, so an unconstrained row is not a
+        // redirection vector.
+        let mut p = row(Outcome::AutoApprove);
+        p.origins = vec![];
+        p.mechanism = Mechanism::CliRead;
+        let mut r = req_brokered();
+        r.mechanism = Mechanism::CliRead;
+        r.constraints.origins = vec![];
+        r.constraints.methods = vec![];
+        r.constraints.path_prefixes = vec![];
+        let e = eval(&client(), Some(&secret()), &[], &r, &[p]);
+        assert_eq!(e.decision, Decision::AutoApprove);
     }
 
     #[test]

@@ -329,7 +329,12 @@ pub async fn create(
         mechanism: req.mechanism,
         constraints: constraints.clone(),
     };
-    let eval_now = Utc::now();
+    // Database clock for policy applicability AND (below) every persisted
+    // deadline: policy `not_after` rows and the SQL predicates that later
+    // enforce grant/request deadlines all live on the DB clock, so evaluating
+    // applicability on a skewed process clock could ignore a still-live
+    // policy or select an already-expired one.
+    let eval_now = db::db_now(&state.db).await?;
     // Fails closed if any row that applies to this request cannot be parsed.
     let (pclient, psecret, prows) = policy_inputs(
         &client.row,
@@ -370,10 +375,9 @@ pub async fn create(
     });
 
     // Deadlines persisted from this base (request expiry, auto-grant
-    // not_after) are enforced by SQL `now()` predicates, so derive them from
-    // the database clock: a fast server clock must not stretch a TTL as the
-    // database measures it.
-    let now = db::db_now(&state.db).await?;
+    // not_after) are enforced by SQL `now()` predicates: same DB-clock base
+    // as the policy evaluation above (one fetch, used consistently).
+    let now = eval_now;
     let expires_at = now + Duration::seconds(state.config.limits.request_expiry_seconds);
     let new_row = db::NewAccessRequest {
         client_name: client.name().to_owned(),

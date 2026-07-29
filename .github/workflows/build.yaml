@@ -21,9 +21,13 @@ concurrency:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: keychute
+# Workflow-level default is read-only; the build job elevates to
+# packages: write for its registry push. (pull_request runs execute the
+# PR head's workflow definition, so in-file gating is defense in depth,
+# not a boundary — the registry-side boundary is the token GitHub grants.)
 permissions:
   contents: read
-  packages: write
+  packages: read
 jobs:
   prepare:
     runs-on: ubuntu-latest
@@ -111,6 +115,10 @@ jobs:
   build-keychute:
     needs: prepare
     runs-on: ubuntu-latest
+    # The only job that pushes to ghcr.
+    permissions:
+      contents: read
+      packages: write
     # Rust + aws-lc-sys (cmake/C) for two architectures is a much heavier build
     # than the Go services; cargo-chef keeps the dependency layer warm, but a
     # cold cache still needs room.
@@ -123,6 +131,8 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - name: Log in to Container Registry
+        # PR builds never push; don't hand them registry credentials at all.
+        if: needs.prepare.outputs.should-push == 'true'
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ${{ env.REGISTRY }}

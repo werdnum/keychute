@@ -175,6 +175,36 @@ impl Default for Limits {
     }
 }
 
+/// Refuse a plaintext `http://` URL to a non-loopback host for an outbound
+/// endpoint that carries credentials (or, for JWKS, trust anchors). Loopback
+/// hosts stay allowed for local development and tests; `insecure_ok` is the
+/// explicit `allow_insecure_http_non_loopback` override. Non-http(s) schemes
+/// are always rejected.
+fn validate_outbound_https(what: &str, url: &str, insecure_ok: bool) -> anyhow::Result<()> {
+    if let Some(rest) = url.strip_prefix("http://") {
+        let hostport = rest.split(['/', '?', '#']).next().unwrap_or("");
+        // Bracketed IPv6 first; else strip any :port.
+        let host = match hostport.strip_prefix('[') {
+            Some(v6) => v6.split(']').next().unwrap_or(""),
+            None => hostport.split(':').next().unwrap_or(""),
+        };
+        let loopback = host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .map(|ip| ip.is_loopback())
+                .unwrap_or(false);
+        if !loopback && !insecure_ok {
+            bail!(
+                "{what} {url} is plaintext HTTP to a non-loopback host: \
+                 use https://, or set allow_insecure_http_non_loopback: true"
+            );
+        }
+    } else if !url.starts_with("https://") {
+        bail!("{what} {url} must be an http(s):// URL");
+    }
+    Ok(())
+}
+
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Config> {
         let raw =
@@ -324,34 +354,21 @@ impl Config {
         if l.max_proxy_streams_per_client == 0 {
             bail!("limits.max_proxy_streams_per_client must be positive");
         }
-        // TokenReview posts the caller's service-account token (and, when
-        // configured, the reviewer credential) to this URL: plaintext to a
-        // non-loopback host exposes both. Same rule as the listen side, and
-        // the same explicit override.
+        // Outbound endpoints that carry credentials must not be plaintext to
+        // a non-loopback host (same rule as the listen side, same explicit
+        // override): TokenReview posts the caller's SA token and the reviewer
+        // credential; Pushover posts the app token and user key; a JWKS URL
+        // is worse still — plaintext key fetch lets an on-path attacker
+        // substitute a signing key and mint operator tokens.
+        let insecure_ok = self.allow_insecure_http_non_loopback;
         if let Some(url) = &self.tokenreview_url {
-            let insecure_ok = self.allow_insecure_http_non_loopback;
-            if let Some(rest) = url.strip_prefix("http://") {
-                let hostport = rest.split(['/', '?', '#']).next().unwrap_or("");
-                // Bracketed IPv6 first; else strip any :port.
-                let host = match hostport.strip_prefix('[') {
-                    Some(v6) => v6.split(']').next().unwrap_or(""),
-                    None => hostport.split(':').next().unwrap_or(""),
-                };
-                let loopback = host.eq_ignore_ascii_case("localhost")
-                    || host
-                        .parse::<std::net::IpAddr>()
-                        .map(|ip| ip.is_loopback())
-                        .unwrap_or(false);
-                if !loopback && !insecure_ok {
-                    bail!(
-                        "tokenreview_url {} is plaintext HTTP to a non-loopback host: \
-                         use https://, or set allow_insecure_http_non_loopback: true",
-                        url
-                    );
-                }
-            } else if !url.starts_with("https://") {
-                bail!("tokenreview_url {} must be an http(s):// URL", url);
-            }
+            validate_outbound_https("tokenreview_url", url, insecure_ok)?;
+        }
+        if let Some(p) = &self.pushover {
+            validate_outbound_https("pushover.base_url", &p.base_url, insecure_ok)?;
+        }
+        if let Some(oidc) = &self.human_auth.oidc {
+            validate_outbound_https("human_auth.oidc.jwks_url", &oidc.jwks_url, insecure_ok)?;
         }
         // Zero here is never a usable configuration, only a quiet outage:
         // waits that return immediately, a body cap every nonempty payload
@@ -513,6 +530,37 @@ clients:
         check("http://10.0.0.5:8001/tokenreviews", false, false);
         check("http://10.0.0.5:8001/tokenreviews", true, true);
         check("ftp://kubernetes.default.svc/tokenreviews", false, false);
+
+        // Same rule for the other credential-carrying outbound endpoints.
+        let mut cfg: Config = serde_yaml::from_str(BASE_YAML).unwrap();
+        cfg.pushover = Some(PushoverConfig {
+            base_url: "http://pushover.internal".into(),
+            token: Some("t".into()),
+            token_path: None,
+            user_key: Some("u".into()),
+            user_key_path: None,
+        });
+        cfg.normalize();
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("pushover.base_url"));
+
+        let mut cfg: Config = serde_yaml::from_str(BASE_YAML).unwrap();
+        cfg.human_auth.oidc = Some(OidcHumanAuth {
+            issuer: "https://idp.example.dev".into(),
+            audience: "keychute".into(),
+            jwks_url: "http://idp.example.dev/jwks".into(),
+            allowed_subjects: vec!["andrew".into()],
+            allowed_group: None,
+            group_claim: "groups".into(),
+            clock_skew_seconds: 60,
+        });
+        cfg.normalize();
+        // Plaintext JWKS is a signing-key substitution vector regardless of
+        // human_auth.mode: reject it whenever the section is present.
+        assert!(cfg.validate().unwrap_err().to_string().contains("jwks_url"));
     }
 
     #[test]

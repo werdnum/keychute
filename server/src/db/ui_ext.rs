@@ -270,24 +270,45 @@ pub async fn rotate_secret_version(
     Ok(row)
 }
 
-/// Grants that are still exercisable: not revoked, not past `not_after`, and
-/// with uses remaining — the same predicate `begin_grant_use` increments
-/// under, so the operator UI never lists (or offers to revoke) a grant that
-/// would already return `grant-exhausted`.
-pub async fn list_active_grants(db: &PgPool) -> anyhow::Result<Vec<GrantRow>> {
+/// Grants that can still release a credential: not revoked, not past
+/// `not_after`, and either with uses remaining (the fresh-use predicate
+/// `begin_grant_use` increments under) OR still inside a replay window.
+///
+/// The replay clause matters for revocation: an exhausted grant keeps
+/// re-releasing the same plaintext to a same-key retry until its window
+/// closes, and revoking is the ONLY thing that stops that (it makes replay
+/// return `ExpiredOrRevoked` and nulls the passthrough ciphertext). Hiding
+/// such a grant from the operator would remove the revoke button during
+/// precisely the window where it still does something.
+pub async fn list_active_grants(
+    db: &PgPool,
+    replay_window_seconds: i64,
+) -> anyhow::Result<Vec<GrantRow>> {
     Ok(sqlx::query_as::<_, GrantRow>(
-        "SELECT * FROM grants \
-         WHERE NOT revoked AND now() < not_after \
-           AND (max_uses IS NULL OR use_count < max_uses) \
-         ORDER BY created_at DESC",
+        "SELECT * FROM grants g \
+         WHERE NOT g.revoked AND now() < g.not_after \
+           AND ((g.max_uses IS NULL OR g.use_count < g.max_uses) \
+                OR EXISTS (SELECT 1 FROM grant_reads r \
+                           WHERE r.grant_id = g.id \
+                             AND r.first_read_at > now() - make_interval(secs => $1::double precision))) \
+         ORDER BY g.created_at DESC",
     )
+    .bind(replay_window_seconds as f64)
     .fetch_all(db)
     .await?)
 }
 
 /// Push dedup (addendum #10): true when another pending request with the same
 /// dedup key (client + secret + mechanism + normalized-constraints jsonb) had
-/// a push delivered after `since`.
+/// a push ACTUALLY SENT after `since`.
+///
+/// `push_attempts > 0` is the "actually sent" part and it is load-bearing: a
+/// deduped row is itself marked delivered (so the sweeper stops reselecting
+/// it) WITHOUT a push being sent, and without this predicate that row would
+/// become the next arrival's dedup target. A client re-submitting an
+/// identical request just inside the window would then chain dedups
+/// indefinitely and the operator would be notified exactly once, ever, while
+/// requests piled up unattended. Only rows that really pushed can suppress.
 pub async fn recent_duplicate_push(
     db: &PgPool,
     row: &AccessRequestRow,
@@ -296,7 +317,8 @@ pub async fn recent_duplicate_push(
     Ok(sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM access_requests \
          WHERE id <> $1 AND client_name = $2 AND secret_name = $3 AND mechanism = $4 \
-           AND constraints = $5 AND state = 'pending' AND push_delivered_at > $6)",
+           AND constraints = $5 AND state = 'pending' AND push_delivered_at > $6 \
+           AND push_attempts > 0)",
     )
     .bind(row.id)
     .bind(&row.client_name)
@@ -578,6 +600,9 @@ mod tests {
         let b = insert_pending(db, "dup", "d2", now + Duration::seconds(600)).await?;
         // No delivery recorded anywhere: no dedup.
         assert!(!recent_duplicate_push(db, &b, now - Duration::seconds(60)).await?);
+        // A real send claims the row (bumping push_attempts) and then marks
+        // it delivered — that is what makes it a valid dedup target.
+        assert!(crate::notify::claim_for_push(db, a.id).await?);
         crate::db::mark_push_delivered(db, a.id).await?;
         // Twin (same client/secret/mechanism/constraints) delivered just now.
         assert!(recent_duplicate_push(db, &b, now - Duration::seconds(60)).await?);
@@ -586,13 +611,34 @@ mod tests {
         // A row never dedups against itself.
         assert!(!recent_duplicate_push(db, &a, now - Duration::seconds(60)).await?);
 
+        // Dedup must NOT chain: `b` is now marked delivered without ever
+        // having pushed (that is what the dedup branch does), so a third
+        // identical arrival must not dedup against `b` once `a` ages out —
+        // otherwise a client re-submitting inside the window suppresses the
+        // operator's notifications forever.
+        crate::db::mark_push_delivered(db, b.id).await?;
+        let c = insert_pending(db, "dup", "d3", now + Duration::seconds(600)).await?;
+        // Window that excludes `a`'s real push but would include `b`'s
+        // dedup-marked "delivery".
+        let after_a: Vec<(chrono::DateTime<Utc>,)> =
+            sqlx::query_as("SELECT push_delivered_at FROM access_requests WHERE id = $1")
+                .bind(a.id)
+                .fetch_all(db)
+                .await?;
+        let since = after_a[0].0 + Duration::milliseconds(1);
+        assert!(!recent_duplicate_push(db, &c, since).await?);
+
         // Active-grant listing excludes revoked/expired.
         let g_live = Uuid::new_v4();
         approve_request(db, a.id, "andrew", g_live, &grant_params(None), None).await?;
         let g_dead = Uuid::new_v4();
         approve_request(db, b.id, "andrew", g_dead, &grant_params(None), None).await?;
         crate::db::revoke_grant(db, g_dead, "andrew").await?;
-        let active: Vec<Uuid> = list_active_grants(db).await?.iter().map(|g| g.id).collect();
+        let active: Vec<Uuid> = list_active_grants(db, 60)
+            .await?
+            .iter()
+            .map(|g| g.id)
+            .collect();
         assert!(active.contains(&g_live));
         assert!(!active.contains(&g_dead));
 

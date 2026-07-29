@@ -132,7 +132,18 @@ database:
   # convention used across this cluster) — and derives the credentials Secret
   # name from it, so `user` and `existingSecret` must stay in lockstep.
   user: keychute.keychute
+  # `require` encrypts but does NOT authenticate the server: an active
+  # attacker on the cluster network who can intercept the connection can
+  # impersonate Postgres. Set `verify-full` plus `sslRootCertSecret` wherever
+  # a CA for the database is available (the Zalando operator's default
+  # self-signed setup does not expose one, hence the weaker default here —
+  # its threat model accepts in-namespace interception).
   sslMode: require
+  # Secret holding the CA bundle Postgres's server cert chains to. Required
+  # for sslMode verify-ca / verify-full (render fails otherwise); mounted
+  # read-only and appended to the URL as sslrootcert.
+  sslRootCertSecret: ""
+  sslRootCertKey: ca.crt
   # Secret holding the role's credentials. NOT created by this chart. The
   # operator names it `<user>.<cluster>.credentials.postgresql.acid.zalan.do`
   # and uses the keys `username` / `password`.

@@ -10,11 +10,14 @@ metadata:
     # (duration 2160h / renewBefore 360h, rotationPolicy Always), but the
     # server loads the keypair once at startup. Stakater Reloader (running in
     # the reference cluster) watches this annotation and recreates the pod
-    # when the Secret's content changes, so the new leaf is served before the
-    # old one expires. Without Reloader this is an inert annotation — and the
-    # cert WILL expire in-pod at day 90, so install Reloader or arrange an
-    # equivalent restart-on-rotation.
-    secret.reloader.stakater.com/reload: {{ .Values.tls.secretName | quote }}
+    # when any listed Secret's content changes. EVERY Secret the process
+    # loads at startup is listed — TLS leaf, KEK keyset, DB credentials,
+    # Pushover credentials, upstream CA — because all of them are read once
+    # and never re-read: a rotation without a restart is silently unapplied
+    # (or, for the DB password, a delayed outage). Without Reloader this is
+    # an inert annotation — and the TLS cert WILL expire in-pod at day 90, so
+    # install Reloader or arrange an equivalent restart-on-rotation.
+    secret.reloader.stakater.com/reload: {{ include "keychute.reloadSecrets" . | quote }}
 spec:
   # Pinned to a single replica with a Recreate strategy, and deliberately NOT
   # configurable (DESIGN.md §5/§7): passthrough payload DEKs are wrapped under
@@ -45,6 +48,9 @@ spec:
       # ephemeral KEK (DESIGN §5). Enforced at render time — a values override
       # that violates it would otherwise deploy cleanly and only lose data
       # during a later rollout.
+      {{- if and (has .Values.database.sslMode (list "verify-ca" "verify-full")) (not .Values.database.sslRootCertSecret) (not .Values.database.urlSecret) }}
+      {{- fail (printf "database.sslMode=%s requires database.sslRootCertSecret (the CA to verify the server against)" .Values.database.sslMode) }}
+      {{- end }}
       {{- if le (int64 .Values.terminationGracePeriodSeconds) (int64 .Values.limits.drainSeconds) }}
       {{- fail (printf "terminationGracePeriodSeconds (%v) must exceed limits.drainSeconds (%v): the kubelet would SIGKILL the pod before the drain finishes, losing in-flight passthrough reads" .Values.terminationGracePeriodSeconds .Values.limits.drainSeconds) }}
       {{- end }}
@@ -81,7 +87,7 @@ spec:
           args:
             - |
               enc() { printf %s "$1" | od -An -v -tx1 | tr -d '\n' | tr ' ' '\n' | sed '/^$/d;s/^/%/' | tr -d '\n'; }
-              KEYCHUTE_DATABASE_URL="postgres://$(enc "$KEYCHUTE_DB_USER"):$(enc "$KEYCHUTE_DB_PASSWORD")@{{ .Values.database.host }}:{{ .Values.database.port | int64 }}/{{ .Values.database.name }}?sslmode={{ .Values.database.sslMode }}"
+              KEYCHUTE_DATABASE_URL="postgres://$(enc "$KEYCHUTE_DB_USER"):$(enc "$KEYCHUTE_DB_PASSWORD")@{{ .Values.database.host }}:{{ .Values.database.port | int64 }}/{{ .Values.database.name }}?sslmode={{ .Values.database.sslMode }}{{- if .Values.database.sslRootCertSecret }}&sslrootcert=/etc/keychute/db-ca/{{ .Values.database.sslRootCertKey }}{{- end }}"
               export KEYCHUTE_DATABASE_URL
               unset KEYCHUTE_DB_USER KEYCHUTE_DB_PASSWORD
               exec /usr/local/bin/keychute-server
@@ -166,6 +172,11 @@ spec:
               mountPath: /etc/keychute/upstream-ca
               readOnly: true
             {{- end }}
+            {{- if .Values.database.sslRootCertSecret }}
+            - name: db-ca
+              mountPath: /etc/keychute/db-ca
+              readOnly: true
+            {{- end }}
             # readOnlyRootFilesystem: true — give the process somewhere to put
             # transient files.
             - name: tmp
@@ -185,6 +196,12 @@ spec:
           secret:
             secretName: {{ .Values.tls.secretName }}
             defaultMode: 0400
+        {{- if .Values.database.sslRootCertSecret }}
+        - name: db-ca
+          secret:
+            secretName: {{ .Values.database.sslRootCertSecret }}
+            defaultMode: 0400
+        {{- end }}
         {{- if .Values.pushover.enabled }}
         - name: pushover
           secret:

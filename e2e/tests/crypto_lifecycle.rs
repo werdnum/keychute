@@ -42,7 +42,17 @@ async fn assert_absent_from_db(env: &TestEnv, value: &str) {
 
     // Full-row textual dump (bytea renders as \x<hex>): neither the literal
     // value nor its hex encoding may appear anywhere.
-    for table in ["secrets", "secret_versions", "access_requests", "grants"] {
+    for table in [
+        "secrets",
+        "secret_versions",
+        "access_requests",
+        "grants",
+        // The schema comment forbids secret material and freeform client
+        // context in audit detail; scan it so a debuggability change that
+        // starts writing either into audit_log.detail fails THIS test.
+        "audit_log",
+        "grant_reads",
+    ] {
         let rows: Vec<(String,)> = sqlx::query_as(&format!("SELECT t::text FROM {table} t"))
             .fetch_all(&env.db)
             .await

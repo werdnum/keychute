@@ -95,3 +95,27 @@ that route.
 {{- printf "%s-%s" (include "keychute.fullname" .) (.Values.ingress.host | replace "." "-") | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 {{- end -}}
+
+{{/*
+Comma-separated list of every Secret the server loads at STARTUP, for the
+Stakater Reloader annotation: a change to any of them needs a pod recreate to
+take effect (nothing is re-read at runtime).
+*/}}
+{{- define "keychute.reloadSecrets" -}}
+{{- $secrets := list .Values.tls.secretName .Values.kek.secretName -}}
+{{- if .Values.database.urlSecret -}}
+{{- $secrets = append $secrets .Values.database.urlSecret -}}
+{{- else -}}
+{{- $secrets = append $secrets .Values.database.existingSecret -}}
+{{- end -}}
+{{- if .Values.pushover.enabled -}}
+{{- $secrets = append $secrets .Values.pushover.secretName -}}
+{{- end -}}
+{{- if .Values.upstreamCA.secretName -}}
+{{- $secrets = append $secrets .Values.upstreamCA.secretName -}}
+{{- end -}}
+{{- if .Values.database.sslRootCertSecret -}}
+{{- $secrets = append $secrets .Values.database.sslRootCertSecret -}}
+{{- end -}}
+{{- $secrets | uniq | join "," -}}
+{{- end -}}

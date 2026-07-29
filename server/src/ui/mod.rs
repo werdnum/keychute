@@ -445,11 +445,44 @@ async fn render_request_detail(
         } else {
             row.state.as_str()
         };
+        // Read-only detail, no approval/denial controls. This is what the
+        // notify-only FYI push links to ("View request" on an
+        // already-approved row): the operator must be able to inspect what
+        // was released — mechanism, normalized constraints, retained context
+        // — not just the bare state.
+        let mechanism = parse_mechanism(&row.mechanism)?;
+        let constraints = parse_constraints(row)?;
+        let secret = db::get_secret_by_name(&state.db, &row.secret_name).await?;
+        let context = decrypt_context(state, row);
+        let secret_line = match &secret {
+            Some(s) => html! {
+                (s.name) " "
+                span .muted {
+                    "(stored, version " (s.current_version)
+                    ", max tier: "
+                    (Tier::from_int(s.max_tier).map(|t| t.as_str()).unwrap_or("?"))
+                    ")"
+                }
+            },
+            None => html! { (row.secret_name) },
+        };
         return Ok(html_page(
             "Request resolved",
             html! {
-                h1 { "Request " (row.id) }
+                h1 { "Request from " (row.client_name) }
                 p { "This request is " b { (label) } " and can no longer be acted on." }
+                p .muted {
+                    "Created " (age_label(row.created_at, now)) " ago"
+                    @if let Some(by) = &row.resolved_by { " · resolved by " (by) }
+                    @if let Some(at) = row.resolved_at {
+                        " at " (at.format("%Y-%m-%d %H:%M:%S UTC"))
+                    }
+                }
+                @if let Some(reason) = &row.deny_reason {
+                    p { "Deny reason: " (reason) }
+                }
+                (grant_block(mechanism, &constraints, secret_line))
+                (context_block(context.as_ref(), mechanism))
             },
         ));
     }
@@ -586,6 +619,12 @@ async fn render_request_detail(
 // ---------------------------------------------------------------------------
 // POST /ui/requests/{id}/approve
 
+/// The one place a HUMAN-supplied production credential enters the process
+/// (`secret_value`, for a not-yet-stored secret). `take_secret_value` zeroizes
+/// it on the success path, but approval has many fallible checks before that
+/// point — a mistyped TTL or a stale-form 409 would otherwise drop the typed
+/// credential into the allocator's free list. `Drop` closes every early
+/// return at once (matching the zeroize-on-drop discipline in `crypto`).
 #[derive(Deserialize)]
 struct ApproveForm {
     csrf_token: String,
@@ -739,6 +778,14 @@ fn secret_present_marker(present: bool) -> &'static str {
         "1"
     } else {
         "0"
+    }
+}
+
+impl Drop for ApproveForm {
+    fn drop(&mut self) {
+        if let Some(v) = &mut self.secret_value {
+            v.zeroize();
+        }
     }
 }
 
@@ -1006,7 +1053,9 @@ async fn deny(
 async fn grants_page(State(state): State<AppState>, headers: HeaderMap) -> UiResult<Html<String>> {
     let op = operator(&state, &headers).await?;
     let now = Utc::now();
-    let grants = db::ui_ext::list_active_grants(&state.db).await?;
+    let grants =
+        db::ui_ext::list_active_grants(&state.db, state.config.limits.replay_window_seconds)
+            .await?;
     Ok(html_page(
         "Active grants",
         html! {
@@ -1264,6 +1313,22 @@ async fn create_policy(
         origins.push(
             Origin::parse(line).map_err(|e| UiError::bad_request(format!("bad origin: {e}")))?,
         );
+    }
+    // A brokered row that grants without naming an origin is unconstrained in
+    // the dimension that decides where the credential is SENT: it would match
+    // any origin the client asks for, releasing the real credential to a
+    // client-chosen host with no approval and (for auto-approve) no push.
+    // The engine clamps such a row to require-approval anyway; refuse it here
+    // so the operator finds out at creation rather than wondering why their
+    // "auto-approve" rule keeps prompting.
+    if mechanism == Mechanism::Brokered
+        && origins.is_empty()
+        && matches!(outcome, "auto-approve" | "notify-only")
+    {
+        return Err(UiError::bad_request(
+            "a brokered auto-approve/notify-only policy must name at least one origin: \
+             without one it would release the credential to any host the client asks for",
+        ));
     }
     let methods = parse_methods_field(form.methods.as_deref().unwrap_or(""))?;
     let mut path_prefixes: Vec<String> = Vec::new();

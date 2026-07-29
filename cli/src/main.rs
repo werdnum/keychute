@@ -585,8 +585,29 @@ async fn wait_for_resolution(
             }
         };
         if !status.is_success() {
+            // 5xx and 429 (a gateway hiccup, or the concurrent-wait cap) are
+            // transient: the request was already created and possibly already
+            // pushed to the operator, so giving up here would strand an
+            // approval mid-flight — and a rerun would mint a duplicate
+            // request AND a duplicate push. Only a definitive 4xx is fatal,
+            // with the same exit-code mapping as the create path.
+            if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                network_errors += 1;
+                let msg = api_error_message(status, &text);
+                if network_errors >= MAX_WAIT_NETWORK_ERRORS {
+                    return Err(fail(EXIT_OTHER, format!("wait failed repeatedly: {msg}")));
+                }
+                eprintln!("keychute: transient error while waiting, retrying: {msg}");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+            let code = match status.as_u16() {
+                401 => EXIT_CONFIG,
+                403 => EXIT_DENIED,
+                _ => EXIT_OTHER,
+            };
             return Err(fail(
-                EXIT_OTHER,
+                code,
                 format!("wait failed: {}", api_error_message(status, &text)),
             ));
         }
@@ -658,8 +679,15 @@ async fn read_grant(
             }
             if status.is_client_error() {
                 // Definitive, fully parsed 4xx: retrying cannot change it.
+                // Same exit-code mapping as the create path — a wrapper's
+                // `case $? in 3)` must fire for a policy refusal here too.
+                let code = match status.as_u16() {
+                    401 => EXIT_CONFIG,
+                    403 => EXIT_DENIED,
+                    _ => EXIT_OTHER,
+                };
                 return Ok(Err(fail(
-                    EXIT_OTHER,
+                    code,
                     format!("grant read failed: {}", api_error_message(status, &text)),
                 )));
             }

@@ -91,6 +91,16 @@ fn assert_fresh_binaries() {
     for sub in ["server", "cli", "types", "migrations"] {
         newest_source_mtime(&root.join(sub), &mut newest_src);
     }
+    // The workspace root manifests too: a root Cargo.toml/Cargo.lock
+    // dependency bump changes what the binaries link without touching any
+    // file under the four source dirs.
+    for manifest in ["Cargo.toml", "Cargo.lock"] {
+        if let Ok(m) = std::fs::metadata(root.join(manifest)) {
+            if let Ok(t) = m.modified() {
+                newest_src = newest_src.max(t);
+            }
+        }
+    }
     for bin in [server_bin(), cli_bin()] {
         let built = std::fs::metadata(&bin)
             .and_then(|m| m.modified())

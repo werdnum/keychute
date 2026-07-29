@@ -7,27 +7,52 @@
 
 use std::collections::HashMap;
 
-/// One row of `ps` output: pid -> (ppid, command line).
-pub type PsTable = HashMap<u32, (u32, String)>;
+/// One row of `ps` output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PsRow {
+    pub ppid: u32,
+    /// Process group. A shell runs every member of one pipeline in the same
+    /// group, so "same pgid as us" is exactly "our pipeline peers".
+    pub pgid: u32,
+    pub command: String,
+}
 
-/// Parse `ps -o pid=,ppid=,command= -ax` output. Unparsable lines are skipped.
+/// `ps` output: pid -> row.
+pub type PsTable = HashMap<u32, PsRow>;
+
+/// Parse `ps -o pid=,ppid=,pgid=,command= -ax` output. Unparsable lines are
+/// skipped.
 pub fn parse_ps(text: &str) -> PsTable {
     let mut table = PsTable::new();
     for line in text.lines() {
         let Some((pid_s, rest)) = split_field(line) else {
             continue;
         };
-        let Some((ppid_s, command)) = split_field(rest) else {
+        let Some((ppid_s, rest)) = split_field(rest) else {
             continue;
         };
-        let (Ok(pid), Ok(ppid)) = (pid_s.parse::<u32>(), ppid_s.parse::<u32>()) else {
+        let Some((pgid_s, command)) = split_field(rest) else {
+            continue;
+        };
+        let (Ok(pid), Ok(ppid), Ok(pgid)) = (
+            pid_s.parse::<u32>(),
+            ppid_s.parse::<u32>(),
+            pgid_s.parse::<u32>(),
+        ) else {
             continue;
         };
         let command = command.trim_end();
         if command.is_empty() {
             continue;
         }
-        table.insert(pid, (ppid, command.to_string()));
+        table.insert(
+            pid,
+            PsRow {
+                ppid,
+                pgid,
+                command: command.to_string(),
+            },
+        );
     }
     table
 }
@@ -57,14 +82,14 @@ fn walk_pids(table: &PsTable, start: u32, max_levels: usize) -> Vec<(u32, String
         if !seen.insert(pid) {
             break; // cycle guard
         }
-        let Some((ppid, command)) = table.get(&pid) else {
+        let Some(row) = table.get(&pid) else {
             break;
         };
-        out.push((pid, command.clone()));
-        if *ppid == 0 || *ppid == pid {
+        out.push((pid, row.command.clone()));
+        if row.ppid == 0 || row.ppid == pid {
             break;
         }
-        pid = *ppid;
+        pid = row.ppid;
     }
     out
 }
@@ -81,8 +106,12 @@ fn looks_like_shell(command: &str) -> bool {
 }
 
 /// Best-effort pipeline capture: ancestor command lines plus, when a shell
-/// ancestor is found, that shell's OTHER children from the same `ps` snapshot
-/// — the pipeline peers (e.g. the consumer after the `|`). Agent-asserted
+/// ancestor is found, that shell's other children FROM OUR OWN PROCESS GROUP
+/// — the actual pipeline peers (e.g. the consumer after the `|`). The pgid
+/// filter is what keeps this from becoming an argv dragnet: a shell's other
+/// children include unrelated background jobs whose command lines can carry
+/// somebody else's credentials (`mysql -p…`, `curl -H "Authorization: …"`),
+/// and those must never be collected and shipped to the server. Agent-asserted
 /// context only; the snapshot is agent-influenceable and never verified.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Capture {
@@ -98,19 +127,20 @@ pub fn analyze(table: &PsTable, start: u32, max_levels: usize) -> Option<Capture
         return None;
     }
     let chain_pids: std::collections::HashSet<u32> = chain.iter().map(|(p, _)| *p).collect();
+    let own_pgid = table.get(&start).map(|r| r.pgid);
     // First shell in the ancestor chain (excluding ourselves at index 0).
     let shell_pid = chain
         .iter()
         .skip(1)
-        .find(|(_, cmd)| looks_like_shell(cmd))
+        .find(|(pid, _)| table.get(pid).is_some_and(|r| looks_like_shell(&r.command)))
         .map(|(pid, _)| *pid);
-    let mut siblings: Vec<(u32, String)> = match shell_pid {
-        Some(shell) => table
+    let mut siblings: Vec<(u32, String)> = match (shell_pid, own_pgid) {
+        (Some(shell), Some(pgid)) => table
             .iter()
-            .filter(|(pid, (ppid, _))| *ppid == shell && !chain_pids.contains(pid))
-            .map(|(pid, (_, cmd))| (*pid, cmd.clone()))
+            .filter(|(pid, row)| row.ppid == shell && row.pgid == pgid && !chain_pids.contains(pid))
+            .map(|(pid, row)| (*pid, row.command.clone()))
             .collect(),
-        None => Vec::new(),
+        _ => Vec::new(),
     };
     siblings.sort(); // deterministic order (by pid)
     Some(Capture {
@@ -124,7 +154,7 @@ pub fn analyze(table: &PsTable, start: u32, max_levels: usize) -> Option<Capture
 #[cfg(unix)]
 pub fn capture() -> Option<Capture> {
     let out = std::process::Command::new("ps")
-        .args(["-o", "pid=,ppid=,command=", "-ax"])
+        .args(["-o", "pid=,ppid=,pgid=,command=", "-ax"])
         .output()
         .ok()?;
     if !out.status.success() {
@@ -144,29 +174,41 @@ pub fn capture() -> Option<Capture> {
 mod tests {
     use super::*;
 
+    fn row(ppid: u32, pgid: u32, command: &str) -> PsRow {
+        PsRow {
+            ppid,
+            pgid,
+            command: command.to_string(),
+        }
+    }
+
+    // pid ppid pgid command. keychute (789) and kubeseal (790) share pipeline
+    // group 789; the shell's unrelated background job (791) has its own group.
     const CANNED: &str = "\
-    1     0 /sbin/launchd
-  400     1 /usr/bin/login -f agent
-  456   400 -zsh
-  789   456 keychute request my-service-api-key --reason seal
-  790   456 kubeseal --format yaml
-  bad   456 not-a-pid
+    1     0     1 /sbin/launchd
+  400     1   400 /usr/bin/login -f agent
+  456   400   456 -zsh
+  789   456   789 keychute request my-service-api-key --reason seal
+  790   456   789 kubeseal --format yaml
+  791   456   791 curl -H secret-header https://internal
+  bad   456   456 not-a-pid
   801       \n";
 
     #[test]
     fn parses_canned_ps_output() {
         let table = parse_ps(CANNED);
-        assert_eq!(table.len(), 5);
+        assert_eq!(table.len(), 6);
         assert_eq!(
             table.get(&789),
-            Some(&(
+            Some(&row(
                 456,
-                "keychute request my-service-api-key --reason seal".to_string()
+                789,
+                "keychute request my-service-api-key --reason seal"
             ))
         );
-        assert_eq!(table.get(&456), Some(&(400, "-zsh".to_string())));
+        assert_eq!(table.get(&456), Some(&row(400, 456, "-zsh")));
         // pid 1 has ppid 0
-        assert_eq!(table.get(&1), Some(&(0, "/sbin/launchd".to_string())));
+        assert_eq!(table.get(&1), Some(&row(0, 1, "/sbin/launchd")));
     }
 
     #[test]
@@ -193,7 +235,7 @@ mod tests {
     }
 
     #[test]
-    fn analyze_includes_pipeline_siblings_from_the_shell() {
+    fn analyze_includes_only_own_process_group_siblings() {
         let table = parse_ps(CANNED);
         let cap = analyze(&table, 789, 5).unwrap();
         assert_eq!(
@@ -205,18 +247,21 @@ mod tests {
                 "/sbin/launchd",
             ]
         );
-        // kubeseal (pid 790) shares the -zsh parent: it is the downstream
-        // pipeline peer, not an ancestor.
+        // kubeseal (pid 790) shares the -zsh parent AND our process group: it
+        // is the downstream pipeline peer.
         assert_eq!(cap.siblings, vec!["kubeseal --format yaml"]);
+        // The shell's unrelated background job (791, its own pgid) is NOT
+        // captured — its argv can carry somebody else's credential.
+        assert!(!cap.siblings.iter().any(|s| s.contains("curl")));
     }
 
     #[test]
     fn analyze_without_shell_ancestor_has_no_siblings() {
         // launchd -> keychute directly: no shell in the chain.
         let mut table = PsTable::new();
-        table.insert(1, (0, "/sbin/launchd".into()));
-        table.insert(50, (1, "keychute request x".into()));
-        table.insert(51, (1, "other-child".into()));
+        table.insert(1, row(0, 1, "/sbin/launchd"));
+        table.insert(50, row(1, 50, "keychute request x"));
+        table.insert(51, row(1, 50, "other-child"));
         let cap = analyze(&table, 50, 5).unwrap();
         assert_eq!(cap.ancestors, vec!["keychute request x", "/sbin/launchd"]);
         assert!(cap.siblings.is_empty());
@@ -244,12 +289,12 @@ mod tests {
         assert!(walk(&table, 99999, 5).is_empty());
         // Self-parent cycle terminates.
         let mut cyclic = PsTable::new();
-        cyclic.insert(7, (7, "self-parent".into()));
+        cyclic.insert(7, row(7, 7, "self-parent"));
         assert_eq!(walk(&cyclic, 7, 5), vec!["self-parent"]);
         // Two-node cycle terminates via the seen-set.
         let mut two = PsTable::new();
-        two.insert(1, (2, "a".into()));
-        two.insert(2, (1, "b".into()));
+        two.insert(1, row(2, 1, "a"));
+        two.insert(2, row(1, 1, "b"));
         assert_eq!(walk(&two, 1, 5), vec!["a", "b"]);
     }
 }

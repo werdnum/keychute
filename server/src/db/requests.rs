@@ -398,20 +398,23 @@ pub async fn increment_push_attempts(db: &PgPool, request_id: Uuid) -> anyhow::R
 }
 
 /// Notify-only approved requests whose FYI push has not been delivered. Same
-/// row-as-outbox model as pending approval pushes; `cutoff` bounds how far
-/// back the sweeper keeps retrying, since an FYI has no expiry of its own and
-/// loses its value once it is stale.
+/// row-as-outbox model as pending approval pushes; `retry_window_seconds`
+/// bounds how far back the sweeper keeps retrying, since an FYI has no expiry
+/// of its own and loses its value once it is stale. Measured on the DATABASE
+/// clock like every other sweep cutoff — with a process clock running ahead
+/// this query could otherwise return nothing and silently abandon the
+/// notification that notify-only exists to guarantee.
 pub async fn list_notify_only_needing_push(
     db: &PgPool,
-    cutoff: DateTime<Utc>,
+    retry_window_seconds: i64,
 ) -> anyhow::Result<Vec<AccessRequestRow>> {
     Ok(sqlx::query_as::<_, AccessRequestRow>(
         "SELECT * FROM access_requests \
          WHERE notify_only AND state = 'approved' AND push_delivered_at IS NULL \
-           AND created_at > $1 \
+           AND created_at > now() - make_interval(secs => $1::double precision) \
          ORDER BY created_at",
     )
-    .bind(cutoff)
+    .bind(retry_window_seconds as f64)
     .fetch_all(db)
     .await?)
 }

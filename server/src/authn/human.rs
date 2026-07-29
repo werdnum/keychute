@@ -11,7 +11,7 @@ use crate::config::{HumanAuthMode, OidcHumanAuth, StaticHumanAuth};
 use crate::crypto::ct_eq;
 use crate::state::AppState;
 use axum::http::{HeaderMap, StatusCode};
-use jsonwebtoken::jwk::{AlgorithmParameters, Jwk, JwkSet};
+use jsonwebtoken::jwk::{AlgorithmParameters, Jwk, JwkSet, KeyOperations, PublicKeyUse};
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -280,6 +280,29 @@ async fn authenticate_oidc(
     }
     let kid = header.kid.as_deref().ok_or(StatusCode::UNAUTHORIZED)?;
     let jwk = jwk_for_kid(&cfg.jwks_url, kid).await?;
+    // The key must be published FOR SIGNATURE VERIFICATION. A JWKS commonly
+    // carries encryption keys alongside signing ones (Keycloak ships RSA-OAEP
+    // `enc` entries by default), and an encryption key's private half is often
+    // held under weaker controls — escrowed, or shared with downstream
+    // decryptors. Verifying operator tokens against one would let any of those
+    // holders mint full approval access. Absent `use`/`key_ops` means
+    // unrestricted, which JOSE permits.
+    if jwk
+        .common
+        .public_key_use
+        .as_ref()
+        .is_some_and(|u| !matches!(u, PublicKeyUse::Signature))
+    {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    if jwk
+        .common
+        .key_operations
+        .as_ref()
+        .is_some_and(|ops| !ops.contains(&KeyOperations::Verify))
+    {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
     // The key's algorithm family must match the token header.
     let family_ok = matches!(
         (&jwk.algorithm, header.alg),
