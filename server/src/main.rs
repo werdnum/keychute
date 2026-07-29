@@ -18,6 +18,12 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    // reqwest and axum-server enable different rustls crypto providers. The
+    // server must choose one explicitly before constructing any TLS config.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|_| anyhow::anyhow!("rustls crypto provider already installed"))?;
+
     let args = Args::parse();
     let config = keychute_server::config::Config::load(&args.config)
         .with_context(|| format!("loading config from {}", args.config.display()))?;
