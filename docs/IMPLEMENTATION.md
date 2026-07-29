@@ -223,7 +223,9 @@ Client authn: `Authorization: Bearer <api-token>` or
   `limits.max_deposits_per_hour_per_client` — counted off the audit log inside
   the deposit's own transaction, behind a per-client advisory lock, so
   concurrent deposits cannot each observe the same pre-deposit count.
-  Bounds: name ≤ 128 bytes of
+  A deposit lands with `operator_vetted = false`, so it can never satisfy a
+  standing auto-approve/notify-only row until a human reviews it. Bounds:
+  name ≤ 128 bytes of
   `[A-Za-z0-9._-]` (not leading `.`), description ≤ 1 KiB, decoded value ≤
   64 KiB. Writes `secret-created` with `client_name` set and actor
   `client:<name>`, plus a best-effort FYI push. Not idempotent by design — a
@@ -255,7 +257,9 @@ or Envoy-forwarded JWT in oidc mode):
 - `GET /ui/policies` + `POST /ui/policies` (create standing grant row) +
   `POST /ui/policies/{id}/delete`.
 - Admin secret management (human-auth too): `POST /ui/secrets` (create/rotate:
-  name, value, max_tier, injection template), `GET /ui/secrets`.
+  name, value, max_tier, injection template), `GET /ui/secrets`,
+  `POST /ui/secrets/{id}/reviewed` (lift the unvetted clamp on a client
+  deposit; audits `secret-vetted`).
 - CSRF: session-less double-submit is NOT enough with header auth; since auth is
   a header (no cookies), CSRF risk is minimal, but implement `Origin`/
   `Sec-Fetch-Site` checks on all POSTs + a per-rendered-form token MAC'd with the
@@ -273,7 +277,10 @@ Use `uuid` PKs (`gen_random_uuid()` via pgcrypto or app-generated), `timestamptz
 
 - `secrets(id, name unique, description, max_tier int, injection_kind text
   ['bearer'|'header'|'basic'], injection_header text null, current_version int,
-  enabled bool, created_at, updated_at)`
+  enabled bool, operator_vetted bool default true, created_at, updated_at)` —
+  `operator_vetted` is false for a client deposit until an operator reviews it
+  (`POST /ui/secrets/{id}/reviewed`); the policy engine clamps an unvetted
+  secret to at most `require-approval`, exactly like an absent one.
 - `secret_versions(id uuid pk, secret_id fk, version int, ciphertext bytea,
   nonce bytea, wrapped_dek bytea, kek_id text, created_at, created_by_request
   uuid null, unique(secret_id, version))` — append-only; only `wrapped_dek`+

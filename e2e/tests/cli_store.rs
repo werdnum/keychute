@@ -349,3 +349,93 @@ async fn deposits_are_rate_capped_per_client() {
         .unwrap();
     assert_eq!(count, 0);
 }
+
+/// A deposit must not be able to unlock a standing auto-approve row. The
+/// depositing client picks the name, so without the unvetted clamp it could
+/// create a secret matching a policy the operator wrote for a credential THEY
+/// intended to store, and have its own bytes released with nobody in the loop.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deposit_cannot_satisfy_a_standing_auto_approve_policy() {
+    let env = TestEnv::spawn(SpawnOpts::default()).await.unwrap();
+
+    // The operator has a standing auto-approve for a name nothing is stored
+    // under yet — today that clamps to require-approval because the secret
+    // does not exist.
+    env.create_policy(&[
+        ("client_name", "k8s-agent"),
+        ("secret_name", "reserved-name"),
+        ("mechanism", "cli-read"),
+        ("outcome", "auto-approve"),
+        ("priority", "0"),
+        ("max_ttl_seconds", "3600"),
+    ])
+    .await
+    .unwrap();
+
+    // The client deposits under exactly that name...
+    let (code, _, stderr) = run_cli_with_stdin(
+        &env,
+        &["store", "reserved-name", "--max-tier", "cooperating-client"],
+        b"client-chosen\n",
+    );
+    assert_eq!(code, 0, "store failed: {stderr}");
+
+    // ...and a matching request STILL waits for a human: the secret exists,
+    // but no operator has reviewed the bytes.
+    let (status, body) = env
+        .k8s()
+        .create_request(cli_read_request("dep-1", "reserved-name", 60, "please"))
+        .await
+        .unwrap();
+    assert_eq!(status, 201, "{body}");
+    assert_eq!(
+        body["state"], "pending",
+        "an unreviewed deposit must not auto-approve: {body}"
+    );
+    assert!(body["grant_id"].is_null(), "no grant was minted: {body}");
+
+    // The approval page tells the operator where those bytes came from.
+    let request_id = body["request_id"].as_str().unwrap().to_owned();
+    let page = env
+        .ui_get(&format!("/ui/requests/{request_id}"))
+        .await
+        .unwrap();
+    assert!(
+        page.contains("not yet reviewed by you"),
+        "approval page flags the unreviewed deposit"
+    );
+
+    // Once the operator marks it reviewed, the standing policy applies again.
+    let secrets_page = env.ui_get("/ui/secrets").await.unwrap();
+    let secret_id: String =
+        sqlx::query_scalar::<_, uuid::Uuid>("SELECT id FROM secrets WHERE name = 'reserved-name'")
+            .fetch_one(&env.db)
+            .await
+            .unwrap()
+            .to_string();
+    assert!(
+        secrets_page.contains("Mark reviewed"),
+        "the secrets page offers the review action"
+    );
+    let action = format!("/ui/secrets/{secret_id}/reviewed");
+    let token = extract_csrf(&secrets_page, &action).expect("review csrf token");
+    let (status, body) = env
+        .ui_post(&action, &[("csrf_token", &token)])
+        .await
+        .unwrap();
+    assert!(
+        status.is_redirection(),
+        "mark reviewed failed: {status} {body}"
+    );
+
+    let (status, body) = env
+        .k8s()
+        .create_request(cli_read_request("dep-2", "reserved-name", 60, "please"))
+        .await
+        .unwrap();
+    assert_eq!(status, 201, "{body}");
+    assert_eq!(
+        body["state"], "approved",
+        "a reviewed secret follows the standing policy again: {body}"
+    );
+}

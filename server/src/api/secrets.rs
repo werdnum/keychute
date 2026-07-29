@@ -85,7 +85,10 @@ pub async fn store(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiFailure> {
-    let client = authenticate_client(&state, &headers).await?;
+    // Authenticate first, but do NOT return yet: an unauthenticated request
+    // still carried a credential in its body, and bailing on `?` here would
+    // free that allocation unwiped.
+    let authed = authenticate_client(&state, &headers).await;
     let parsed: Result<StoreSecretRequest, _> = serde_json::from_slice(&body);
     // The raw JSON body holds the plaintext too. Wipe it as soon as it has been
     // parsed — including on a parse failure, where the bytes are just as
@@ -94,6 +97,7 @@ pub async fn store(
     // socket read buffers) were never ours to clear. That is the same bound the
     // approval-form ingestion path works under.
     wipe(body);
+    let client = authed?;
     let mut req = parsed.map_err(|_| ApiFailure::InvalidRequest("malformed request body"))?;
     // The parsed struct owns its own copy: move it into a buffer that zeroizes
     // on drop, whichever way the handler exits.

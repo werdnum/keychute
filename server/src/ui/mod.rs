@@ -41,6 +41,7 @@ const R_REVOKE: &str = "/ui/grants/revoke";
 const R_POLICY_CREATE: &str = "/ui/policies/create";
 const R_POLICY_DELETE: &str = "/ui/policies/delete";
 const R_SECRET_SAVE: &str = "/ui/secrets/save";
+const R_SECRET_VET: &str = "/ui/secrets/vet";
 
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -61,6 +62,7 @@ pub fn router(state: AppState) -> Router {
         .route("/ui/policies/{id}/delete", post(delete_policy))
         .route("/ui/secrets", get(secrets_page))
         .route("/ui/secrets", post(save_secret))
+        .route("/ui/secrets/{id}/reviewed", post(mark_reviewed))
         .layer(axum::middleware::from_fn(security_headers))
         .with_state(state)
 }
@@ -1289,6 +1291,12 @@ async fn render_request_detail(
                 (Tier::from_int(s.max_tier).map(|t| t.as_str()).unwrap_or("?"))
                 ")"
             }
+            // Who put these bytes here matters to the decision: a deposited,
+            // unreviewed value was chosen by the client, not by you.
+            @if !s.operator_vetted {
+                " "
+                span .caveat { "(deposited by a client — not yet reviewed by you)" }
+            }
         },
         None => html! {
             span .mono { (row.secret_name) } " "
@@ -2292,6 +2300,16 @@ async fn secrets_page(State(state): State<AppState>, headers: HeaderMap) -> UiRe
                 "Credentials Keychute holds. Each one is capped at the broadest tier "
                 "it can ever be released through."
             }))
+            @if secrets.iter().any(|s| !s.operator_vetted) {
+                div .callout .callout-attention {
+                    p {
+                        "Some secrets below were deposited by a client and nobody has "
+                        "reviewed them. Until you do, every release of them needs your "
+                        "approval — a standing auto-approve or notify-only policy will "
+                        "NOT release a secret you have never seen."
+                    }
+                }
+            }
             @if secrets.is_empty() { (empty_state("No stored secrets.")) }
             @else {
                 div .table-wrap .stack-wrap {
@@ -2300,6 +2318,7 @@ async fn secrets_page(State(state): State<AppState>, headers: HeaderMap) -> UiRe
                             tr {
                                 th { "Name" } th { "Description" } th .numeric { "Version" }
                                 th { "Max tier" } th { "Injection" } th { "Enabled" }
+                                th { "Reviewed" } th { "" }
                             }
                         }
                         tbody {
@@ -2326,6 +2345,22 @@ async fn secrets_page(State(state): State<AppState>, headers: HeaderMap) -> UiRe
                                     td data-label="Enabled" {
                                         @if s.enabled { span .badge .badge-ok { "yes" } }
                                         @else { span .badge .badge-danger { "no" } }
+                                    }
+                                    td data-label="Reviewed" {
+                                        @if s.operator_vetted { span .badge .badge-ok { "yes" } }
+                                        @else {
+                                            span .badge .badge-warn { "not yet" }
+                                        }
+                                    }
+                                    td .actions data-label="" {
+                                        @if !s.operator_vetted {
+                                            form method="post"
+                                                action={ "/ui/secrets/" (s.id) "/reviewed" } .inline {
+                                                input type="hidden" name="csrf_token"
+                                                    value=(csrf::issue_token(&state.keyset, R_SECRET_VET, &s.id.to_string(), &op.subject, "", now));
+                                                button .small type="submit" { "Mark reviewed" }
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -2414,6 +2449,38 @@ impl Drop for SecretForm {
             v.zeroize();
         }
     }
+}
+
+/// POST /ui/secrets/{id}/reviewed — the operator has looked at a
+/// client-deposited value and accepts it. Until this happens the policy engine
+/// treats the secret like one that does not exist: no auto-approve, no
+/// notify-only, every release needs a decision (migration 0007).
+async fn mark_reviewed(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    Form(form): Form<CsrfOnlyForm>,
+) -> UiResult<Response> {
+    let op = operator(&state, &headers).await?;
+    check_post(
+        &state,
+        &headers,
+        R_SECRET_VET,
+        &id.to_string(),
+        &op.subject,
+        "",
+        &form.csrf_token,
+    )?;
+    // Already reviewed (or gone): nothing was written and nothing audited, so
+    // say so rather than redirecting as if this call did the work — same as
+    // the revoke handler.
+    if !db::mark_secret_vetted(&state.db, id, &op.subject).await? {
+        return Err(UiError::new(
+            StatusCode::CONFLICT,
+            "that secret is already marked reviewed, or no longer exists",
+        ));
+    }
+    Ok(Redirect::to("/ui/secrets").into_response())
 }
 
 async fn save_secret(

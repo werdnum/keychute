@@ -1,0 +1,13 @@
+-- Has a human ever looked at this secret's value?
+--
+-- The policy engine refuses to auto-approve (or silently notify-only) a
+-- release of a secret that does not exist yet: an operator must see the
+-- credential at least once. Client deposits (`POST /v1/secrets`, migration
+-- 0006) would otherwise defeat that clamp by simply creating the row — the
+-- client picks the name, so it could satisfy a name-scoped OR wildcard
+-- standing policy with bytes no human ever reviewed.
+--
+-- So deposits land unvetted and keep the clamp until an operator reviews them
+-- in the UI. Existing rows default to vetted: every one of them was created or
+-- rotated by an operator through `POST /ui/secrets` or approval-time entry.
+ALTER TABLE secrets ADD COLUMN operator_vetted boolean NOT NULL DEFAULT true;

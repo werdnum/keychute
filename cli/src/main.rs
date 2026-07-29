@@ -22,7 +22,7 @@ use keychute_types::{
 };
 use serde::Deserialize;
 use uuid::Uuid;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 const EXIT_OTHER: i32 = 1;
 const EXIT_CONFIG: i32 = 2;
@@ -845,20 +845,41 @@ fn read_secret_input(source: Option<&PathBuf>, raw: bool) -> CliResult<Zeroizing
     if !raw && strip_trailing_newline(&mut buf) {
         eprintln!("keychute: stripped the trailing newline (pass --raw to keep it)");
     }
+    // The cap applies to the CREDENTIAL, so it is enforced after normalization:
+    // a full-size secret plus the shell's `\n` is a full-size secret, and the
+    // reader deliberately allows that much headroom.
+    if buf.len() > MAX_SECRET_BYTES {
+        buf.zeroize();
+        return Err(fail(
+            EXIT_CONFIG,
+            format!("the secret value exceeds {MAX_SECRET_BYTES} bytes"),
+        ));
+    }
     if buf.is_empty() {
         return Err(fail(EXIT_CONFIG, "the secret value is empty"));
     }
     Ok(buf)
 }
 
-/// Read at most [`MAX_SECRET_BYTES`] + 1 bytes, then fail. Both sources are
-/// attacker-or-accident shaped — a mistaken `--value-file /dev/zero`, a stuck
-/// producer upstream in the pipe — and the server would refuse anything over
-/// the limit anyway, so the bound belongs here rather than after an unbounded
-/// read into memory.
+/// Read at most [`MAX_SECRET_BYTES`] plus newline headroom, then stop. Both
+/// sources are attacker-or-accident shaped — a mistaken `--value-file
+/// /dev/zero`, a stuck producer upstream in the pipe — and the server would
+/// refuse anything over the limit anyway, so the bound belongs here rather than
+/// after an unbounded read into memory.
+///
+/// The headroom is `\r\n` plus one byte: enough that a maximum-size credential
+/// followed by a shell newline still arrives intact (the caller strips it and
+/// then enforces the real cap), and one byte beyond that so oversize input is
+/// still detectable rather than silently truncated.
 fn read_bounded(source: impl Read, buf: &mut Vec<u8>) -> std::io::Result<()> {
-    source.take(MAX_SECRET_BYTES as u64 + 1).read_to_end(buf)?;
-    if buf.len() > MAX_SECRET_BYTES {
+    const HEADROOM: u64 = 3;
+    source
+        .take(MAX_SECRET_BYTES as u64 + HEADROOM)
+        .read_to_end(buf)?;
+    if buf.len() as u64 > MAX_SECRET_BYTES as u64 + HEADROOM - 1 {
+        // `clear()` only drops the length — overwrite first, or the fragment
+        // stays in the allocation for `Zeroizing`'s drop to miss.
+        buf.zeroize();
         buf.clear();
         return Err(std::io::Error::other(format!(
             "the secret value exceeds {MAX_SECRET_BYTES} bytes"
@@ -950,6 +971,14 @@ async fn run_store(cfg: &Config, http: &reqwest::Client, args: StoreArgs) -> Cli
                 ),
             ));
         }
+        // A 5xx proves nothing about what was written: a gateway that timed
+        // out after Keychute committed synthesizes 502/504 all the same. Same
+        // warning as a dropped connection.
+        if status.is_server_error() {
+            return Err(fail(code, ambiguous(format!("store failed: {msg}"))));
+        }
+        // A definitive 4xx (bad request, denied, over the rate cap) means the
+        // server rejected the deposit before writing anything.
         return Err(fail(code, format!("store failed: {msg}")));
     }
     let stored: StoreSecretResponse = serde_json::from_str(&text).map_err(|e| {
@@ -1158,16 +1187,36 @@ mod tests {
         let at_limit = vec![b'x'; MAX_SECRET_BYTES];
         read_bounded(at_limit.as_slice(), &mut buf).unwrap();
         assert_eq!(buf.len(), MAX_SECRET_BYTES);
-        // One byte over: rejected locally, and the buffer is not left holding
-        // a partial secret.
+        // Past the newline headroom: rejected locally, and the buffer is not
+        // left holding a partial secret.
         let mut buf = Vec::new();
-        let over = vec![b'x'; MAX_SECRET_BYTES + 1];
+        let over = vec![b'x'; MAX_SECRET_BYTES + 3];
         let err = read_bounded(over.as_slice(), &mut buf).unwrap_err();
         assert!(err.to_string().contains("exceeds"), "{err}");
         assert!(buf.is_empty());
         // An endless producer stops at the bound instead of eating memory.
         let mut buf = Vec::new();
         assert!(read_bounded(std::io::repeat(b'x'), &mut buf).is_err());
+    }
+
+    #[test]
+    fn a_full_size_secret_survives_its_shell_newline() {
+        // MAX + "\n" must reach the caller intact so the newline can be
+        // stripped and the credential accepted at exactly the cap.
+        let mut input = vec![b'x'; MAX_SECRET_BYTES];
+        input.push(b'\n');
+        let mut buf = Vec::new();
+        read_bounded(input.as_slice(), &mut buf).unwrap();
+        assert!(strip_trailing_newline(&mut buf));
+        assert_eq!(buf.len(), MAX_SECRET_BYTES);
+
+        // Same with CRLF.
+        let mut input = vec![b'x'; MAX_SECRET_BYTES];
+        input.extend_from_slice(b"\r\n");
+        let mut buf = Vec::new();
+        read_bounded(input.as_slice(), &mut buf).unwrap();
+        assert!(strip_trailing_newline(&mut buf));
+        assert_eq!(buf.len(), MAX_SECRET_BYTES);
     }
 
     #[test]

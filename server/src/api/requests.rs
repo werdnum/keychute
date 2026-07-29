@@ -209,6 +209,7 @@ fn policy_inputs(
         name: s.name.clone(),
         enabled: s.enabled,
         max_tier: Tier::from_int(s.max_tier).unwrap_or(Tier::Brokered),
+        operator_vetted: s.operator_vetted,
     });
     let mut out = Vec::with_capacity(rows.len());
     for r in rows {

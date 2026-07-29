@@ -95,5 +95,6 @@ pub use requests::{
 pub use secrets::{
     count_secrets, create_secret, create_secret_from_client, get_secret_by_name,
     get_secret_version, get_secret_version_by_id, get_tags_for_secret, insert_secret_version,
-    list_secrets, set_secret_tags, DepositOutcome, DepositRate, SecretRow, SecretVersionRow,
+    list_secrets, mark_secret_vetted, set_secret_tags, DepositOutcome, DepositRate, SecretRow,
+    SecretVersionRow,
 };

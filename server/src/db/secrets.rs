@@ -14,6 +14,10 @@ pub struct SecretRow {
     pub injection_header: Option<String>,
     pub current_version: i32,
     pub enabled: bool,
+    /// Has an operator ever seen this value? False for a client deposit until
+    /// one reviews it (migration 0007): the policy engine keeps such a secret
+    /// under the same "never auto-approve" clamp as one that does not exist.
+    pub operator_vetted: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -156,10 +160,13 @@ pub async fn create_secret_from_client(
     }
     super::take_kek_shared_lock(&mut tx).await?;
     let inserted = sqlx::query(
+        // `operator_vetted = false`: nobody has looked at these bytes. Until
+        // someone does, the policy engine treats this row like an absent one
+        // for auto-approve/notify-only purposes (migration 0007).
         "INSERT INTO secrets \
          (id, name, description, max_tier, injection_kind, injection_header, \
-          injection_username, current_version) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, 1) \
+          injection_username, current_version, operator_vetted) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 1, false) \
          ON CONFLICT (name) DO NOTHING",
     )
     .bind(store.secret_id)
@@ -263,6 +270,42 @@ pub async fn count_secrets(db: &PgPool) -> anyhow::Result<i64> {
     Ok(sqlx::query_scalar("SELECT count(*) FROM secrets")
         .fetch_one(db)
         .await?)
+}
+
+/// Record that an operator has reviewed a client-deposited secret, lifting the
+/// policy engine's "never auto-approve an unvetted secret" clamp. Idempotent;
+/// returns false when the row is already vetted (or absent) so the caller does
+/// not write a second audit row for a no-op.
+pub async fn mark_secret_vetted(db: &PgPool, secret_id: Uuid, actor: &str) -> anyhow::Result<bool> {
+    let mut tx = db.begin().await?;
+    let updated = sqlx::query(
+        "UPDATE secrets SET operator_vetted = true, updated_at = now() \
+         WHERE id = $1 AND NOT operator_vetted",
+    )
+    .bind(secret_id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if updated == 0 {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    let name: String = sqlx::query_scalar("SELECT name FROM secrets WHERE id = $1")
+        .bind(secret_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    crate::audit::insert_audit(
+        &mut *tx,
+        &crate::audit::AuditEvent {
+            kind: crate::audit::kinds::SECRET_VETTED,
+            secret_name: Some(name),
+            actor: Some(actor.to_owned()),
+            ..Default::default()
+        },
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(true)
 }
 
 /// Replace the tag set for a secret.

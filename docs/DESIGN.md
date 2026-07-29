@@ -125,10 +125,20 @@ and is agent-influenceable. The approval UI therefore renders tier-2 context as
      self-tagging would be self-selecting its own approval rules;
    - a per-client hourly deposit cap, decided inside the deposit's own
      transaction under a per-client lock (a check outside it would bound only a
-     serial client), bounds how much operator attention one client can spend.
+     serial client), bounds how much operator attention one client can spend;
+   - **the deposit lands unvetted**, and the policy engine treats an unvetted
+     secret exactly like one that does not exist: no auto-approve, no
+     notify-only, every release needs a decision. Without this, depositing
+     under a name a standing policy selects — by name OR by the wildcard row —
+     would let a client hand itself bytes nobody reviewed and have them
+     released with no human in the loop. An operator lifts the clamp with
+     "Mark reviewed" on the secrets page, which is the moment a human first
+     takes responsibility for the value.
 3. The operator gets an FYI push ("k8s-agent stored a new secret …") and an audit
    row (`secret-created`, actor `client:k8s-agent`). Getting the secret back out
-   is the ordinary CUJ 2 flow, approval and all.
+   is the ordinary CUJ 2 flow, approval and all — and the approval page says the
+   value was deposited by a client and not yet reviewed, because who chose those
+   bytes is part of the decision.
 
 This is the second ingestion path alongside approval-time entry (CUJ 2 step 3);
 both exist so credentials never have to transit an LLM chat to get into the store.
