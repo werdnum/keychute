@@ -26,7 +26,14 @@ namespace: keychute
 image:
   repository: ghcr.io/werdnum/keychute
   # Either a digest (preferred, set by CI) or a tag. Digest wins if both set.
-  digest: ""
+  #
+  # Seeded by hand with the digest `:latest` resolved to when the kube-config
+  # wiring landed, because the bump step above had not yet run against a tree
+  # that contained the chart — leaving `digest: ""`, i.e. a `:latest` pull with
+  # `pullPolicy: IfNotPresent`, which never refreshes. The k8s-agent image pins
+  # the same digest to lift the client CLI out of it, so server and CLI ship as
+  # a matched pair. CI overwrites this on the next push to main.
+  digest: "sha256:33b39a0b90f3d52f6f34f76750f3c92f5a4caf1b411d6165411c282c260ca0f8"
   tag: "latest"
   pullPolicy: IfNotPresent
 

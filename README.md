@@ -49,5 +49,14 @@ helm lint charts/keychute
 helm template charts/keychute
 ```
 
-Not yet in-tree: kube-config wiring and the family-assistant integration (see
-DESIGN §8).
+Cluster wiring lives in [`werdnum/kube-config`][kube-config]: the ArgoCD
+Application and values (`kubernetes/{applications,helm-values}/workloads/keychute/`),
+the Postgres database and role, the Keycloak realm client, the Cloudflare Tunnel
+hostname, and the internal-CA bundle that clients verify the server with
+(published by trust-manager). The `keychute` CLI is baked into the `k8s-agent`
+image from this repo's server image, alongside a `keychute` skill documenting
+tier-2 use.
+
+Not yet in-tree: the family-assistant integration (see DESIGN §8).
+
+[kube-config]: https://github.com/werdnum/kube-config
