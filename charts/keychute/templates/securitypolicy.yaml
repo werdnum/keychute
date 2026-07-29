@@ -1,0 +1,43 @@
+{{- if and .Values.ingress.enabled .Values.ingress.oidc.enabled }}
+# Envoy Gateway OIDC in front of the human approval UI, matching the shape of
+# the cluster's existing oidc-security-policy.yaml examples (ansible-drift-ui,
+# notes, webslicer). It targets the HTTPRoute the gateway generates for our
+# Ingress — `<ingress>-<host-with-dashes>` (DESIGN.md §7).
+#
+# forwardAccessToken is load-bearing: Keychute validates the JWT itself
+# (issuer, audience, signature, exp/nbf with bounded skew) and applies its own
+# authorization allowlist, rather than trusting proxy-injected identity
+# headers. Cluster-internal client API traffic never passes through here —
+# machine clients dial the internal Service directly.
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: SecurityPolicy
+metadata:
+  name: {{ include "keychute.fullname" . }}-oidc
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "keychute.labels" . | nindent 4 }}
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: {{ include "keychute.httpRouteName" . }}
+  oidc:
+    provider:
+      issuer: {{ .Values.oidc.issuer | quote }}
+      authorizationEndpoint: {{ .Values.ingress.oidc.authorizationEndpoint | quote }}
+      tokenEndpoint: {{ .Values.ingress.oidc.tokenEndpoint | quote }}
+    clientID: {{ .Values.ingress.oidc.clientID | quote }}
+    # SecretObjectReference has no `key` field — Envoy Gateway always reads
+    # the fixed key `client-secret` from this Secret, so that is the key the
+    # Secret must carry. (An extra `key:` here would be silently pruned by the
+    # CRD's structural schema and the policy would never program.)
+    clientSecret:
+      name: {{ .Values.ingress.oidc.clientSecretName }}
+    scopes:
+      {{- range .Values.ingress.oidc.scopes }}
+      - {{ . | quote }}
+      {{- end }}
+    redirectURL: {{ printf "https://%s%s" .Values.ingress.host .Values.ingress.oidc.redirectPath | quote }}
+    logoutPath: {{ .Values.ingress.oidc.logoutPath | quote }}
+    forwardAccessToken: true
+{{- end }}

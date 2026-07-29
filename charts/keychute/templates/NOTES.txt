@@ -1,0 +1,51 @@
+Keychute {{ .Chart.AppVersion }} installed as {{ include "keychute.fullname" . }} in namespace {{ .Values.namespace }}.
+
+This chart does NOT create any Secrets. Before the pod can start, these must
+exist in the {{ .Values.namespace }} namespace (SealedSecrets in kube-config,
+except the Postgres one which the storage-cluster operator drops in):
+
+  1. {{ .Values.kek.secretName }}
+     key: {{ .Values.kek.key }} — the KEK keyset
+     {"active": "k1", "keys": {"k1": "<base64 32 bytes>"}, "mac_key": "<base64 32 bytes>"}
+
+  2. {{ .Values.pushover.secretName }}
+     keys: token, user_key (cluster convention, same as alertmanager)
+
+  3. Postgres credentials
+{{- if .Values.database.urlSecret }}
+     {{ .Values.database.urlSecret }} / key {{ .Values.database.urlKey }} — full postgres:// URL
+{{- else }}
+     {{ .Values.database.existingSecret }} / key {{ .Values.database.passwordKey }}
+     Created by the storage-cluster operator once you add
+       databases: {keychute: keychute.keychute}
+       users:     {keychute.keychute: []}
+     to storage-cluster/postgresql.yaml.
+{{- end }}
+
+{{- if and .Values.ingress.enabled .Values.ingress.oidc.enabled }}
+
+  4. {{ .Values.ingress.oidc.clientSecretName }} / key client-secret
+     (the key name is fixed by Envoy Gateway and cannot be changed)
+     — the Keycloak client secret used by the gateway's OIDC SecurityPolicy,
+     which targets HTTPRoute "{{ include "keychute.httpRouteName" . }}".
+{{- end }}
+
+!! KEK LOSS = TOTAL DATA LOSS !!
+The database and its backups contain ciphertext only. Losing
+{{ .Values.kek.secretName }} loses every stored secret, irrecoverably. The
+recovery chain is: the sealed form of the KEK in git, plus the sealed-secrets
+controller's private key. Back up both, and never rotate the controller key
+without re-sealing.
+
+Passthrough payloads are a deliberate exception: their DEKs are wrapped under a
+process-local ephemeral KEK that never leaves memory, so a restart loses live
+passthrough payloads by design (clients get "payload lost — re-request"). That
+is also why this Deployment is pinned to replicas: 1 with the Recreate
+strategy, with no value to override it.
+
+Internal clients should use:
+  https://{{ include "keychute.serviceFQDN" . }}
+verifying against the internal CA bundle{{ if .Values.backendTLSPolicy.enabled }} (ConfigMap {{ .Values.backendTLSPolicy.caBundleConfigMap }}){{ end }}.
+{{- if .Values.ingress.enabled }}
+Humans approve at https://{{ .Values.ingress.host }}/ui/requests.
+{{- end }}

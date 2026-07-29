@@ -1,0 +1,220 @@
+name: Build and Push keychute
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'charts/keychute/Chart.yaml'
+      - 'charts/keychute/values.yaml'
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '41 4 23 * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Custom tag for the images (defaults to timestamp)'
+        required: false
+        type: string
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: keychute
+# Workflow-level default is read-only; the build job elevates to
+# packages: write for its registry push. (pull_request runs execute the
+# PR head's workflow definition, so in-file gating is defense in depth,
+# not a boundary — the registry-side boundary is the token GitHub grants.)
+permissions:
+  contents: read
+  packages: read
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.tags.outputs.tag }}
+      should-push: ${{ steps.tags.outputs.should-push }}
+      platforms: ${{ steps.tags.outputs.platforms }}
+      image-path: ${{ steps.tags.outputs.image-path }}
+      cache-to: ${{ steps.tags.outputs.cache-to }}
+    steps:
+      - name: Generate tags and determine build strategy
+        id: tags
+        # Every value below crosses into the shell through env, never through
+        # `${{ }}` interpolation: this job holds `packages: write` and later
+        # mints an App token with push access to main, and INPUT_TAG in
+        # particular is attacker-shaped free text from workflow_dispatch.
+        # Expression interpolation would splice it into the script source.
+        env:
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+          EVENT_NAME: ${{ github.event_name }}
+          COMMIT_SHA: ${{ github.sha }}
+          PR_NUMBER: ${{ github.event.number }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          # Construct image path: ghcr.io/owner/keychute
+          # Lowercase the owner name to avoid issues with docker
+          OWNER="$(echo "${REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          IMAGE_PATH="${REGISTRY}/${OWNER}/${IMAGE_NAME}"
+          echo "image-path=${IMAGE_PATH}" >> "$GITHUB_OUTPUT"
+
+          # Determine tag and push strategy
+          SHOULD_PUSH="false"
+          SHORT_SHA="$(echo "${COMMIT_SHA}" | cut -c1-7)"
+
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
+             if [ -n "${INPUT_TAG}" ]; then
+               # Dispatcher-supplied: validate against Docker tag syntax
+               # BEFORE it reaches $GITHUB_OUTPUT — an embedded newline in a
+               # plain key=value write would let the rest of the input define
+               # arbitrary extra outputs (e.g. overriding image-path) for the
+               # privileged steps downstream. Bash [[ =~ ]] is unanchored to
+               # lines: a multi-line value fails this match.
+               if [[ ! "${INPUT_TAG}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+                 echo "invalid tag input: must match Docker tag syntax" >&2
+                 exit 1
+               fi
+               TAG="${INPUT_TAG}"
+             else
+               TAG="$(date +%Y%m%d_%H%M%S)-${SHORT_SHA}"
+             fi
+             SHOULD_PUSH="true"
+          elif [ "${EVENT_NAME}" = "push" ] || [ "${EVENT_NAME}" = "schedule" ]; then
+             TAG="$(date +%Y%m%d_%H%M%S)-${SHORT_SHA}"
+             SHOULD_PUSH="true"
+          else
+             # pull_request
+             TAG="pr-${PR_NUMBER}"
+             SHOULD_PUSH="false"
+          fi
+
+          {
+            echo "tag=${TAG}"
+            echo "should-push=${SHOULD_PUSH}"
+            # The cluster runs arm64; amd64 is built too so the image is
+            # portable. No QEMU setup step is needed because the Dockerfile
+            # never executes a target-arch command: every RUN is pinned to
+            # --platform=$BUILDPLATFORM (cross-compile for the binaries, a
+            # `rootfs` stage for the CA bundle and the passwd/group entries)
+            # and the one per-target stage is COPY-only. Adding a RUN to the
+            # `runtime` stage would break that and require setup-qemu-action.
+            echo "platforms=linux/amd64,linux/arm64"
+          } >> "$GITHUB_OUTPUT"
+
+          # Determine cache strategy
+          {
+            echo "cache-to<<EOF"
+            echo "type=gha,mode=max,scope=${IMAGE_NAME}"
+            if [ "${SHOULD_PUSH}" = "true" ]; then
+              echo "type=registry,ref=${IMAGE_PATH}:buildcache,mode=max"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+  build-keychute:
+    needs: prepare
+    runs-on: ubuntu-latest
+    # The only job that pushes to ghcr.
+    permissions:
+      contents: read
+      packages: write
+    # Rust + aws-lc-sys (cmake/C) for two architectures is a much heavier build
+    # than the Go services; cargo-chef keeps the dependency layer warm, but a
+    # cold cache still needs room.
+    timeout-minutes: 90
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+        with:
+          persist-credentials: false
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Log in to Container Registry
+        # PR builds never push; don't hand them registry credentials at all.
+        if: needs.prepare.outputs.should-push == 'true'
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and conditionally push image
+        id: build
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ needs.prepare.outputs.platforms }}
+          push: ${{ needs.prepare.outputs.should-push }}
+          tags: |
+            ${{ needs.prepare.outputs.image-path }}:${{ needs.prepare.outputs.tag }}
+            ${{ needs.prepare.outputs.image-path }}:latest
+          cache-from: |
+            type=gha,scope=${{ env.IMAGE_NAME }}
+            type=registry,ref=${{ needs.prepare.outputs.image-path }}:latest
+            type=registry,ref=${{ needs.prepare.outputs.image-path }}:buildcache
+          cache-to: ${{ needs.prepare.outputs.cache-to }}
+
+      - name: Generate image updater token
+        if: needs.prepare.outputs.should-push == 'true'
+        id: app-token
+        uses: actions/create-github-app-token@29824e69f54612133e76f7eaac726eef6c875baf # v2
+        with:
+          app-id: ${{ secrets.IMAGE_UPDATER_APP_ID }}
+          private-key: ${{ secrets.IMAGE_UPDATER_PRIVATE_KEY }}
+          owner: werdnum
+          repositories: keychute
+
+      - name: Update chart image digest
+        if: needs.prepare.outputs.should-push == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE_TAG: ${{ needs.prepare.outputs.tag }}
+          REPOSITORY: ${{ github.repository }}
+          SERVER_URL: ${{ github.server_url }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -e
+
+          VALUES_PATH="charts/keychute/values.yaml"
+          CHART_PATH="charts/keychute/Chart.yaml"
+
+          # The chart lands in a parallel PR; skip the bump until it exists
+          # rather than failing the build that produced a perfectly good image.
+          if [ ! -f "${VALUES_PATH}" ] || [ ! -f "${CHART_PATH}" ]; then
+            echo "chart not present yet; skipping digest bump"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${REPOSITORY}.git"
+
+          # ubuntu-latest ships mikefarah yq, but fall back to a user-writable
+          # install if it's ever missing.
+          if ! command -v yq >/dev/null 2>&1; then
+            YQ_VERSION="v4.44.3"
+            mkdir -p "${RUNNER_TEMP}/bin"
+            curl -sSL "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" \
+              -o "${RUNNER_TEMP}/bin/yq"
+            chmod +x "${RUNNER_TEMP}/bin/yq"
+            export PATH="${RUNNER_TEMP}/bin:${PATH}"
+          fi
+
+          # Pin the freshly-built digest as the chart default so ArgoCD (which
+          # tracks this chart at HEAD) rolls the new image out. appVersion is
+          # bumped to the human-readable tag for visibility.
+          yq eval -i ".image.digest = \"${IMAGE_DIGEST}\"" "${VALUES_PATH}"
+          yq eval -i ".appVersion = \"${IMAGE_TAG}\"" "${CHART_PATH}"
+
+          if git diff --quiet; then
+            echo "No changes to commit"
+          else
+            git add "${VALUES_PATH}" "${CHART_PATH}"
+            git commit -m "chore: update image to ${IMAGE_DIGEST:0:19}" \
+                       -m "Source: ${SERVER_URL}/${REPOSITORY}/commit/${COMMIT_SHA}"
+            git pull --rebase
+            git push
+            echo "Updated chart with new image digest"
+          fi

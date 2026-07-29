@@ -1,0 +1,347 @@
+# Default values for the keychute chart.
+#
+# Keychute is a secrets store and *delivery broker* for AI agents (see
+# docs/DESIGN.md). The chart deploys the Rust server, its config, and the
+# cluster wiring described in DESIGN.md §7. Secrets are deliberately NOT part
+# of this chart: the KEK keyset, the Pushover credentials and the Postgres
+# credentials are all managed out-of-band (SealedSecrets / the Zalando
+# storage-cluster operator) and only referenced by name here.
+#
+# NOTE ON REPLICAS: there is deliberately no `replicaCount` value. Passthrough
+# payloads are wrapped under a *process-local ephemeral KEK* held only in the
+# running process's memory (DESIGN.md §5), so a second replica could not unwrap
+# what the first encrypted, and a rolling update would route grant reads to a
+# pod that never held the key. The Deployment therefore hard-codes
+# `replicas: 1` with the `Recreate` strategy and exposes no knob to change it.
+# HA is an explicit non-goal.
+
+# Namespace every namespaced resource is created in. Also the namespace the
+# Postgres credentials Secret is dropped into by the storage-cluster operator,
+# and the namespace the BackendTLSPolicy + internal CA bundle ConfigMap must
+# live in (both of that policy's refs are namespace-local — DESIGN.md §7).
+namespace: keychute
+
+# Server container image. The digest is rewritten by the chart's build workflow
+# on each push to main; pin it here so deploys are reproducible.
+image:
+  repository: ghcr.io/werdnum/keychute
+  # Either a digest (preferred, set by CI) or a tag. Digest wins if both set.
+  digest: ""
+  tag: "latest"
+  pullPolicy: IfNotPresent
+
+# imagePullSecrets are mirrored into the namespace out-of-band (e.g. by the
+# emberstack reflector in the reference cluster); conftest in kube-config
+# enforces that workloads reference one.
+imagePullSecrets:
+  - name: ghcr-secret
+
+# Server resource requests/limits.
+resources:
+  requests:
+    cpu: 20m
+    memory: 64Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+# Public base URL Keychute advertises in Pushover approval links. Must match
+# the OIDC-fronted Ingress host below, since the links land on the human
+# approval UI.
+externalUrl: https://keychute.andrewgarrett.dev
+
+# ---------------------------------------------------------------------------
+# Human (approver) authentication.
+#
+# The chart only ever renders `human_auth.mode: oidc`. The `static` mode that
+# the server also supports is a dev/e2e affordance and is never emitted here.
+# Authentication alone is not enough: DESIGN.md §6 requires an authorization
+# allowlist on top, so at least one of `allowedGroup` / `allowedSubjects` must
+# be set or the server refuses to start.
+# ---------------------------------------------------------------------------
+oidc:
+  # Keycloak realm issuer. Must match the `iss` claim exactly.
+  issuer: https://id.andrewgarrett.dev/realms/master
+  # Expected `aud` claim on the forwarded access token.
+  audience: keychute
+  # JWKS endpoint the server fetches signing keys from.
+  jwksUrl: https://id.andrewgarrett.dev/realms/master/protocol/openid-connect/certs
+  # Group whose members may approve releases (the sudo-service `adminGroup`
+  # pattern). Either this or allowedSubjects is required.
+  allowedGroup: kubernetes-cluster-admin
+  # Claim carrying group membership.
+  groupClaim: groups
+  # Explicit subject allowlist, additive with allowedGroup.
+  allowedSubjects: []
+  # Allowed clock skew when checking exp/nbf, in seconds.
+  clockSkewSeconds: 60
+
+# ---------------------------------------------------------------------------
+# Declarative client provisioning (DESIGN.md §5/§6, reconciled at startup).
+#
+# Each entry registers a machine client with the tier and mechanisms the
+# operator is willing to trust that deployment with. Registering a client at
+# tier 1 *is* the operator's statement that they trust its deterministic
+# handling code — Keychute cannot verify mechanism honesty.
+#
+#   name        — client identity recorded in the audit log
+#   maxTier     — brokered | trusted-client | cooperating-client | direct
+#   mechanisms  — brokered (t0) | autofill (t1) | cli-read (t2) | direct-read (t3)
+#                 each mechanism's tier must be <= maxTier
+#   auth        — exactly one of:
+#                   apiTokenSha256: "<lowercase hex sha256 of the bearer token>"
+#                   serviceAccount: {audience, subject}   (TokenReview)
+#
+# The API token *hash* is not a secret (it is not usable as a credential), so
+# it is fine in values; the token itself lives in the client's own config.
+#
+# Example:
+# clients:
+#   - name: family-assistant
+#     maxTier: trusted-client
+#     mechanisms: [brokered, autofill]
+#     auth:
+#       apiTokenSha256: "0000000000000000000000000000000000000000000000000000000000000000"
+#   - name: k8s-agent
+#     maxTier: cooperating-client
+#     mechanisms: [cli-read]
+#     auth:
+#       serviceAccount:
+#         audience: keychute.andrewgarrett.dev
+#         subject: "system:serviceaccount:k8s-agent:k8s-agent"
+clients: []
+
+# ---------------------------------------------------------------------------
+# Database. The Zalando storage-cluster operator creates the role and drops a
+# credentials Secret into this namespace (cross-namespace secrets are enabled
+# in the reference cluster); add `keychute: keychute.keychute` to `databases`
+# and `keychute.keychute: []` to `users` in storage-cluster/postgresql.yaml.
+#
+# The connection URL is assembled at container start from these values plus
+# the Secret: the password arrives as its own env var and a small shell
+# wrapper percent-encodes it before splicing it into KEYCHUTE_DATABASE_URL,
+# so passwords containing @ / ? # % etc. work and the credential is never
+# rendered into the ConfigMap.
+# ---------------------------------------------------------------------------
+database:
+  host: storage-cluster.storage.svc.cluster.local
+  port: 5432
+  name: keychute
+  # Login role. The Zalando operator creates the role named exactly as listed
+  # under `users:` — here `keychute.keychute` (the `<namespace>.<name>`
+  # convention used across this cluster) — and derives the credentials Secret
+  # name from it, so `user` and `existingSecret` must stay in lockstep.
+  user: keychute.keychute
+  # `require` encrypts but does NOT authenticate the server: an active
+  # attacker on the cluster network who can intercept the connection can
+  # impersonate Postgres. Set `verify-full` plus `sslRootCertSecret` wherever
+  # a CA for the database is available (the Zalando operator's default
+  # self-signed setup does not expose one, hence the weaker default here —
+  # its threat model accepts in-namespace interception).
+  sslMode: require
+  # Secret holding the CA bundle Postgres's server cert chains to. Required
+  # for sslMode verify-ca / verify-full (render fails otherwise); mounted
+  # read-only and appended to the URL as sslrootcert.
+  sslRootCertSecret: ""
+  sslRootCertKey: ca.crt
+  # Secret holding the role's credentials. NOT created by this chart. The
+  # operator names it `<user>.<cluster>.credentials.postgresql.acid.zalan.do`
+  # and uses the keys `username` / `password`.
+  existingSecret: keychute.keychute.storage-cluster.credentials.postgresql.acid.zalan.do
+  passwordKey: password
+  # Escape hatch: if set, this Secret key is expected to hold a complete
+  # `postgres://…` URL and is used verbatim instead of assembling one from the
+  # fields above (e.g. for a non-Zalando database with its own URL secret).
+  urlSecret: ""
+  urlKey: url
+
+# ---------------------------------------------------------------------------
+# KEK keyset Secret (`keyset.json`: active kek id, keys, mac_key). Created
+# out-of-band as a SealedSecret. Mounted read-only; Postgres never sees it.
+#
+# LOSING THIS SECRET LOSES EVERY STORED SECRET — backups contain ciphertext
+# only (DESIGN.md §5). The sealed form in git plus the sealed-secrets
+# controller key is the entire recovery chain.
+# ---------------------------------------------------------------------------
+kek:
+  secretName: keychute-kek
+  # Key within the Secret holding the JSON keyset.
+  key: keyset.json
+
+# Pushover credentials for approval pushes. Cluster convention: keys `token`
+# and `user_key`. Created out-of-band as a SealedSecret; mounted as files so
+# the credentials never appear in the pod env or in the ConfigMap.
+pushover:
+  enabled: true
+  secretName: keychute-pushover
+  baseURL: https://api.pushover.net
+
+# ---------------------------------------------------------------------------
+# Internal TLS. Plaintext HTTP is not offered: static API tokens and tier-1/2
+# plaintext reads transit this connection and the cluster network is not in the
+# trusted base (DESIGN.md §7). The server's `allow_insecure_http` escape hatch
+# is a dev-only flag and is never set by this chart.
+#
+# The certificate must come from a *cluster-internal* cert-manager CA issuer —
+# public CAs cannot issue for `*.svc.cluster.local`.
+# ---------------------------------------------------------------------------
+tls:
+  issuerRef:
+    name: internal-ca
+    kind: ClusterIssuer
+    group: cert-manager.io
+  # Secret cert-manager writes the keypair into (created by the Certificate).
+  secretName: keychute-internal-tls
+  # Extra SANs. The in-cluster service DNS names are always included.
+  dnsNames: []
+  duration: 2160h
+  renewBefore: 360h
+
+# ---------------------------------------------------------------------------
+# Public ingress for the human approval UI. In this cluster Ingresses are
+# materialized as Envoy Gateway HTTPRoutes, and the OIDC SecurityPolicy below
+# targets the generated route.
+# ---------------------------------------------------------------------------
+ingress:
+  enabled: false
+  className: nginx
+  host: keychute.andrewgarrett.dev
+  clusterIssuer: letsencrypt-prod
+  tlsSecretName: keychute-tls
+  # Optional Cloudflare Tunnel exposure so Pushover approval links work away
+  # from home. Set to "" to omit the external-dns target annotation. The
+  # cloudflared ConfigMap also needs the host added to its ingress list.
+  #
+  # TRUST CAVEAT (DESIGN.md §7, stated in full): the tunnel makes Cloudflare a
+  # TLS-terminating party for *all* approval traffic — not merely for typed
+  # secrets. It can observe the operator's gateway session cookie, the CSRF
+  # token, and the decrypted client context, and a party in that position could
+  # in principle forge or modify an approval. Enabling the tunnel is therefore
+  # an explicit decision to trust Cloudflare with approval authority and with
+  # secret-bearing page content alike — the same trust this cluster already
+  # extends to Cloudflare Access on every tunneled service, sudo-service
+  # approvals included. The Tailscale ingress remains the end-to-end
+  # alternative for anyone declining that trust, and is the recommended route
+  # for approval-time secret entry either way.
+  cloudflareTunnel:
+    enabled: false
+    target: ""
+  # Envoy Gateway OIDC SecurityPolicy in front of the generated HTTPRoute.
+  # forwardAccessToken is required: Keychute validates the JWT itself (issuer,
+  # audience, signature, exp/nbf) rather than trusting proxy headers.
+  oidc:
+    enabled: true
+    # Override the HTTPRoute name if the gateway's generated name differs from
+    # the `<ingress>-<host-with-dashes>` convention.
+    httpRouteName: ""
+    clientID: keychute
+    # Secret holding the OIDC client secret. NOT created by this chart. The
+    # key inside the Secret MUST be `client-secret`: Envoy Gateway's
+    # SecretObjectReference has no key field, so EG always reads that exact
+    # key and there is deliberately no knob to change it.
+    clientSecretName: keychute-oidc
+    # Well-known endpoints of the realm named by `oidc.issuer` above.
+    authorizationEndpoint: https://id.andrewgarrett.dev/realms/master/protocol/openid-connect/auth
+    tokenEndpoint: https://id.andrewgarrett.dev/realms/master/protocol/openid-connect/token
+    scopes: [openid, profile, email, groups]
+    redirectPath: /oauth2/callback
+    logoutPath: /logout
+
+# Gateway API BackendTLSPolicy so the gateway-to-Service hop speaks TLS — the
+# backend refuses plaintext. Both `targetRefs` and `validation.caCertificateRefs`
+# are namespace-local, so this policy and the CA bundle ConfigMap live in the
+# keychute namespace beside the Service, NOT in the gateway namespace
+# (DESIGN.md §7 is explicit about this).
+backendTLSPolicy:
+  enabled: false
+  # ConfigMap in this namespace holding the internal CA bundle (public material
+  # only), fanned out by the reflector pattern. Not created by this chart.
+  caBundleConfigMap: internal-ca-bundle
+  caBundleKey: ca.crt
+
+# Server-side limits (see server/src/config.rs `Limits`). Defaults here match
+# the server's own defaults.
+limits:
+  # Concurrent unresolved access requests a single client may hold.
+  maxPendingPerClient: 10
+  # Concurrent long-poll /wait connections a single client may hold.
+  maxWaitsPerClient: 5
+  # Upper bound on a single /wait long poll, seconds.
+  waitMaxSeconds: 300
+  # Unanswered requests expire after this many seconds (sudo-service uses 1h).
+  requestExpirySeconds: 3600
+  # Max request/response body proxied in a brokered (tier-0) call.
+  proxyMaxBodyBytes: 10485760
+  # Deadline for a single streamed proxy exchange, seconds.
+  proxyStreamDeadlineSeconds: 300
+  # Idempotency replay window, seconds.
+  replayWindowSeconds: 60
+  # Concurrent in-flight proxy streams per client.
+  maxProxyStreamsPerClient: 8
+  # Graceful-shutdown drain window. Must stay below
+  # terminationGracePeriodSeconds below: a passthrough payload is wrapped under
+  # the process-local ephemeral KEK, so a read cut off mid-flight is
+  # unrecoverable rather than merely retried.
+  drainSeconds: 25
+
+# TokenReview settings for audience-bound projected SA-token authentication.
+# The chart binds the ServiceAccount to `system:auth-delegator` so these calls
+# are permitted at all — without that binding the API server rejects every
+# SA-token authn attempt (DESIGN.md §7).
+tokenreview:
+  enabled: true
+  url: https://kubernetes.default.svc/apis/authentication.k8s.io/v1/tokenreviews
+  # Bearer token the server presents when calling TokenReview, and the CA it
+  # verifies the API server with. Both come from the default projected
+  # ServiceAccount volume.
+  tokenPath: /var/run/secrets/kubernetes.io/serviceaccount/token
+  caPath: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+
+# Optional PEM bundle of extra roots trusted by the outbound brokered-proxy
+# HTTP client (for upstream origins behind an internal CA). System roots stay
+# trusted. Set `secretName` to mount one; empty disables it.
+upstreamCA:
+  secretName: ""
+  key: ca.crt
+
+# ServiceAccount created for the server.
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+# Namespace-level Goldilocks (Fairwinds VPA recommender) opt-in.
+goldilocks:
+  enabled: true
+  vpaUpdateMode: "Off"
+  vpaResourcePolicy: '{"containerPolicies":[{"containerName":"*","controlledValues":"RequestsOnly","maxAllowed":{"cpu":"1","memory":"1Gi"}}]}'
+
+# No `serviceMonitor` block: the server exposes only /healthz, /readyz and the API/UI
+# routes, so a ServiceMonitor would scrape a 404 and collect nothing. It (and
+# the matching NetworkPolicy rule for the monitoring namespace) will be added
+# when the server grows a /metrics endpoint.
+
+# Create the NetworkPolicy locking ingress to the Keychute Pod.
+networkPolicy:
+  enabled: false
+  # Namespace (by metadata.name) running the gateway that fronts the human UI.
+  ingressNamespace: ingress
+  # No monitoringNamespace: there is no /metrics endpoint to scrape yet, so the
+  # scraper is not given reachability to the TLS listener.
+  # Namespaces whose pods may reach the client API on the TLS port. Machine
+  # clients are in-cluster and dial the internal Service directly. Network
+  # reachability is not authorization — authn/authz is upstack (API tokens,
+  # TokenReview) — this is defence in depth.
+  clientNamespaces:
+    - family-assistant
+    - k8s-agent
+
+# Extra pod annotations (e.g. to force a rollout).
+# Pod termination grace period. Must exceed limits.drainSeconds so in-flight
+# releases finish draining before the kubelet SIGKILLs the process.
+terminationGracePeriodSeconds: 30
+
+podAnnotations: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}

@@ -1,0 +1,24 @@
+# Keep the build context to exactly what `cargo build -p keychute-server
+# -p keychute-cli` needs: Cargo.toml / Cargo.lock, types/, server/, cli/, and
+# migrations/ (embedded at compile time by sqlx::migrate!("../migrations")).
+
+target/
+.git/
+.gitignore
+.github/
+.claude/
+docs/
+charts/
+README.md
+Dockerfile
+.dockerignore
+
+# The e2e crate is test-only (live Postgres + prebuilt binaries) and is never
+# compiled in the image — but it is a workspace member, so cargo needs its
+# manifest to resolve the workspace. The Dockerfile stubs out e2e/src/lib.rs.
+e2e/src/
+e2e/tests/
+
+# Editor / OS noise
+**/*.swp
+**/.DS_Store

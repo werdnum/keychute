@@ -1,0 +1,110 @@
+name: Rust Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+# The image build (build.yaml) only compiles keychute-server/keychute-cli; it
+# never runs the test suite. This workflow is the regression net: format, lint,
+# the store-layer tests that need a real Postgres, and the black-box e2e suite
+# (real server process, real approval UI, real CLI binary).
+jobs:
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    # Nearly everything below the unit-test line talks to Postgres for real:
+    # the store tests and every e2e test create a fresh database per test, so
+    # the service user must be a superuser (the stock postgres image role is).
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_ADMIN_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Unit and store tests
+        env:
+          KEYCHUTE_TEST_DB: ${{ env.DATABASE_ADMIN_URL }}
+        run: cargo test --workspace --exclude keychute-e2e
+
+      # The e2e harness refuses to build anything itself (nesting cargo inside
+      # cargo test corrupts the shared target dir); it asserts both binaries
+      # exist and are newer than their sources. So: build first, then test.
+      - name: Prebuild binaries for the e2e suite
+        # `touch` stamps the binaries as corresponding to this source tree.
+        # cargo keys off content, not mtime, so a build that changes nothing
+        # legitimately leaves the old binary in place with an older mtime —
+        # which the harness would otherwise read as stale.
+        run: |
+          cargo build -p keychute-server -p keychute-cli
+          touch target/debug/keychute-server target/debug/keychute
+
+      - name: e2e tests
+        env:
+          E2E_DATABASE_URL: ${{ env.DATABASE_ADMIN_URL }}
+        run: cargo test -p keychute-e2e -- --test-threads=2
+
+  helm-lint:
+    name: helm lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+        with:
+          persist-credentials: false
+
+      # The chart lands separately; these steps no-op until it exists. The
+      # guard has to sit on the steps, not the job — hashFiles resolves against
+      # the workspace, which is empty before checkout.
+      - name: Set up Helm
+        if: hashFiles('charts/keychute/Chart.yaml') != ''
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+
+      - name: helm lint
+        if: hashFiles('charts/keychute/Chart.yaml') != ''
+        run: helm lint charts/keychute

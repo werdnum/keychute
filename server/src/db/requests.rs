@@ -1,0 +1,442 @@
+//! Access requests: idempotent creation, resolution, expiry, push outbox.
+
+use crate::audit::{insert_audit, kinds, AuditEvent};
+use crate::crypto::{AadContext, CryptoError, EphemeralKek, SecretBytes};
+use chrono::{DateTime, Utc};
+use sqlx::PgPool;
+use uuid::Uuid;
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct AccessRequestRow {
+    pub id: Uuid,
+    pub client_name: String,
+    pub secret_name: String,
+    pub mechanism: String,
+    pub constraints: serde_json::Value,
+    pub context_ciphertext: Option<Vec<u8>>,
+    pub context_nonce: Option<Vec<u8>>,
+    pub context_wrapped_dek: Option<Vec<u8>>,
+    pub context_kek_id: Option<String>,
+    pub state: String,
+    /// Expiry of the standing policy row that matched at creation time, when
+    /// one did. A later human approval caps the grant at it (migration 0005).
+    pub policy_not_after: Option<DateTime<Utc>>,
+    pub deny_reason: Option<String>,
+    pub resolved_by: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub resolved_at: Option<DateTime<Utc>>,
+    pub expires_at: DateTime<Utc>,
+    pub push_delivered_at: Option<DateTime<Utc>>,
+    pub push_attempts: i32,
+    /// True when the row was created already-approved under a notify-only
+    /// policy and therefore owes the operator an FYI push (migration 0006).
+    /// The row is the outbox: the sweeper retries until `push_delivered_at`.
+    pub notify_only: bool,
+    pub idem_client: String,
+    pub idem_key: String,
+    pub idem_mac: Vec<u8>,
+}
+
+/// Insert parameters for a new access request. `idem_mac` is the keyed MAC of
+/// the normalized payload (computed by the caller with the keyset MAC key).
+///
+/// The encrypted client context is NOT part of this struct: it is sealed by a
+/// [`super::SealFn`] the insert runs inside its own transaction, under the KEK
+/// shared lock (addendum #19).
+#[derive(Debug, Clone)]
+pub struct NewAccessRequest {
+    pub client_name: String,
+    pub secret_name: String,
+    pub mechanism: String,
+    pub constraints: serde_json::Value,
+    pub expires_at: DateTime<Utc>,
+    /// Cap inherited from the matching standing policy row (see
+    /// [`AccessRequestRow::policy_not_after`]).
+    pub policy_not_after: Option<DateTime<Utc>>,
+    pub idem_client: String,
+    pub idem_key: String,
+    pub idem_mac: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InsertedRequest {
+    pub row: AccessRequestRow,
+    /// False when an existing row for (idem_client, idem_key) was returned.
+    /// The caller decides 200-vs-409 by comparing `row.idem_mac` with the
+    /// MAC of the incoming payload.
+    pub created: bool,
+}
+
+/// Idempotent insert: `ON CONFLICT (idem_client, idem_key) DO NOTHING`, then
+/// select the surviving row. `seal_context` is `Some` when the client sent a
+/// context to store: the transaction takes the KEK shared advisory lock and
+/// only then seals (addendum #19), so the KEK the seal picks cannot be retired
+/// before this row commits.
+pub async fn insert_access_request(
+    db: &PgPool,
+    req: &NewAccessRequest,
+    seal_context: Option<super::SealFn<'_>>,
+) -> anyhow::Result<InsertedRequest> {
+    let mut tx = db.begin().await?;
+    let context = match seal_context {
+        Some(seal) => {
+            super::take_kek_shared_lock(&mut tx).await?;
+            Some(seal().map_err(|e| anyhow::anyhow!("sealing request context: {e}"))?)
+        }
+        None => None,
+    };
+    let inserted = sqlx::query_as::<_, AccessRequestRow>(
+        "INSERT INTO access_requests \
+         (client_name, secret_name, mechanism, constraints, \
+          context_ciphertext, context_nonce, context_wrapped_dek, context_kek_id, \
+          expires_at, policy_not_after, idem_client, idem_key, idem_mac) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
+         ON CONFLICT (idem_client, idem_key) DO NOTHING \
+         RETURNING *",
+    )
+    .bind(&req.client_name)
+    .bind(&req.secret_name)
+    .bind(&req.mechanism)
+    .bind(&req.constraints)
+    .bind(context.as_ref().map(|s| s.ciphertext.as_slice()))
+    .bind(context.as_ref().map(|s| s.nonce.as_slice()))
+    .bind(context.as_ref().map(|s| s.wrapped_dek.as_slice()))
+    .bind(context.as_ref().map(|s| s.kek_id.as_str()))
+    .bind(req.expires_at)
+    .bind(req.policy_not_after)
+    .bind(&req.idem_client)
+    .bind(&req.idem_key)
+    .bind(&req.idem_mac)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some(row) = inserted {
+        tx.commit().await?;
+        return Ok(InsertedRequest { row, created: true });
+    }
+    tx.rollback().await?;
+    let row = sqlx::query_as::<_, AccessRequestRow>(
+        "SELECT * FROM access_requests WHERE idem_client = $1 AND idem_key = $2",
+    )
+    .bind(&req.idem_client)
+    .bind(&req.idem_key)
+    .fetch_one(db)
+    .await?;
+    Ok(InsertedRequest {
+        row,
+        created: false,
+    })
+}
+
+pub async fn count_pending_for_client(db: &PgPool, client_name: &str) -> anyhow::Result<i64> {
+    Ok(sqlx::query_scalar(
+        "SELECT count(*) FROM access_requests WHERE client_name = $1 AND state = 'pending'",
+    )
+    .bind(client_name)
+    .fetch_one(db)
+    .await?)
+}
+
+pub async fn get_request(db: &PgPool, id: Uuid) -> anyhow::Result<Option<AccessRequestRow>> {
+    Ok(
+        sqlx::query_as::<_, AccessRequestRow>("SELECT * FROM access_requests WHERE id = $1")
+            .bind(id)
+            .fetch_optional(db)
+            .await?,
+    )
+}
+
+pub async fn list_pending(db: &PgPool) -> anyhow::Result<Vec<AccessRequestRow>> {
+    Ok(sqlx::query_as::<_, AccessRequestRow>(
+        "SELECT * FROM access_requests WHERE state = 'pending' ORDER BY created_at",
+    )
+    .fetch_all(db)
+    .await?)
+}
+
+/// Passthrough payload attached to a grant at approval time (secret entered
+/// but not stored).
+///
+/// ALWAYS sealed under the process-local ephemeral KEK (DESIGN §5: a durable
+/// wrap would let a backup copy of a purged payload be decrypted through the
+/// long-lived KEK recovery chain, outliving the grant it was scoped to). That
+/// is a property of the type, not a convention: the fields are private and
+/// [`PassthroughPayload::seal`] — which takes an [`EphemeralKek`] and performs
+/// the sealing itself — is the only way to make one, so a keyset-sealed blob
+/// cannot be smuggled in. A durable payload would be a wrapped-DEK reference
+/// sealed by the caller, outside the transaction that holds the KEK shared
+/// lock, which is exactly the ordering addendum #19 forbids (see
+/// [`super::SealFn`]). Because the ephemeral KEK is not in the keyset and is
+/// never retired, sealing these before the transaction is safe — and the
+/// store's `passthrough_ephemeral` column is `true` for every row that carries
+/// a payload.
+#[derive(Debug, Clone)]
+pub struct PassthroughPayload {
+    ciphertext: Vec<u8>,
+    nonce: Vec<u8>,
+    wrapped_dek: Vec<u8>,
+}
+
+impl PassthroughPayload {
+    /// Seal `value` for `grant_id` under the process-local ephemeral KEK. The
+    /// only constructor (see the type docs).
+    pub fn seal(
+        kek: &EphemeralKek,
+        grant_id: Uuid,
+        value: &SecretBytes,
+    ) -> Result<PassthroughPayload, CryptoError> {
+        let sealed = kek.seal(value, AadContext::GrantPassthrough { grant_id })?;
+        debug_assert_eq!(sealed.kek_id, crate::crypto::EPHEMERAL_KEK_ID);
+        Ok(PassthroughPayload {
+            ciphertext: sealed.ciphertext,
+            nonce: sealed.nonce,
+            wrapped_dek: sealed.wrapped_dek,
+        })
+    }
+
+    /// `(ciphertext, nonce, wrapped_dek)` for the store layer's INSERTs.
+    pub fn parts(&self) -> (&[u8], &[u8], &[u8]) {
+        (&self.ciphertext, &self.nonce, &self.wrapped_dek)
+    }
+}
+
+/// Grant fields decided at approval time (constraints possibly narrowed,
+/// `not_after` already capped against policy expiry by the caller).
+#[derive(Debug, Clone)]
+pub struct GrantParams {
+    pub client_name: String,
+    pub secret_name: String,
+    pub mechanism: String,
+    pub constraints: serde_json::Value,
+    pub not_after: DateTime<Utc>,
+    pub max_uses: Option<i32>,
+    pub passthrough: Option<PassthroughPayload>,
+}
+
+/// Approve a pending request: in one transaction, flip `pending -> approved`
+/// (rowcount-checked), insert the grant, and write the `request-approved`
+/// audit row. Returns the new grant id, or `None` if the request was not
+/// pending (already resolved or expired) — nothing is written in that case.
+pub async fn resolve_approve(
+    db: &PgPool,
+    request_id: Uuid,
+    resolved_by: &str,
+    grant: &GrantParams,
+) -> anyhow::Result<Option<Uuid>> {
+    let mut tx = db.begin().await?;
+    let updated = sqlx::query(
+        "UPDATE access_requests \
+         SET state = 'approved', resolved_by = $2, resolved_at = now() \
+         WHERE id = $1 AND state = 'pending' AND now() < expires_at",
+    )
+    .bind(request_id)
+    .bind(resolved_by)
+    .execute(&mut *tx)
+    .await?;
+    if updated.rows_affected() != 1 {
+        return Ok(None);
+    }
+    // `passthrough_ephemeral` mirrors "this grant carries a payload": payloads
+    // are ephemeral-KEK-sealed by construction ([`PassthroughPayload`]). The
+    // column stays `true` after the sweeper nulls the ciphertext, which is how
+    // the read path tells a purged passthrough grant from a stored-secret one.
+    let (pt_ct, pt_nonce, pt_dek, pt_eph) = match &grant.passthrough {
+        Some(p) => {
+            let (ct, nonce, dek) = p.parts();
+            (Some(ct), Some(nonce), Some(dek), true)
+        }
+        None => (None, None, None, false),
+    };
+    let grant_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO grants \
+         (request_id, client_name, secret_name, mechanism, constraints, not_after, max_uses, \
+          passthrough_ciphertext, passthrough_nonce, passthrough_wrapped_dek, passthrough_ephemeral) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+         RETURNING id",
+    )
+    .bind(request_id)
+    .bind(&grant.client_name)
+    .bind(&grant.secret_name)
+    .bind(&grant.mechanism)
+    .bind(&grant.constraints)
+    .bind(grant.not_after)
+    .bind(grant.max_uses)
+    .bind(pt_ct)
+    .bind(pt_nonce)
+    .bind(pt_dek)
+    .bind(pt_eph)
+    .fetch_one(&mut *tx)
+    .await?;
+    insert_audit(
+        &mut *tx,
+        &AuditEvent {
+            kind: kinds::REQUEST_APPROVED,
+            request_id: Some(request_id),
+            grant_id: Some(grant_id),
+            client_name: Some(grant.client_name.clone()),
+            secret_name: Some(grant.secret_name.clone()),
+            actor: Some(resolved_by.to_owned()),
+            ..Default::default()
+        },
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Some(grant_id))
+}
+
+/// Deny a pending request (`pending -> denied`) plus audit row, atomically.
+/// Returns false if the request was not pending.
+pub async fn resolve_deny(
+    db: &PgPool,
+    request_id: Uuid,
+    resolved_by: &str,
+    reason: &str,
+) -> anyhow::Result<bool> {
+    let mut tx = db.begin().await?;
+    let row: Option<(String, String)> = sqlx::query_as(
+        "UPDATE access_requests \
+         SET state = 'denied', deny_reason = $2, resolved_by = $3, resolved_at = now() \
+         WHERE id = $1 AND state = 'pending' AND now() < expires_at \
+         RETURNING client_name, secret_name",
+    )
+    .bind(request_id)
+    .bind(reason)
+    .bind(resolved_by)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((client_name, secret_name)) = row else {
+        return Ok(false);
+    };
+    insert_audit(
+        &mut *tx,
+        &AuditEvent {
+            kind: kinds::REQUEST_DENIED,
+            request_id: Some(request_id),
+            client_name: Some(client_name),
+            secret_name: Some(secret_name),
+            actor: Some(resolved_by.to_owned()),
+            ..Default::default()
+        },
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// Expire pending requests past their deadline. Returns the number expired.
+///
+/// The encrypted context is deliberately KEPT here and left to
+/// [`purge_request_context`]'s retention window, exactly like a denied or
+/// approved request's: the resolved-request page renders context for terminal
+/// rows, so an operator opening the link for a request that expired minutes
+/// ago must still be able to read what the client asked for and why. Purging
+/// at the transition would blank it instantly while denied rows keep theirs
+/// for the full window — an inconsistency with no privacy benefit, since both
+/// are purged on the same schedule.
+///
+/// Deadline and `resolved_at` are both on the DATABASE clock, matching every
+/// other predicate that reads `expires_at` (`claim_for_push`, the pending-cap
+/// count, the approve/deny transitions).
+pub async fn expire_stale(db: &PgPool) -> anyhow::Result<u64> {
+    let mut tx = db.begin().await?;
+    let expired: Vec<(Uuid, String, String)> = sqlx::query_as(
+        "UPDATE access_requests \
+         SET state = 'expired', resolved_at = now() \
+         WHERE state = 'pending' AND expires_at < now() \
+         RETURNING id, client_name, secret_name",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    for (id, client_name, secret_name) in &expired {
+        insert_audit(
+            &mut *tx,
+            &AuditEvent {
+                kind: kinds::REQUEST_EXPIRED,
+                request_id: Some(*id),
+                client_name: Some(client_name.clone()),
+                secret_name: Some(secret_name.clone()),
+                ..Default::default()
+            },
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(expired.len() as u64)
+}
+
+/// Purge encrypted context from requests that reached a terminal state before
+/// `cutoff` (retention decided by the sweeper). Returns rows purged.
+/// Retention is measured on the DATABASE clock (`resolved_at` is written with
+/// SQL `now()`), same as the other purge cutoffs: the process clock plays no
+/// part in deciding what is old enough to destroy.
+pub async fn purge_request_context(db: &PgPool, retention_seconds: i64) -> anyhow::Result<u64> {
+    let res = sqlx::query(
+        "UPDATE access_requests \
+         SET context_ciphertext = NULL, context_nonce = NULL, \
+             context_wrapped_dek = NULL, context_kek_id = NULL \
+         WHERE state <> 'pending' AND resolved_at IS NOT NULL \
+           AND resolved_at < now() - make_interval(secs => $1::double precision) \
+           AND context_ciphertext IS NOT NULL",
+    )
+    .bind(retention_seconds as f64)
+    .execute(db)
+    .await?;
+    Ok(res.rows_affected())
+}
+
+pub async fn mark_push_delivered(db: &PgPool, request_id: Uuid) -> anyhow::Result<()> {
+    sqlx::query("UPDATE access_requests SET push_delivered_at = now() WHERE id = $1")
+        .bind(request_id)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+/// Unconditional counter bump. Both push paths use
+/// `notify::claim_for_push` instead: it bumps the counter only while the row
+/// is still pushable, which is also the permission to send.
+pub async fn increment_push_attempts(db: &PgPool, request_id: Uuid) -> anyhow::Result<()> {
+    sqlx::query("UPDATE access_requests SET push_attempts = push_attempts + 1 WHERE id = $1")
+        .bind(request_id)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+/// Notify-only approved requests whose FYI push has not been delivered. Same
+/// row-as-outbox model as pending approval pushes; `retry_window_seconds`
+/// bounds how far back the sweeper keeps retrying, since an FYI has no expiry
+/// of its own and loses its value once it is stale. Measured on the DATABASE
+/// clock like every other sweep cutoff — with a process clock running ahead
+/// this query could otherwise return nothing and silently abandon the
+/// notification that notify-only exists to guarantee.
+pub async fn list_notify_only_needing_push(
+    db: &PgPool,
+    retry_window_seconds: i64,
+) -> anyhow::Result<Vec<AccessRequestRow>> {
+    Ok(sqlx::query_as::<_, AccessRequestRow>(
+        "SELECT * FROM access_requests \
+         WHERE notify_only AND state = 'approved' AND push_delivered_at IS NULL \
+           AND created_at > now() - make_interval(secs => $1::double precision) \
+         ORDER BY created_at",
+    )
+    .bind(retry_window_seconds as f64)
+    .fetch_all(db)
+    .await?)
+}
+
+/// Pending, unexpired requests whose approval push has not been delivered and
+/// which still have retry budget. The request row is the outbox.
+pub async fn list_pending_needing_push(
+    db: &PgPool,
+    max_attempts: i32,
+) -> anyhow::Result<Vec<AccessRequestRow>> {
+    Ok(sqlx::query_as::<_, AccessRequestRow>(
+        "SELECT * FROM access_requests \
+         WHERE state = 'pending' AND push_delivered_at IS NULL \
+           AND push_attempts < $1 AND expires_at > now() \
+         ORDER BY created_at",
+    )
+    .bind(max_attempts)
+    .fetch_all(db)
+    .await?)
+}

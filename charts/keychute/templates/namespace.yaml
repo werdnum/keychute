@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Values.namespace }}
+  labels:
+    {{- include "keychute.labels" . | nindent 4 }}
+    {{- if .Values.goldilocks.enabled }}
+    goldilocks.fairwinds.com/enabled: "true"
+    {{- end }}
+{{- if .Values.goldilocks.enabled }}
+  annotations:
+    goldilocks.fairwinds.com/vpa-update-mode: {{ .Values.goldilocks.vpaUpdateMode | quote }}
+    goldilocks.fairwinds.com/vpa-resource-policy: {{ .Values.goldilocks.vpaResourcePolicy | quote }}
+{{- end }}

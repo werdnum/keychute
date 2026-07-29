@@ -1,0 +1,24 @@
+apiVersion: v2
+name: keychute
+description: |-
+  Secrets store and delivery broker for AI agents. Ships the single-replica
+  Keychute Deployment (Rust server, internal TLS from a cluster-internal
+  cert-manager CA), its ServiceAccount + `system:auth-delegator` binding for
+  TokenReview-based client authentication, the rendered server config, and the
+  supporting Service, Certificate, Ingress, Envoy Gateway OIDC SecurityPolicy,
+  BackendTLSPolicy and NetworkPolicy.
+type: application
+# Chart version is bumped on chart changes; appVersion tracks the container
+# image and is rewritten by .github/workflows/build.yaml on each push to main.
+version: 0.1.0
+appVersion: "0.0.0-dev"
+keywords:
+  - secrets
+  - approval
+  - agents
+  - kubernetes
+home: https://github.com/werdnum/keychute
+sources:
+  - https://github.com/werdnum/keychute
+maintainers:
+  - name: werdnum

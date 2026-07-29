@@ -1,0 +1,30 @@
+{{- if .Values.backendTLSPolicy.enabled }}
+# The gateway-to-Service hop must be TLS because the backend refuses plaintext.
+#
+# Namespace placement is not a style choice: DESIGN.md §7 is explicit that both
+# `targetRefs` (the Service) and `validation.caCertificateRefs` (the internal
+# CA bundle ConfigMap) are namespace-local, so this policy AND the CA bundle
+# live here in the keychute namespace beside the Service — not in the gateway
+# namespace. The CA bundle ConfigMap is fanned out with the reflector pattern
+# and is not created by this chart.
+apiVersion: gateway.networking.k8s.io/v1alpha3
+kind: BackendTLSPolicy
+metadata:
+  name: {{ include "keychute.fullname" . }}-backend-tls
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "keychute.labels" . | nindent 4 }}
+spec:
+  targetRefs:
+    - group: ""
+      kind: Service
+      name: {{ include "keychute.fullname" . }}
+      sectionName: https
+  validation:
+    caCertificateRefs:
+      - group: ""
+        kind: ConfigMap
+        name: {{ .Values.backendTLSPolicy.caBundleConfigMap }}
+    # Must match a SAN on the internal certificate.
+    hostname: {{ include "keychute.serviceFQDN" . }}
+{{- end }}

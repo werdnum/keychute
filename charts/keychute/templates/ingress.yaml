@@ -1,0 +1,71 @@
+{{- if .Values.ingress.enabled }}
+# Public entrypoint for the human approval UI. In this cluster Ingresses are
+# materialized as Envoy Gateway HTTPRoutes (generated name
+# `<ingress>-<host-with-dashes>`); the OIDC SecurityPolicy in
+# templates/securitypolicy.yaml targets that route, and the BackendTLSPolicy
+# secures the gateway-to-Service hop.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "keychute.fullname" . }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "keychute.labels" . | nindent 4 }}
+  annotations:
+    cert-manager.io/cluster-issuer: {{ .Values.ingress.clusterIssuer }}
+    # The backend refuses plaintext; nginx must originate TLS upstream.
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+    {{- if and .Values.ingress.cloudflareTunnel.enabled .Values.ingress.cloudflareTunnel.target }}
+    # Routes through Cloudflare Tunnel so Pushover approval links work away
+    # from home. The cloudflared ConfigMap also needs this host in its ingress
+    # list. See values.yaml for the full trust caveat: the tunnel makes
+    # Cloudflare a TLS-terminating party for all approval traffic — session
+    # cookie, CSRF token and decrypted client context included — and therefore
+    # a party that could in principle forge or modify an approval.
+    external-dns.alpha.kubernetes.io/target: {{ .Values.ingress.cloudflareTunnel.target }}
+    {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  tls:
+    - hosts:
+        - {{ .Values.ingress.host }}
+      secretName: {{ .Values.ingress.tlsSecretName }}
+  rules:
+    - host: {{ .Values.ingress.host }}
+      http:
+        paths:
+          {{- /*
+          Deliberately NOT `path: /`. This Ingress is the public entrypoint;
+          everything it matches is reachable from the internet. The server also
+          serves /v1/* (the machine client API — token/SA authenticated, dialed
+          by in-cluster clients over the internal Service, never needed from
+          outside) and /healthz + /readyz (probed by the kubelet on the pod IP).
+          The gateway OIDC SecurityPolicy fronts this route today, but
+          `ingress.oidc.enabled` is an independent toggle and the httpRouteName
+          in _helpers.tpl is a convention guess that can miss the gateway's
+          actual generated name — so the path set is the load-bearing limit,
+          not the policy.
+
+          /ui covers every route in server/src/ui/mod.rs (requests, grants,
+          policies, secrets) and is the target of every Pushover approval link
+          (`{external_url}/ui/requests/{id}`). The two OIDC paths are consumed
+          by Envoy Gateway itself, not the backend, but must be matched by the
+          HTTPRoute for the SecurityPolicy to intercept them — they come
+          straight from ingress.oidc.{redirectPath,logoutPath} so overriding
+          those values keeps this in sync.
+          */ -}}
+          {{- $paths := list "/ui" }}
+          {{- if .Values.ingress.oidc.enabled }}
+          {{- $paths = append $paths .Values.ingress.oidc.redirectPath }}
+          {{- $paths = append $paths .Values.ingress.oidc.logoutPath }}
+          {{- end }}
+          {{- range $paths }}
+          - path: {{ . | quote }}
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "keychute.fullname" $ }}
+                port:
+                  number: 443
+          {{- end }}
+{{- end }}

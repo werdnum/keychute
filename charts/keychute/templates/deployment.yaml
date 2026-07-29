@@ -1,0 +1,234 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "keychute.fullname" . }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "keychute.labels" . | nindent 4 }}
+  annotations:
+    # cert-manager renews {{ .Values.tls.secretName }} in place at ~day 75
+    # (duration 2160h / renewBefore 360h, rotationPolicy Always), but the
+    # server loads the keypair once at startup. Stakater Reloader (running in
+    # the reference cluster) watches this annotation and recreates the pod
+    # when any listed Secret's content changes. EVERY Secret the process
+    # loads at startup is listed — TLS leaf, KEK keyset, DB credentials,
+    # Pushover credentials, upstream CA — because all of them are read once
+    # and never re-read: a rotation without a restart is silently unapplied
+    # (or, for the DB password, a delayed outage). Without Reloader this is
+    # an inert annotation — and the TLS cert WILL expire in-pod at day 90, so
+    # install Reloader or arrange an equivalent restart-on-rotation.
+    secret.reloader.stakater.com/reload: {{ include "keychute.reloadSecrets" . | quote }}
+spec:
+  # Pinned to a single replica with a Recreate strategy, and deliberately NOT
+  # configurable (DESIGN.md §5/§7): passthrough payload DEKs are wrapped under
+  # a process-local ephemeral KEK that exists only in this process's memory.
+  # A second replica could not unwrap payloads the first encrypted, and a
+  # rolling update would route grant reads to a pod that never held the key —
+  # both produce spurious "payload lost" errors. HA is a non-goal here.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "keychute.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "keychute.selectorLabels" . | nindent 8 }}
+      annotations:
+        # Roll the pod when the rendered server config changes.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      # Must exceed limits.drainSeconds so the drain completes before the
+      # kubelet SIGKILLs the pod: an in-flight passthrough read cut off here is
+      # unrecoverable, since its payload is wrapped under the process-local
+      # ephemeral KEK (DESIGN §5). Enforced at render time — a values override
+      # that violates it would otherwise deploy cleanly and only lose data
+      # during a later rollout.
+      {{- if and (has .Values.database.sslMode (list "verify-ca" "verify-full")) (not .Values.database.sslRootCertSecret) (not .Values.database.urlSecret) }}
+      {{- fail (printf "database.sslMode=%s requires database.sslRootCertSecret (the CA to verify the server against)" .Values.database.sslMode) }}
+      {{- end }}
+      {{- if le (int64 .Values.terminationGracePeriodSeconds) (int64 .Values.limits.drainSeconds) }}
+      {{- fail (printf "terminationGracePeriodSeconds (%v) must exceed limits.drainSeconds (%v): the kubelet would SIGKILL the pod before the drain finishes, losing in-flight passthrough reads" .Values.terminationGracePeriodSeconds .Values.limits.drainSeconds) }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      serviceAccountName: {{ include "keychute.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: keychute
+          # Image digest is rewritten by .github/workflows/build.yaml on each
+          # push to main.
+          image: {{ include "keychute.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- if not .Values.database.urlSecret }}
+          # Assemble KEYCHUTE_DATABASE_URL at container start rather than via
+          # Kubernetes $(VAR) expansion: the userinfo section of a URL must be
+          # percent-encoded, and the operator-generated password can legally
+          # contain `@ / ? # %`, any of which would silently reparent the URL's
+          # authority or credentials if spliced in raw. The wrapper hex-encodes
+          # every byte of the user and password (blanket percent-encoding is
+          # always valid), exports the URL, scrubs the raw values from the
+          # environment, and execs the server (so PID 1 and signal handling are
+          # unchanged). od/sed/tr are in Debian's Essential set.
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              enc() { printf %s "$1" | od -An -v -tx1 | tr -d '\n' | tr ' ' '\n' | sed '/^$/d;s/^/%/' | tr -d '\n'; }
+              KEYCHUTE_DATABASE_URL="postgres://$(enc "$KEYCHUTE_DB_USER"):$(enc "$KEYCHUTE_DB_PASSWORD")@{{ .Values.database.host }}:{{ .Values.database.port | int64 }}/{{ .Values.database.name }}?sslmode={{ .Values.database.sslMode }}{{- if .Values.database.sslRootCertSecret }}&sslrootcert=/etc/keychute/db-ca/{{ .Values.database.sslRootCertKey }}{{- end }}"
+              export KEYCHUTE_DATABASE_URL
+              unset KEYCHUTE_DB_USER KEYCHUTE_DB_PASSWORD
+              exec /usr/local/bin/keychute-server
+          {{- end }}
+          env:
+            - name: KEYCHUTE_CONFIG
+              value: /etc/keychute/config/config.yaml
+            {{- if .Values.database.urlSecret }}
+            # Verbatim connection URL from a Secret (escape hatch for
+            # passwords needing percent-encoding).
+            - name: KEYCHUTE_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.urlSecret }}
+                  key: {{ .Values.database.urlKey }}
+            {{- else }}
+            # Consumed (percent-encoded into KEYCHUTE_DATABASE_URL) and then
+            # unset by the shell wrapper above, so the password is never
+            # rendered into the ConfigMap and never spliced raw into a URL.
+            # KEYCHUTE_DATABASE_URL overrides `database_url` in the config
+            # file (server/src/config.rs).
+            - name: KEYCHUTE_DB_USER
+              value: {{ .Values.database.user | quote }}
+            - name: KEYCHUTE_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.existingSecret }}
+                  key: {{ .Values.database.passwordKey }}
+            {{- end }}
+          ports:
+            - name: https
+              containerPort: 8443
+              protocol: TCP
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          # Liveness: process-only. /healthz never touches the database, so a
+          # Postgres outage does not get "fixed" by restarting the pod.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: https
+              scheme: HTTPS
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          # Readiness: /readyz runs a bounded `SELECT 1`, so a pod that cannot
+          # reach the database leaves the Service endpoints instead of
+          # accepting requests every one of which would fail.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: https
+              scheme: HTTPS
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            # Above the server's own 2s database-probe bound so the endpoint
+            # answers 503 rather than being cut off mid-check.
+            timeoutSeconds: 3
+            failureThreshold: 3
+          volumeMounts:
+            - name: config
+              mountPath: /etc/keychute/config
+              readOnly: true
+            # The KEK keyset. Read-only, and never reachable from Postgres.
+            - name: kek
+              mountPath: /etc/keychute/kek
+              readOnly: true
+            - name: tls
+              mountPath: /etc/keychute/tls
+              readOnly: true
+            {{- if .Values.pushover.enabled }}
+            - name: pushover
+              mountPath: /etc/keychute/pushover
+              readOnly: true
+            {{- end }}
+            {{- if .Values.upstreamCA.secretName }}
+            - name: upstream-ca
+              mountPath: /etc/keychute/upstream-ca
+              readOnly: true
+            {{- end }}
+            {{- if .Values.database.sslRootCertSecret }}
+            - name: db-ca
+              mountPath: /etc/keychute/db-ca
+              readOnly: true
+            {{- end }}
+            # readOnlyRootFilesystem: true — give the process somewhere to put
+            # transient files.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "keychute.fullname" . }}-config
+            items:
+              - key: config.yaml
+                path: config.yaml
+        - name: kek
+          secret:
+            secretName: {{ .Values.kek.secretName }}
+            defaultMode: 0400
+        - name: tls
+          secret:
+            secretName: {{ .Values.tls.secretName }}
+            defaultMode: 0400
+        {{- if .Values.database.sslRootCertSecret }}
+        - name: db-ca
+          secret:
+            secretName: {{ .Values.database.sslRootCertSecret }}
+            defaultMode: 0400
+        {{- end }}
+        {{- if .Values.pushover.enabled }}
+        - name: pushover
+          secret:
+            secretName: {{ .Values.pushover.secretName }}
+            defaultMode: 0400
+            items:
+              - key: token
+                path: token
+              - key: user_key
+                path: user_key
+        {{- end }}
+        {{- if .Values.upstreamCA.secretName }}
+        - name: upstream-ca
+          secret:
+            secretName: {{ .Values.upstreamCA.secretName }}
+        {{- end }}
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
