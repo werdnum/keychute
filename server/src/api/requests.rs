@@ -180,7 +180,7 @@ fn row_is_applicable_raw(
 /// mechanism, or already expired — all decided from columns that cannot be
 /// malformed) are dropped with a warning, so one broken unrelated row does not
 /// brick every request.
-fn policy_inputs(
+pub(crate) fn policy_inputs(
     client: &db::ClientRow,
     secret: Option<&db::SecretRow>,
     secret_tags: &[String],

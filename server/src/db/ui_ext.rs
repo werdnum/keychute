@@ -63,19 +63,24 @@ pub async fn approve_request(
     // this transaction: the handler computed it before waiting on the KEK
     // advisory lock and sealing, and approving past it would hand the client
     // an approved status whose grant can only ever return `grant-expired`.
-    let updated = sqlx::query(
+    // `RETURNING secret_name` is the request's OWN name, read inside the
+    // transaction that resolves it: the operator may have approved against a
+    // different stored secret (UI substitution), and the audit row below has to
+    // record which name was asked for versus which one was actually released.
+    let requested_name: Option<String> = sqlx::query_scalar(
         "UPDATE access_requests \
          SET state = 'approved', resolved_by = $2, resolved_at = now() \
-         WHERE id = $1 AND state = 'pending' AND now() < expires_at AND now() < $3",
+         WHERE id = $1 AND state = 'pending' AND now() < expires_at AND now() < $3 \
+         RETURNING secret_name",
     )
     .bind(request_id)
     .bind(resolved_by)
     .bind(grant.not_after)
-    .execute(&mut *tx)
+    .fetch_optional(&mut *tx)
     .await?;
-    if updated.rows_affected() != 1 {
+    let Some(requested_name) = requested_name else {
         return Ok(None);
-    }
+    };
 
     if let Some(s) = store {
         // Sealed here, not by the caller: the KEK shared lock is already held,
@@ -161,6 +166,11 @@ pub async fn approve_request(
             client_name: Some(grant.client_name.clone()),
             secret_name: Some(grant.secret_name.clone()),
             actor: Some(resolved_by.to_owned()),
+            // Server vocabulary only: the name the client asked for, recorded
+            // when the operator released a DIFFERENT stored secret instead.
+            // `secret_name` above is always what was actually released.
+            detail: (requested_name != grant.secret_name)
+                .then(|| serde_json::json!({ "substituted_for_requested_name": requested_name })),
             ..Default::default()
         },
     )
