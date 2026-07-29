@@ -382,21 +382,17 @@ async fn overview_page(
     headers: HeaderMap,
 ) -> UiResult<Html<String>> {
     let op = operator(&state, &headers).await?;
-    // Database clock, for the same reason requests_page uses it: a skewed
-    // process clock must not report a request as pending that the approve
-    // transition would reject as expired.
-    let now = db::db_now(&state.db).await?;
-    let pending = db::list_pending(&state.db)
-        .await?
-        .into_iter()
-        .filter(|r| r.expires_at > now)
-        .count();
+    // Counted in SQL, never listed: the rows behind the first two counts carry
+    // encrypted client context and passthrough payloads, and a page that only
+    // shows a number has no business loading either. The pending count's
+    // expiry predicate is the database clock, matching what /ui/requests
+    // filters on and what the approve transition enforces.
+    let pending = db::count_pending(&state.db).await?;
     let grants =
-        db::ui_ext::list_active_grants(&state.db, state.config.limits.replay_window_seconds)
-            .await?
-            .len();
-    let policies = db::list_policies(&state.db).await?.len();
-    let secrets = db::list_secrets(&state.db).await?.len();
+        db::ui_ext::count_active_grants(&state.db, state.config.limits.replay_window_seconds)
+            .await?;
+    let policies = db::count_policies(&state.db).await?;
+    let secrets = db::count_secrets(&state.db).await?;
 
     Ok(html_page(
         "Overview",

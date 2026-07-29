@@ -280,22 +280,36 @@ pub async fn rotate_secret_version(
 /// return `ExpiredOrRevoked` and nulls the passthrough ciphertext). Hiding
 /// such a grant from the operator would remove the revoke button during
 /// precisely the window where it still does something.
+/// What "active" means, shared by the list and the overview's count so the
+/// two can never disagree. `$1` is the replay window in seconds.
+const ACTIVE_GRANTS_PREDICATE: &str = "NOT g.revoked AND now() < g.not_after \
+     AND ((g.max_uses IS NULL OR g.use_count < g.max_uses) \
+          OR EXISTS (SELECT 1 FROM grant_reads r \
+                     WHERE r.grant_id = g.id \
+                       AND r.first_read_at > now() - make_interval(secs => $1::double precision)))";
+
 pub async fn list_active_grants(
     db: &PgPool,
     replay_window_seconds: i64,
 ) -> anyhow::Result<Vec<GrantRow>> {
-    Ok(sqlx::query_as::<_, GrantRow>(
-        "SELECT * FROM grants g \
-         WHERE NOT g.revoked AND now() < g.not_after \
-           AND ((g.max_uses IS NULL OR g.use_count < g.max_uses) \
-                OR EXISTS (SELECT 1 FROM grant_reads r \
-                           WHERE r.grant_id = g.id \
-                             AND r.first_read_at > now() - make_interval(secs => $1::double precision))) \
-         ORDER BY g.created_at DESC",
-    )
-    .bind(replay_window_seconds as f64)
-    .fetch_all(db)
-    .await?)
+    let sql = format!(
+        "SELECT * FROM grants g WHERE {ACTIVE_GRANTS_PREDICATE} ORDER BY g.created_at DESC"
+    );
+    Ok(sqlx::query_as::<_, GrantRow>(&sql)
+        .bind(replay_window_seconds as f64)
+        .fetch_all(db)
+        .await?)
+}
+
+/// Active grants — the count only, for the overview page. Same reasoning as
+/// [`crate::db::count_pending`]: `GrantRow` can carry a passthrough payload,
+/// which a count has no business loading.
+pub async fn count_active_grants(db: &PgPool, replay_window_seconds: i64) -> anyhow::Result<i64> {
+    let sql = format!("SELECT count(*) FROM grants g WHERE {ACTIVE_GRANTS_PREDICATE}");
+    Ok(sqlx::query_scalar(&sql)
+        .bind(replay_window_seconds as f64)
+        .fetch_one(db)
+        .await?)
 }
 
 /// Push dedup (addendum #10): true when another pending request with the same

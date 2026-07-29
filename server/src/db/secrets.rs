@@ -138,6 +138,13 @@ pub async fn list_secrets(db: &PgPool) -> anyhow::Result<Vec<SecretRow>> {
     )
 }
 
+/// Stored secrets — the count only, for the overview page.
+pub async fn count_secrets(db: &PgPool) -> anyhow::Result<i64> {
+    Ok(sqlx::query_scalar("SELECT count(*) FROM secrets")
+        .fetch_one(db)
+        .await?)
+}
+
 /// Replace the tag set for a secret.
 pub async fn set_secret_tags(db: &PgPool, secret_id: Uuid, tags: &[String]) -> anyhow::Result<()> {
     let mut tx = db.begin().await?;

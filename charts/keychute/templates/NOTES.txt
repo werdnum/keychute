@@ -47,5 +47,6 @@ Internal clients should use:
   https://{{ include "keychute.serviceFQDN" . }}
 verifying against the internal CA bundle{{ if .Values.backendTLSPolicy.enabled }} (ConfigMap {{ .Values.backendTLSPolicy.caBundleConfigMap }}){{ end }}.
 {{- if .Values.ingress.enabled }}
-Humans approve at https://{{ .Values.ingress.host }}/ui/requests.
+Humans start at https://{{ .Values.ingress.host }}/ (overview; approvals are
+one click away at /ui/requests).
 {{- end }}

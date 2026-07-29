@@ -136,6 +136,22 @@ pub async fn count_pending_for_client(db: &PgPool, client_name: &str) -> anyhow:
     .await?)
 }
 
+/// Pending, not-yet-expired requests — the count only, for the overview page.
+///
+/// Counting in SQL rather than `list_pending().len()` keeps a page view off
+/// the encrypted client contexts entirely: `AccessRequestRow` carries
+/// `context_ciphertext`, so the list form would transfer and allocate every
+/// stored context just to produce one integer. The `expires_at > now()`
+/// predicate is the database clock, matching what `/ui/requests` filters on
+/// and what the approve transition enforces.
+pub async fn count_pending(db: &PgPool) -> anyhow::Result<i64> {
+    Ok(sqlx::query_scalar(
+        "SELECT count(*) FROM access_requests WHERE state = 'pending' AND expires_at > now()",
+    )
+    .fetch_one(db)
+    .await?)
+}
+
 pub async fn get_request(db: &PgPool, id: Uuid) -> anyhow::Result<Option<AccessRequestRow>> {
     Ok(
         sqlx::query_as::<_, AccessRequestRow>("SELECT * FROM access_requests WHERE id = $1")
