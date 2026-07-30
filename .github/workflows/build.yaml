@@ -218,3 +218,44 @@ jobs:
             git push
             echo "Updated chart with new image digest"
           fi
+
+      # werdnum/kube-config bakes the keychute *client* CLI into its k8s-agent
+      # image by copying it out of the image we just pushed. Poke that build so
+      # the agent picks up a new CLI right away; without this it only refreshes
+      # on kube-config's daily scheduled rebuild.
+      #
+      # repository_dispatch (not workflow_dispatch) on purpose: it needs only
+      # contents: write on the target repo, which the image-updater App already
+      # has, whereas workflow_dispatch would require actions: write.
+      - name: Generate kube-config dispatch token
+        if: needs.prepare.outputs.should-push == 'true'
+        id: dispatch-token
+        continue-on-error: true
+        uses: actions/create-github-app-token@29824e69f54612133e76f7eaac726eef6c875baf # v2
+        with:
+          app-id: ${{ secrets.IMAGE_UPDATER_APP_ID }}
+          private-key: ${{ secrets.IMAGE_UPDATER_PRIVATE_KEY }}
+          owner: werdnum
+          repositories: kube-config
+
+      - name: Trigger k8s-agent rebuild
+        # Best-effort: a failure here means a downstream image lags by up to a
+        # day, which is not a reason to fail a build that already published a
+        # good image.
+        if: needs.prepare.outputs.should-push == 'true' && steps.dispatch-token.outputs.token != ''
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.dispatch-token.outputs.token }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          SERVER_URL: ${{ github.server_url }}
+          REPOSITORY: ${{ github.repository }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          gh api --method POST /repos/werdnum/kube-config/dispatches \
+            -f event_type=dependency-updated \
+            -f "client_payload[source]=keychute" \
+            -f "client_payload[image_digest]=${IMAGE_DIGEST}" \
+            -f "client_payload[source_commit]=${SERVER_URL}/${REPOSITORY}/commit/${COMMIT_SHA}"
+          echo "Requested k8s-agent rebuild in werdnum/kube-config"
