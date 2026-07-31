@@ -81,6 +81,9 @@ const MAX_TTL_SECONDS: u64 = 30 * 24 * 3600;
 const MAX_SERVER_USES: u32 = i32::MAX as u32;
 const MAX_SECRET_NAME_BYTES: usize = 256;
 const MAX_REASON_BYTES: usize = 4 * 1024;
+/// The cap the server applies to each constraint list — origins, methods and
+/// path prefixes alike.
+const MAX_CONSTRAINT_ENTRIES: usize = 32;
 
 /// Overrides [`DEFAULT_MAX_BODY_BYTES`], for a deployment whose
 /// `limits.proxy_max_body_bytes` is not the default.
@@ -775,7 +778,11 @@ fn validate_grant_options(args: &CurlArgs, target: &Target) -> CliResult<()> {
             format!("--max-uses must be at most {MAX_SERVER_USES} (0 means no cap)"),
         ));
     }
-    if let Some(name) = &args.secret {
+    // Only when the name is going to be USED. `--grant-id` reuses a grant that
+    // already names the credential, and `credential_selector` says so plainly;
+    // rejecting the call over the length of an argument just reported to have
+    // no effect would contradict that message for no gain.
+    if let Some(name) = args.secret.as_ref().filter(|_| args.grant_id.is_none()) {
         if name.is_empty() || name.len() > MAX_SECRET_NAME_BYTES {
             return Err(fail(
                 EXIT_CONFIG,
@@ -816,10 +823,54 @@ fn validate_grant_options(args: &CurlArgs, target: &Target) -> CliResult<()> {
                     ),
                 ));
             }
+            // A target that IS a directory has a perfectly good parent, so the
+            // check above passes it — and `File::create` then fails on it just
+            // as surely as on a missing parent. Same cost either way: an
+            // approval spent on a call whose response could never be written.
+            if path.is_dir() {
+                return Err(fail(
+                    EXIT_CONFIG,
+                    format!(
+                        "cannot write --output {}: it is a directory",
+                        path.display()
+                    ),
+                ));
+            }
         }
     }
+    // Each list the server bounds. Methods are counted the way
+    // `constraints_for` builds them — normalized and deduplicated — but
+    // WITHOUT the call's own method, which is not known until the body has
+    // been read (a body means POST, its absence GET). That leaves the true
+    // count at `distinct` or `distinct + 1`, so only `distinct` past the cap
+    // is a certain rejection; a set that lands exactly on the cap is left to
+    // the server, which alone knows whether the method was already in it.
+    let mut distinct: Vec<String> = Vec::new();
     for m in &args.allow_methods {
-        normalize_method(m).map_err(|e| fail(EXIT_CONFIG, e))?;
+        let m = normalize_method(m).map_err(|e| fail(EXIT_CONFIG, e))?;
+        if !distinct.contains(&m) {
+            distinct.push(m);
+        }
+    }
+    if distinct.len() > MAX_CONSTRAINT_ENTRIES {
+        return Err(fail(
+            EXIT_CONFIG,
+            format!(
+                "too many distinct --allow-method values ({}; the server accepts at most \
+                 {MAX_CONSTRAINT_ENTRIES} per constraint list, including the call's own method)",
+                distinct.len()
+            ),
+        ));
+    }
+    if args.path_prefixes.len() > MAX_CONSTRAINT_ENTRIES {
+        return Err(fail(
+            EXIT_CONFIG,
+            format!(
+                "too many --path-prefix values ({}; the server accepts at most \
+                 {MAX_CONSTRAINT_ENTRIES} per constraint list)",
+                args.path_prefixes.len()
+            ),
+        ));
     }
     // Reuses the real rule so the two cannot drift; the method is irrelevant
     // to every check it performs on the prefixes.
@@ -1777,6 +1828,72 @@ mod tests {
         assert!(validate_grant_options(&args, &target).is_err());
 
         args.ttl = MAX_TTL_SECONDS;
+        assert!(validate_grant_options(&args, &target).is_ok());
+    }
+
+    #[test]
+    fn a_constraint_list_past_the_servers_cap_is_refused_before_the_body_is_read() {
+        let target = parse_target("https://api.example.com/v1/things").unwrap();
+        let mut args = body_args(None, None, None);
+        args.url = "https://api.example.com/v1/things".into();
+        args.secret = Some("s".into());
+
+        args.path_prefixes = vec!["/".into(); MAX_CONSTRAINT_ENTRIES + 1];
+        let err = validate_grant_options(&args, &target).unwrap_err();
+        assert_eq!(err.code, EXIT_CONFIG);
+        assert!(err.message.contains("--path-prefix"), "{}", err.message);
+
+        args.path_prefixes = vec!["/".into(); MAX_CONSTRAINT_ENTRIES];
+        assert!(validate_grant_options(&args, &target).is_ok());
+
+        // Methods are deduplicated first, so repetition alone is not a
+        // rejection however often it is spelled.
+        args.allow_methods = vec!["get".into(); MAX_CONSTRAINT_ENTRIES + 1];
+        assert!(validate_grant_options(&args, &target).is_ok());
+
+        args.allow_methods = (0..=MAX_CONSTRAINT_ENTRIES)
+            .map(|i| format!("M{i}"))
+            .collect();
+        let err = validate_grant_options(&args, &target).unwrap_err();
+        assert_eq!(err.code, EXIT_CONFIG);
+        assert!(err.message.contains("--allow-method"), "{}", err.message);
+    }
+
+    #[test]
+    fn a_secret_name_is_only_judged_when_the_grant_would_use_it() {
+        let target = parse_target("https://api.example.com/v1/things").unwrap();
+        let mut args = body_args(None, None, None);
+        args.url = "https://api.example.com/v1/things".into();
+        args.secret = Some(String::new());
+
+        let err = validate_grant_options(&args, &target).unwrap_err();
+        assert_eq!(err.code, EXIT_CONFIG);
+        assert!(err.message.contains("--secret"), "{}", err.message);
+
+        // With `--grant-id` the name is ignored, and saying so then rejecting
+        // the call over it would be the same argument answered two ways.
+        args.grant_id = Some(Uuid::nil().to_string());
+        assert!(validate_grant_options(&args, &target).is_ok());
+        args.secret = Some("x".repeat(MAX_SECRET_NAME_BYTES + 1));
+        assert!(validate_grant_options(&args, &target).is_ok());
+    }
+
+    #[test]
+    fn a_directory_output_target_is_refused_before_the_body_is_read() {
+        let target = parse_target("https://api.example.com/v1/things").unwrap();
+        let mut args = body_args(None, None, None);
+        args.url = "https://api.example.com/v1/things".into();
+        args.secret = Some("s".into());
+
+        let dir = std::env::temp_dir();
+        args.output = Some(dir.clone());
+        let err = validate_grant_options(&args, &target).unwrap_err();
+        assert_eq!(err.code, EXIT_CONFIG);
+        assert!(err.message.contains("is a directory"), "{}", err.message);
+
+        // A file that does not exist yet inside that same directory is the
+        // ordinary case and stays acceptable.
+        args.output = Some(dir.join("keychute-nonexistent-output"));
         assert!(validate_grant_options(&args, &target).is_ok());
     }
 
