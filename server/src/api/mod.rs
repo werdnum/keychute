@@ -68,6 +68,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/access-requests/{id}", get(requests::status))
         .route("/v1/access-requests/{id}/wait", get(requests::wait))
         .route("/v1/secrets", post(secrets::store))
+        .route("/v1/grants/{id}", get(grants::info))
         .route("/v1/grants/{id}/read", post(grants::read))
         .route("/v1/grants/{id}/proxy", any(crate::proxy::proxy_root))
         .route(

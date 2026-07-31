@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use keychute_types::{
-    Constraints, CreateAccessRequest, Mechanism, Origin, RequestContext, RequestState,
+    Constraints, CreateAccessRequest, GrantInfo, Mechanism, Origin, RequestContext, RequestState,
 };
 use uuid::Uuid;
 
@@ -34,11 +34,38 @@ use crate::{
     EXIT_DENIED, EXIT_OTHER,
 };
 
-/// Largest request body this command will send. Matches the server's own
-/// default `limits.proxy_max_body_bytes`, so an oversize body fails locally
-/// instead of after a wasted upload — and, more importantly, before an
-/// approval is spent on a call that can only 413.
-const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+/// Default bound on how much of a `@file` / `@-` body this command will read
+/// into memory. Not an attempt to predict the server's answer: the real cap is
+/// `limits.proxy_max_body_bytes`, which is per-deployment and not discoverable
+/// from here, so the server stays the authority and a body under this bound is
+/// still free to come back 413.
+///
+/// What this bound is actually for is the read itself — a mistaken
+/// `-d @/dev/zero`, or a producer upstream in the pipe that never stops, must
+/// not be slurped into memory before anyone checks its size. The default
+/// matches the server's own default so the common deployment agrees with it;
+/// [`MAX_BODY_ENV`] moves it for a deployment that configured something else.
+const DEFAULT_MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+
+/// Overrides [`DEFAULT_MAX_BODY_BYTES`], for a deployment whose
+/// `limits.proxy_max_body_bytes` is not the default.
+const MAX_BODY_ENV: &str = "KEYCHUTE_MAX_BODY_BYTES";
+
+/// The effective local read bound. An unparseable or zero value is a config
+/// error rather than a silent fallback: quietly using a different bound than
+/// the one asked for is how a body gets truncated without anyone noticing.
+fn max_body_bytes() -> CliResult<usize> {
+    match std::env::var(MAX_BODY_ENV) {
+        Err(_) => Ok(DEFAULT_MAX_BODY_BYTES),
+        Ok(raw) => match raw.trim().parse::<usize>() {
+            Ok(n) if n > 0 => Ok(n),
+            _ => Err(fail(
+                EXIT_CONFIG,
+                format!("{MAX_BODY_ENV} must be a positive byte count, got {raw:?}"),
+            )),
+        },
+    }
+}
 
 /// Header the server stamps on its OWN error responses (never on a proxied
 /// upstream response — `proxy.rs` strips it from upstream headers precisely so
@@ -297,6 +324,14 @@ pub(crate) fn constraints_for(
 /// Read the request body. `@path` is a file, `@-` is stdin, anything else is
 /// the literal argument (curl's rules); `--data-raw` skips the `@` reading.
 fn read_body(data: Option<&str>, data_raw: Option<&str>) -> CliResult<Option<Vec<u8>>> {
+    read_body_bounded(data, data_raw, max_body_bytes()?)
+}
+
+fn read_body_bounded(
+    data: Option<&str>,
+    data_raw: Option<&str>,
+    limit: usize,
+) -> CliResult<Option<Vec<u8>>> {
     if let Some(raw) = data_raw {
         return Ok(Some(raw.as_bytes().to_vec()));
     }
@@ -308,26 +343,27 @@ fn read_body(data: Option<&str>, data_raw: Option<&str>) -> CliResult<Option<Vec
     };
     let mut buf = Vec::new();
     if source == "-" {
-        read_bounded(std::io::stdin().lock(), &mut buf)
+        read_bounded(std::io::stdin().lock(), &mut buf, limit)
             .map_err(|e| fail(EXIT_CONFIG, format!("cannot read the body from stdin: {e}")))?;
     } else {
         let file = std::fs::File::open(source)
             .map_err(|e| fail(EXIT_CONFIG, format!("cannot read body file {source}: {e}")))?;
-        read_bounded(file, &mut buf)
+        read_bounded(file, &mut buf, limit)
             .map_err(|e| fail(EXIT_CONFIG, format!("cannot read body file {source}: {e}")))?;
     }
     Ok(Some(buf))
 }
 
-/// Read at most [`MAX_BODY_BYTES`], then stop: an unbounded read of a stuck
-/// producer or a `@/dev/zero` slip would eat memory to no purpose, since the
-/// server refuses anything over its own cap anyway.
-fn read_bounded(source: impl Read, buf: &mut Vec<u8>) -> std::io::Result<()> {
-    source.take(MAX_BODY_BYTES as u64 + 1).read_to_end(buf)?;
-    if buf.len() > MAX_BODY_BYTES {
+/// Read at most `limit` bytes, then stop: an unbounded read of a stuck producer
+/// or a `@/dev/zero` slip would eat memory to no purpose. The message names the
+/// override, because the bound is ours and the deployment's real cap may differ.
+fn read_bounded(source: impl Read, buf: &mut Vec<u8>, limit: usize) -> std::io::Result<()> {
+    source.take(limit as u64 + 1).read_to_end(buf)?;
+    if buf.len() > limit {
         buf.clear();
         return Err(std::io::Error::other(format!(
-            "request body exceeds {MAX_BODY_BYTES} bytes (the server's proxy limit)"
+            "request body exceeds the local {limit}-byte read bound \
+             (raise it with {MAX_BODY_ENV} if this deployment allows more)"
         )));
     }
     Ok(())
@@ -393,8 +429,11 @@ pub(crate) async fn run_curl(
                      the credential the server will attach"
                 );
             }
-            g.parse::<Uuid>()
-                .map_err(|_| fail(EXIT_CONFIG, format!("invalid grant id {g:?}")))?
+            let id = g
+                .parse::<Uuid>()
+                .map_err(|_| fail(EXIT_CONFIG, format!("invalid grant id {g:?}")))?;
+            check_grant_covers(cfg, http, id, &target, &method).await?;
+            id
         }
         None => {
             let secret_name = args.secret.clone().ok_or_else(|| {
@@ -408,6 +447,155 @@ pub(crate) async fn run_curl(
     };
 
     proxy_call(cfg, http, &args, &target, &method, headers, body, grant_id).await
+}
+
+/// Fetch a grant's metadata (never any credential material).
+async fn fetch_grant(cfg: &Config, http: &reqwest::Client, grant_id: Uuid) -> CliResult<GrantInfo> {
+    let resp = http
+        .get(format!("{}/v1/grants/{}", cfg.url, grant_id))
+        .bearer_auth(cfg.bearer()?)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|e| fail(EXIT_OTHER, format!("grant lookup failed: {e}")))?;
+    let status = resp.status();
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| fail(EXIT_OTHER, format!("failed reading grant lookup: {e}")))?;
+    if !status.is_success() {
+        let code = match status.as_u16() {
+            401 => EXIT_CONFIG,
+            // 404 covers "no such grant" AND "someone else's grant" — the
+            // server does not distinguish, and neither should the message.
+            403 | 404 => EXIT_CONFIG,
+            _ => EXIT_OTHER,
+        };
+        return Err(fail(
+            code,
+            format!(
+                "grant {grant_id} lookup failed: {}",
+                api_error_message(status, &text)
+            ),
+        ));
+    }
+    serde_json::from_str(&text)
+        .map_err(|e| fail(EXIT_OTHER, format!("unexpected grant lookup response: {e}")))
+}
+
+/// Refuse to exercise a reused grant that does not cover this call.
+///
+/// The origin check is the load-bearing one. The proxy takes the upstream
+/// origin from the GRANT, never from the URL passed here — so without this, a
+/// `--grant-id` pointing at a grant for `api.example.com` combined with a URL
+/// naming `other.example` would deliver the request to `api.example.com` while
+/// every diagnostic printed `other.example`. For a POST or DELETE that is a
+/// side effect landing on the wrong service, invisibly. Local refusal is the
+/// only place this can be caught: server-side, the call is perfectly valid.
+///
+/// Method and path are checked too — the server would refuse them with a 403,
+/// but finding out before the request leaves is strictly better, and the
+/// message can say which constraint failed instead of "not allowed by grant".
+async fn check_grant_covers(
+    cfg: &Config,
+    http: &reqwest::Client,
+    grant_id: Uuid,
+    target: &Target,
+    method: &str,
+) -> CliResult<()> {
+    let info = fetch_grant(cfg, http, grant_id).await?;
+    if info.mechanism != Mechanism::Brokered {
+        return Err(fail(
+            EXIT_CONFIG,
+            format!(
+                "grant {grant_id} is a {} grant, not a brokered one: it releases a secret \
+                 rather than proxying a request (see `keychute request`)",
+                info.mechanism.as_str()
+            ),
+        ));
+    }
+    if info.revoked {
+        return Err(fail(
+            crate::EXIT_TIMEOUT,
+            format!("grant {grant_id} has been revoked; request a new one"),
+        ));
+    }
+    match info.constraints.origins.as_slice() {
+        [approved] if approved.same_target(&target.origin) => {}
+        [approved] => {
+            return Err(fail(
+                EXIT_CONFIG,
+                format!(
+                    "grant {grant_id} was approved for {}, but this URL targets {}. \
+                     The proxy sends to the APPROVED origin regardless of the URL, so this \
+                     would have gone to {} — request a new grant for {}",
+                    approved.to_display(),
+                    target.origin.to_display(),
+                    approved.to_display(),
+                    target.origin.to_display(),
+                ),
+            ))
+        }
+        _ => {
+            return Err(fail(
+                EXIT_OTHER,
+                format!("grant {grant_id} does not name exactly one origin"),
+            ))
+        }
+    }
+    if !info.constraints.methods.is_empty()
+        && !info
+            .constraints
+            .methods
+            .iter()
+            .any(|m| m.eq_ignore_ascii_case(method))
+    {
+        return Err(fail(
+            EXIT_CONFIG,
+            format!(
+                "grant {grant_id} covers {} but this call is {method}",
+                info.constraints.methods.join(", ")
+            ),
+        ));
+    }
+    if !info.constraints.path_prefixes.is_empty()
+        && !info
+            .constraints
+            .path_prefixes
+            .iter()
+            .any(|p| path_covered(p, &target.path))
+    {
+        return Err(fail(
+            EXIT_CONFIG,
+            format!(
+                "grant {grant_id} covers {} but this call is for {}",
+                info.constraints.path_prefixes.join(", "),
+                target.path
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Prefix match at `/` segment boundaries, mirroring the server's rule:
+/// `/v1/account` covers `/v1/account` and `/v1/account/…`, never
+/// `/v1/account-delete`.
+///
+/// A local approximation on the RAW path, deliberately advisory: the server
+/// canonicalizes before matching, so a percent-encoded path may match there
+/// and not here. Being conservative is the right way round — a false "not
+/// covered" costs a clear local error, while a false "covered" just defers to
+/// the server's own 403.
+pub(crate) fn path_covered(prefix: &str, path: &str) -> bool {
+    let prefix = prefix.trim_end_matches('/');
+    if prefix.is_empty() {
+        return true;
+    }
+    match path.strip_prefix(prefix) {
+        Some("") => true,
+        Some(rest) => rest.starts_with('/'),
+        None => false,
+    }
 }
 
 /// Ask for — and wait on — a grant that permits exactly this call.
@@ -492,14 +680,46 @@ async fn acquire_grant(
             "server reported approval but returned no grant id",
         )
     })?;
+    // Whether the grant can serve a SECOND call is a property of what was
+    // granted, not of what was asked for: the approval form lets the operator
+    // narrow `max_uses` and `ttl_seconds`, so a request for 5 uses may well
+    // have been approved for 1 — and promising reuse then would send the
+    // caller after a grant the very next line exhausts. Ask the server.
+    //
+    // Best-effort: this hint is a convenience, and failing to print it must
+    // not fail a call that is otherwise ready to go.
     if args.max_uses != 1 {
-        // Only worth saying when the grant can actually serve another call;
-        // the default single-use grant is spent by the request below.
-        eprintln!(
-            "keychute: grant {grant_id} approved for {}s — reuse it with `--grant-id {grant_id}` \
-             (no second approval)",
-            args.ttl
-        );
+        match fetch_grant(cfg, http, grant_id).await {
+            Ok(info) => {
+                let remaining = info
+                    .max_uses
+                    .map(|max| max.saturating_sub(info.use_count))
+                    // No cap: bounded by the TTL alone.
+                    .unwrap_or(u32::MAX);
+                // This call spends one of them.
+                if remaining > 1 {
+                    let budget = match info.max_uses {
+                        Some(_) => format!("{} more call(s)", remaining - 1),
+                        None => "further calls".to_string(),
+                    };
+                    eprintln!(
+                        "keychute: grant {grant_id} approved until {} — good for {budget}; \
+                         reuse it with `--grant-id {grant_id}` (no second approval)",
+                        info.not_after.to_rfc3339()
+                    );
+                } else {
+                    eprintln!(
+                        "keychute: grant {grant_id} was approved for a single use \
+                         (narrowed from the {} requested); this call spends it",
+                        args.max_uses
+                    );
+                }
+            }
+            Err(e) => eprintln!(
+                "keychute: could not read back the granted limits: {}",
+                e.message
+            ),
+        }
     }
     Ok(grant_id)
 }
@@ -520,6 +740,21 @@ async fn proxy_call(
     body: Option<Vec<u8>>,
     grant_id: Uuid,
 ) -> CliResult<()> {
+    // Open the destination BEFORE anything leaves: a request that has already
+    // been delivered cannot be un-delivered, and reporting only "cannot open
+    // /nope/out.json" after a POST has committed upstream invites a retry that
+    // repeats the side effect. Truncating a file we then fail to fill is the
+    // lesser harm, and is what curl does too.
+    let mut sink: Box<dyn Write> = match &args.output {
+        Some(path) => Box::new(std::fs::File::create(path).map_err(|e| {
+            fail(
+                EXIT_CONFIG,
+                format!("cannot open --output {}: {e}", path.display()),
+            )
+        })?),
+        None => Box::new(std::io::stdout().lock()),
+    };
+
     // The path goes on RAW: the server canonicalizes it and rejects ambiguous
     // encodings, which only works if the encoding survives the trip.
     let mut url = format!("{}/v1/grants/{}/proxy{}", cfg.url, grant_id, target.path);
@@ -577,15 +812,6 @@ async fn proxy_call(
         );
     }
 
-    let mut sink: Box<dyn Write> = match &args.output {
-        Some(path) => Box::new(std::fs::File::create(path).map_err(|e| {
-            fail(
-                EXIT_CONFIG,
-                format!("cannot open --output {}: {e}", path.display()),
-            )
-        })?),
-        None => Box::new(std::io::stdout().lock()),
-    };
     if args.include {
         let mut head = format!("HTTP/1.1 {status}\r\n");
         for (name, value) in resp.headers() {
@@ -757,11 +983,47 @@ mod tests {
     #[test]
     fn oversize_body_fails_locally() {
         let mut buf = Vec::new();
-        assert!(read_bounded(std::io::repeat(b'x'), &mut buf).is_err());
+        assert!(read_bounded(std::io::repeat(b'x'), &mut buf, 1024).is_err());
         assert!(buf.is_empty());
         let mut buf = Vec::new();
-        read_bounded(vec![b'x'; 1024].as_slice(), &mut buf).unwrap();
+        read_bounded(vec![b'x'; 1024].as_slice(), &mut buf, 1024).unwrap();
         assert_eq!(buf.len(), 1024);
+    }
+
+    #[test]
+    fn the_read_bound_is_configurable_and_validated() {
+        // A body under an explicit bound reads fine...
+        assert_eq!(
+            read_body_bounded(Some("hello"), None, 4).unwrap().unwrap(),
+            b"hello",
+            "an inline body is not read through the bounded reader"
+        );
+        let path = std::env::temp_dir().join(format!("keychute-bound-{}", Uuid::new_v4()));
+        std::fs::write(&path, b"0123456789").unwrap();
+        let arg = format!("@{}", path.display());
+        assert_eq!(
+            read_body_bounded(Some(&arg), None, 10).unwrap().unwrap(),
+            b"0123456789"
+        );
+        // ...and over it fails with a message naming the override, since the
+        // bound is ours and the deployment's real cap may be higher.
+        let err = read_body_bounded(Some(&arg), None, 9).unwrap_err();
+        assert!(err.message.contains(MAX_BODY_ENV), "{}", err.message);
+        assert_eq!(err.code, EXIT_CONFIG);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn path_coverage_matches_at_segment_boundaries() {
+        assert!(path_covered("/v1/account", "/v1/account"));
+        assert!(path_covered("/v1/account", "/v1/account/settings"));
+        // The trap the server's own rule exists to close.
+        assert!(!path_covered("/v1/account", "/v1/account-delete"));
+        assert!(!path_covered("/v1/account", "/v1/other"));
+        // A trailing slash on the prefix means the same prefix.
+        assert!(path_covered("/v1/account/", "/v1/account/x"));
+        // Root covers everything.
+        assert!(path_covered("/", "/anything"));
     }
 
     fn err_body(code: &str) -> String {

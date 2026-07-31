@@ -232,6 +232,17 @@ Client authn: `Authorization: Bearer <api-token>` or
   `client:<name>`, plus a best-effort FYI push. Not idempotent by design — a
   blind retry conflicts rather than silently rotating — so the CLI does not
   retry it.
+- `GET /v1/grants/{id}` — non-secret grant metadata for the OWNING client
+  (another client's grant is 404, like every grant route): mechanism,
+  constraints AS GRANTED, `not_after`, `max_uses`, `use_count`, `revoked`. No
+  credential material and no secret name. Read-only: it neither revalidates nor
+  touches use accounting, and it reports revoked/expired grants rather than
+  hiding them. Exists because the proxy takes the upstream origin from the
+  GRANT, never from the caller's request URL — a client resuming a grant later
+  cannot otherwise tell that its request is about to be delivered somewhere
+  other than the URL it holds — and because approval may narrow
+  `ttl_seconds`/`max_uses`, so the requested constraints are not a safe
+  stand-in for the granted ones.
 - `ANY /v1/grants/{id}/proxy/{path...}` — brokered. Query string passthrough.
   The target origin comes from the grant (single-origin grants in v1: a brokered
   request must name exactly one origin). Method+path validated against grant.

@@ -1,4 +1,5 @@
-//! Grant read endpoint: single logical release with idempotent replay.
+//! Grant endpoints: metadata lookup, and the single logical release with
+//! idempotent replay.
 
 use crate::api::error::ApiFailure;
 use crate::api::{owned_grant, revalidate_grant};
@@ -13,9 +14,54 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use base64::Engine;
-use keychute_types::{Mechanism, ReadGrantRequest, ReadGrantResponse, SecretEncoding};
+use keychute_types::{
+    Constraints, GrantInfo, Mechanism, ReadGrantRequest, ReadGrantResponse, SecretEncoding,
+};
 use secrecy::ExposeSecret;
 use uuid::Uuid;
+
+/// `GET /v1/grants/{id}` — non-secret metadata about a grant the caller owns.
+///
+/// Exists because a client that comes back to a grant later cannot otherwise
+/// see what it actually holds. Two things make that a correctness problem, not
+/// a convenience one:
+///
+/// * The proxy takes the upstream origin from the GRANT, never from the
+///   caller's request URL. A caller that reuses a grant against a different
+///   origin gets its request delivered to the approved one — silently, with
+///   whatever side effect it carries. Only the grant can settle where a call
+///   is really going.
+/// * Approval may NARROW `ttl_seconds`/`max_uses`, so what the client asked
+///   for is not what it got.
+///
+/// Read-only and owner-scoped (a grant belonging to another client is 404, like
+/// every other grant route). Deliberately does NOT revalidate or touch use
+/// accounting: it reports the row, including a revoked or expired one, because
+/// "this grant is dead" is precisely what a caller needs to learn here rather
+/// than at the moment it applies a side effect.
+pub async fn info(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<GrantInfo>, ApiFailure> {
+    let client = authenticate_client(&state, &headers).await?;
+    let grant = owned_grant(&state, &client, id).await?;
+    let mechanism = Mechanism::from_str_opt(&grant.mechanism)
+        .ok_or_else(|| ApiFailure::Internal(anyhow::anyhow!("unknown grant mechanism")))?;
+    let constraints: Constraints = serde_json::from_value(grant.constraints.clone())
+        .map_err(|e| ApiFailure::Internal(e.into()))?;
+    Ok(Json(GrantInfo {
+        grant_id: grant.id,
+        mechanism,
+        constraints,
+        not_after: grant.not_after,
+        // The column is i32 and never negative in practice; clamp rather than
+        // surface a negative use budget if it ever were.
+        max_uses: grant.max_uses.map(|v| v.max(0) as u32),
+        use_count: grant.use_count.max(0) as u32,
+        revoked: grant.revoked,
+    }))
+}
 
 /// Decrypt a grant's passthrough payload. Any failure — including a nulled
 /// payload or a process restart under the ephemeral KEK — is `payload-lost`.

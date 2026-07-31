@@ -304,6 +304,31 @@ pub struct AccessRequestStatus {
     pub expires_at: DateTime<Utc>,
 }
 
+/// Non-secret metadata about a grant the calling client owns
+/// (`GET /v1/grants/{id}`).
+///
+/// Nothing here is credential material: it is the client's own request as the
+/// operator approved it, which is exactly the point. A client that resumes a
+/// grant later (a CLI `--grant-id`, a queued job) otherwise has no way to check
+/// that the grant still covers what it is about to do — and the proxy takes the
+/// upstream ORIGIN from the grant, not from the caller's URL, so a mismatch is
+/// invisible at the call site and lands a side effect on the wrong service.
+/// The approval may also have NARROWED what was asked for, so the requested
+/// constraints are not a safe stand-in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GrantInfo {
+    pub grant_id: Uuid,
+    pub mechanism: Mechanism,
+    /// As granted, after any operator narrowing at approval time.
+    pub constraints: Constraints,
+    pub not_after: DateTime<Utc>,
+    /// None means "no cap within the TTL" (brokered only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_uses: Option<u32>,
+    pub use_count: u32,
+    pub revoked: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadGrantRequest {
     pub idempotency_key: String,

@@ -55,6 +55,8 @@ impl ProxyRecord {
 #[derive(Clone)]
 struct MockState {
     mode: ProxyMode,
+    /// Origin the mock's grant is approved for.
+    grant_host: &'static str,
     wait_calls: Arc<AtomicUsize>,
     create_bodies: Arc<Mutex<Vec<serde_json::Value>>>,
     proxied: Arc<Mutex<Vec<ProxyRecord>>>,
@@ -84,6 +86,26 @@ async fn wait_request(
         "request_id": REQUEST_ID,
         "state": "approved",
         "grant_id": GRANT_ID,
+    }))
+}
+
+/// GET /v1/grants/{id} — the metadata the CLI checks a reused grant against.
+async fn grant_info(State(st): State<MockState>, Path(id): Path<Uuid>) -> Json<serde_json::Value> {
+    assert_eq!(id.to_string(), GRANT_ID);
+    Json(serde_json::json!({
+        "grant_id": GRANT_ID,
+        "mechanism": "brokered",
+        "constraints": {
+            "origins": [{"host": st.grant_host}],
+            "methods": ["GET", "POST"],
+            "path_prefixes": ["/v1"],
+            "ttl_seconds": 300,
+            "max_uses": 5,
+        },
+        "not_after": "2099-01-01T00:00:00Z",
+        "max_uses": 5,
+        "use_count": 1,
+        "revoked": false,
     }))
 }
 
@@ -141,8 +163,13 @@ async fn proxy(State(st): State<MockState>, req: Request) -> Response {
 }
 
 async fn spawn_mock(mode: ProxyMode) -> (String, MockState) {
+    spawn_mock_for(mode, "api.example.com").await
+}
+
+async fn spawn_mock_for(mode: ProxyMode, grant_host: &'static str) -> (String, MockState) {
     let st = MockState {
         mode,
+        grant_host,
         wait_calls: Arc::new(AtomicUsize::new(0)),
         create_bodies: Arc::new(Mutex::new(Vec::new())),
         proxied: Arc::new(Mutex::new(Vec::new())),
@@ -150,6 +177,7 @@ async fn spawn_mock(mode: ProxyMode) -> (String, MockState) {
     let app = Router::new()
         .route("/v1/access-requests", post(create_request))
         .route("/v1/access-requests/{id}/wait", get(wait_request))
+        .route("/v1/grants/{id}", get(grant_info))
         .route("/v1/grants/{id}/proxy", any(proxy))
         .route("/v1/grants/{id}/proxy/{*rest}", any(proxy))
         .with_state(st.clone());
@@ -421,4 +449,89 @@ async fn a_target_without_a_secret_or_grant_is_a_usage_error() {
     assert_eq!(code, 2, "{stderr}");
     assert!(stderr.contains("--secret"), "{stderr}");
     assert!(st.create_bodies.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reusing_a_grant_against_a_different_origin_is_refused() {
+    // The proxy takes the upstream origin from the GRANT, so this call would
+    // have been delivered to api.example.com while every diagnostic said
+    // other.example. For a POST that is a side effect on the wrong service.
+    let (base, st) = spawn_mock_for(ProxyMode::Upstream, "api.example.com").await;
+    let (code, stdout, stderr) = tokio::task::spawn_blocking(move || {
+        run_cli(
+            &base,
+            &[
+                "curl",
+                "https://other.example/v1/things",
+                "-X",
+                "POST",
+                "--grant-id",
+                GRANT_ID,
+            ],
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(code, 2, "usage error: {stderr}");
+    assert!(stdout.is_empty());
+    assert!(
+        stderr.contains("api.example.com"),
+        "names the approved origin: {stderr}"
+    );
+    assert!(
+        stderr.contains("other.example"),
+        "names the requested origin: {stderr}"
+    );
+    // Nothing was sent, so nothing was done to either service.
+    assert!(st.proxied.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reusing_a_grant_that_does_not_cover_the_path_is_refused_locally() {
+    let (base, st) = spawn_mock(ProxyMode::Upstream).await;
+    let (code, _stdout, stderr) = tokio::task::spawn_blocking(move || {
+        run_cli(
+            &base,
+            &[
+                "curl",
+                // The grant covers /v1; this is a sibling that merely shares a
+                // textual prefix.
+                "https://api.example.com/v1-admin/things",
+                "--grant-id",
+                GRANT_ID,
+            ],
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(code, 2, "{stderr}");
+    assert!(st.proxied.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unwritable_output_path_fails_before_the_request_is_sent() {
+    let (base, st) = spawn_mock(ProxyMode::Upstream).await;
+    let (code, _stdout, stderr) = tokio::task::spawn_blocking(move || {
+        run_cli(
+            &base,
+            &[
+                "curl",
+                "https://api.example.com/v1/things",
+                "--grant-id",
+                GRANT_ID,
+                "-o",
+                "/nonexistent-dir/keychute-out.json",
+            ],
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(code, 2, "{stderr}");
+    assert!(stderr.contains("--output"), "{stderr}");
+    // The point of the ordering: a side-effecting call must not have committed
+    // upstream before a purely local failure is reported.
+    assert!(
+        st.proxied.lock().unwrap().is_empty(),
+        "nothing may be sent when the destination cannot be opened"
+    );
 }

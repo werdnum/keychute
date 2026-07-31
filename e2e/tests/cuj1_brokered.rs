@@ -408,3 +408,58 @@ fn base64_std(s: &str) -> String {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.encode(s)
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grant_info_is_owner_scoped_and_reports_the_granted_limits() {
+    let env = TestEnv::spawn(SpawnOpts::default()).await.unwrap();
+    let (_request_id, grant_id) = approved_brokered_grant(&env).await;
+
+    // The owner sees what it actually holds — the origin the proxy will use,
+    // and the use budget as approved.
+    let resp = env
+        .fa()
+        .get(&format!("/v1/grants/{grant_id}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let info: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(info["grant_id"], grant_id);
+    assert_eq!(info["mechanism"], "brokered");
+    assert_eq!(info["constraints"]["origins"][0]["host"], "localhost");
+    assert_eq!(
+        info["constraints"]["origins"][0]["port"],
+        env.upstream_port as u64
+    );
+    assert_eq!(info["use_count"], 0);
+    assert_eq!(info["revoked"], false);
+    // Never any credential material, and not even the secret's name.
+    assert!(info.get("secret").is_none());
+    assert!(info.get("secret_name").is_none());
+
+    // Another client gets the same answer as for a grant that does not exist.
+    let resp = env
+        .k8s()
+        .get(&format!("/v1/grants/{grant_id}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        404,
+        "a grant owned by someone else is absent"
+    );
+
+    // Reading metadata is not a use: the grant is untouched.
+    let resp = env
+        .fa()
+        .get(&format!("/v1/grants/{grant_id}"))
+        .send()
+        .await
+        .unwrap();
+    let info: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        info["use_count"], 0,
+        "metadata lookup must not consume a use"
+    );
+}
