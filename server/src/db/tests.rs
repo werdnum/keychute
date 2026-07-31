@@ -338,6 +338,12 @@ async fn begin_grant_use_single_use_semantics() -> anyhow::Result<()> {
     let Some(t) = setup().await? else {
         return Ok(());
     };
+    // A grant with no passthrough payload releases the STORED secret, so the
+    // row has to exist: `resolve_approve` refuses to mint one over a secret
+    // that is absent (or has just been deleted), which would only ever return
+    // payload-lost.
+    let secret =
+        crate::db::create_secret(&t.pool, "example-api-token", "", 2, "bearer", None).await?;
     let req = insert_access_request(&t.pool, &new_request("fa", "grant-key", b"mac"), None).await?;
     let grant_id = resolve_approve(
         &t.pool,
@@ -346,6 +352,9 @@ async fn begin_grant_use_single_use_semantics() -> anyhow::Result<()> {
         &GrantParams {
             client_name: "fa".into(),
             secret_name: "example-api-token".into(),
+            // The exact row the decision names; approval verifies it survived
+            // (see `GrantParams::secret_id`).
+            secret_id: Some(secret.id),
             mechanism: "cli-read".into(),
             constraints: serde_json::json!({ "ttl_seconds": 600, "max_uses": 1 }),
             not_after: Utc::now() + Duration::hours(1),
@@ -364,6 +373,9 @@ async fn begin_grant_use_single_use_semantics() -> anyhow::Result<()> {
         &GrantParams {
             client_name: "fa".into(),
             secret_name: "example-api-token".into(),
+            // The exact row the decision names; approval verifies it survived
+            // (see `GrantParams::secret_id`).
+            secret_id: Some(secret.id),
             mechanism: "cli-read".into(),
             constraints: serde_json::json!({}),
             not_after: Utc::now() + Duration::hours(1),
