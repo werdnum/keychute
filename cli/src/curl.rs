@@ -1971,15 +1971,26 @@ async fn proxy_call(
     let mut sink: Box<dyn Write> = match output {
         None => Box::new(std::io::stdout().lock()),
         Some(file) => {
-            file.set_len(0).map_err(|e| {
-                fail(
-                    EXIT_CONFIG,
-                    format!(
-                        "cannot write --output {}: {e}",
-                        args.output.as_ref().expect("a file means a path").display()
-                    ),
-                )
-            })?;
+            // Regular files ONLY. `ftruncate` on a character device is EINVAL,
+            // so `-o /dev/null` — which curl's own manual recommends for
+            // discarding a body — failed here, AFTER the approval was given
+            // and before the call went out, stranding it. There is also
+            // nothing to empty: a device or a pipe carries no leftover bytes
+            // from a previous run. `unwrap_or(true)` keeps the old behaviour
+            // when the kind cannot be determined, rather than silently
+            // skipping a truncation a regular file needed.
+            let regular = file.metadata().map(|m| m.is_file()).unwrap_or(true);
+            if regular {
+                file.set_len(0).map_err(|e| {
+                    fail(
+                        EXIT_CONFIG,
+                        format!(
+                            "cannot write --output {}: {e}",
+                            args.output.as_ref().expect("a file means a path").display()
+                        ),
+                    )
+                })?;
+            }
             Box::new(file)
         }
     };

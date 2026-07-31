@@ -772,6 +772,37 @@ async fn output_dash_means_stdout() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// `-o /dev/null` is curl's own documented way to discard a body. `ftruncate`
+/// on a character device is EINVAL, so emptying the destination has to be
+/// limited to regular files — otherwise the failure lands AFTER the approval
+/// and before the call goes out, stranding a grant a human just authorized.
+#[tokio::test(flavor = "multi_thread")]
+async fn output_to_a_device_is_not_truncated() {
+    let (base, st) = spawn_mock(ProxyMode::Upstream).await;
+    let (code, stdout, stderr) = tokio::task::spawn_blocking(move || {
+        run_cli(
+            &base,
+            &[
+                "curl",
+                "https://api.example.com/v1/things",
+                "--grant-id",
+                GRANT_ID,
+                "-o",
+                "/dev/null",
+            ],
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.is_empty(), "the body went to the device, not stdout");
+    assert_eq!(
+        st.proxied.lock().unwrap().len(),
+        1,
+        "the call must actually be made: {stderr}"
+    );
+}
+
 /// `-H 'User-Agent:'` is curl's spelling for *remove the header*. It is the one
 /// removal with something to remove: this CLI sets a default `User-Agent`, and
 /// the broker forwards `User-Agent` upstream unchanged. Removing it therefore
