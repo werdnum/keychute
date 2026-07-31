@@ -863,14 +863,23 @@ async fn proxy_call(
     // /nope/out.json" after a POST has committed upstream invites a retry that
     // repeats the side effect. Truncating a file we then fail to fill is the
     // lesser harm, and is what curl does too.
-    let mut sink: Box<dyn Write> = match &args.output {
-        Some(path) => Box::new(std::fs::File::create(path).map_err(|e| {
+    // `-o -` is curl's spelling for stdout. Treating it as a filename would
+    // create a file literally called `-` and leave stdout empty, on a call
+    // that succeeded — the output silently going somewhere nobody looks.
+    let to_stdout = match &args.output {
+        None => true,
+        Some(path) => path.as_os_str() == "-",
+    };
+    let mut sink: Box<dyn Write> = if to_stdout {
+        Box::new(std::io::stdout().lock())
+    } else {
+        let path = args.output.as_ref().expect("checked above");
+        Box::new(std::fs::File::create(path).map_err(|e| {
             fail(
                 EXIT_CONFIG,
                 format!("cannot open --output {}: {e}", path.display()),
             )
-        })?),
-        None => Box::new(std::io::stdout().lock()),
+        })?)
     };
 
     // The path goes on RAW: the server canonicalizes it and rejects ambiguous
@@ -952,19 +961,27 @@ async fn proxy_call(
         head.extend_from_slice(b"\r\n");
         write_all(&mut sink, &head)?;
     }
+    // Tracked so the newline below is added only when the output actually
+    // needs one — see there.
+    let mut last_byte: Option<u8> = None;
     while let Some(chunk) = resp.chunk().await.map_err(|e| {
         fail(
             EXIT_OTHER,
             format!("reading the upstream response failed: {e}"),
         )
     })? {
+        if let Some(b) = chunk.last() {
+            last_byte = Some(*b);
+        }
         write_all(&mut sink, &chunk)?;
     }
     sink.flush()
         .map_err(|e| fail(EXIT_OTHER, format!("failed flushing the response: {e}")))?;
-    if args.output.is_none() && std::io::stdout().is_terminal() {
-        // A body without a trailing newline would otherwise run into the
-        // shell prompt. Pipes get the bytes verbatim.
+    // A body that does not end in a newline would run into the shell prompt,
+    // so on a terminal one is added — but ONLY then. A body that already ends
+    // in `\n` would otherwise gain a visible blank line, and an empty body
+    // would gain a line of its own. Pipes get the bytes verbatim either way.
+    if to_stdout && std::io::stdout().is_terminal() && matches!(last_byte, Some(b) if b != b'\n') {
         let _ = std::io::stdout().lock().write_all(b"\n");
     }
     eprintln!("keychute: {} {} -> {}", method, target.display(), status);

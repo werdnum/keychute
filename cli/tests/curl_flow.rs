@@ -535,3 +535,41 @@ async fn an_unwritable_output_path_fails_before_the_request_is_sent() {
         "nothing may be sent when the destination cannot be opened"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn output_dash_means_stdout() {
+    // curl's spelling. Treating `-` as a filename would leave stdout empty on
+    // a call that succeeded, with the body in a file named `-`.
+    let (base, _st) = spawn_mock(ProxyMode::Upstream).await;
+    let dir = std::env::temp_dir().join(format!("keychute-dash-{}", Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let cwd = dir.clone();
+    let (code, stdout, stderr) = tokio::task::spawn_blocking(move || {
+        let out = Command::new(cli_bin())
+            .args([
+                "curl",
+                "https://api.example.com/v1/things",
+                "--grant-id",
+                GRANT_ID,
+                "-o",
+                "-",
+            ])
+            .current_dir(&cwd)
+            .env("KEYCHUTE_URL", &base)
+            .env("KEYCHUTE_TOKEN", "client-token")
+            .env_remove("KEYCHUTE_TOKEN_FILE")
+            .output()
+            .expect("running keychute CLI");
+        (
+            out.status.code().unwrap_or(-1),
+            out.stdout,
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stdout, UPSTREAM_BODY, "the body goes to stdout");
+    assert!(!dir.join("-").exists(), "no file named `-` may be created");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
