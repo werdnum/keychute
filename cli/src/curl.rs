@@ -118,20 +118,27 @@ pub(crate) struct CurlArgs {
     #[arg(short = 'H', long = "header", value_name = "LINE")]
     pub headers: Vec<String>,
     /// Request body. `@path` reads a file, `@-` reads stdin (curl's spelling).
-    /// Unlike curl, this does NOT imply a Content-Type: pass one with -H.
+    /// Repeatable: pieces are joined with `&`, as curl does. Unlike curl, this
+    /// does NOT imply a Content-Type: pass one with -H.
     #[arg(short = 'd', long = "data", value_name = "DATA")]
-    pub data: Option<String>,
-    /// Request body taken literally, `@` and all.
+    pub data: Vec<String>,
+    /// Request body taken literally, `@` and all. Repeatable, joined with `&`.
     #[arg(long = "data-raw", value_name = "DATA", conflicts_with = "data")]
-    pub data_raw: Option<String>,
+    pub data_raw: Vec<String>,
     /// Like -d, but file and stdin input is sent byte for byte — no CR/LF
-    /// stripping (curl's --data-binary).
+    /// stripping (curl's --data-binary). Repeatable, joined with `&`.
+    ///
+    /// Unlike curl, this may not be MIXED with -d/--data-raw in one command:
+    /// curl merges the pieces in the order they appear on the command line,
+    /// and reproducing that ordering across different flags is not something
+    /// this parser can do faithfully. A refusal is better than a body whose
+    /// fields are silently in a different order than curl would have sent.
     #[arg(
         long = "data-binary",
         value_name = "DATA",
         conflicts_with_all = ["data", "data_raw"]
     )]
-    pub data_binary: Option<String>,
+    pub data_binary: Vec<String>,
     /// Write the response body here instead of stdout.
     #[arg(short = 'o', long = "output", value_name = "FILE")]
     pub output: Option<PathBuf>,
@@ -329,13 +336,30 @@ pub(crate) fn constraints_for(
         }
         // A prefix set that excludes the call itself would spend an operator's
         // approval on a grant whose very first use is a guaranteed 403. The
-        // server checks the canonical path against these prefixes; check the
-        // same thing here, before a human is asked anything.
-        if let Some(canonical) = canonical_path(&target.path) {
-            if !path_prefixes.iter().any(|p| path_covered(p, &canonical)) {
+        // server checks the CANONICAL path against the CANONICAL prefixes it
+        // stored (`api/requests.rs` canonicalizes every submitted prefix), so
+        // both sides have to be canonicalized here too — comparing a canonical
+        // target against a still-encoded prefix would reject
+        // `--path-prefix /files/a%20b` for a URL of `/files/a%20b`, which is
+        // the same call.
+        //
+        // A prefix with no canonical form is dropped from the comparison
+        // rather than treated as non-covering: the server will reject the
+        // request itself, and guessing here could only turn a server-side
+        // answer into a wrong local one.
+        if let Some(canonical_target) = canonical_path(&target.path) {
+            let canonical_prefixes: Vec<String> = path_prefixes
+                .iter()
+                .filter_map(|p| canonical_path(p))
+                .collect();
+            if !canonical_prefixes.is_empty()
+                && !canonical_prefixes
+                    .iter()
+                    .any(|p| path_covered(p, &canonical_target))
+            {
                 return Err(format!(
-                    "--path-prefix {} does not cover {canonical}, so the approved grant \
-                     could not serve this call",
+                    "--path-prefix {} does not cover {canonical_target}, so the approved \
+                     grant could not serve this call",
                     path_prefixes.join(", ")
                 ));
             }
@@ -368,32 +392,53 @@ fn read_body(args: &CurlArgs) -> CliResult<Option<Vec<u8>>> {
 }
 
 fn read_body_bounded(args: &CurlArgs, limit: usize) -> CliResult<Option<Vec<u8>>> {
-    if let Some(raw) = args.data_raw.as_deref() {
-        return Ok(Some(raw.as_bytes().to_vec()));
-    }
-    // --data-binary keeps every byte; -d strips CR/LF from file/stdin input.
-    let (data, strip_newlines) = match (args.data.as_deref(), args.data_binary.as_deref()) {
-        (Some(d), _) => (d, true),
-        (None, Some(d)) => (d, false),
-        (None, None) => return Ok(None),
-    };
-    let Some(source) = data.strip_prefix('@') else {
-        return Ok(Some(data.as_bytes().to_vec()));
-    };
-    let mut buf = Vec::new();
-    if source == "-" {
-        read_bounded(std::io::stdin().lock(), &mut buf, limit)
-            .map_err(|e| fail(EXIT_CONFIG, format!("cannot read the body from stdin: {e}")))?;
+    // `--data-raw` takes every piece literally; the other two read `@`.
+    // Exactly one flavour can be present (clap enforces it), so there is no
+    // cross-flag ordering to get wrong.
+    let (pieces, reads_at, strip_newlines) = if !args.data_raw.is_empty() {
+        (&args.data_raw, false, false)
+    } else if !args.data.is_empty() {
+        (&args.data, true, true)
+    } else if !args.data_binary.is_empty() {
+        (&args.data_binary, true, false)
     } else {
-        let file = std::fs::File::open(source)
-            .map_err(|e| fail(EXIT_CONFIG, format!("cannot read body file {source}: {e}")))?;
-        read_bounded(file, &mut buf, limit)
-            .map_err(|e| fail(EXIT_CONFIG, format!("cannot read body file {source}: {e}")))?;
+        return Ok(None);
+    };
+
+    let mut out: Vec<u8> = Vec::new();
+    for piece in pieces {
+        if !out.is_empty() {
+            // curl's rule for repeated data options: the pieces are merged
+            // with a separating `&`, which is what makes `-d a=1 -d b=2` a
+            // form body rather than an error.
+            out.push(b'&');
+        }
+        let source = match piece.strip_prefix('@') {
+            Some(src) if reads_at => src,
+            _ => {
+                out.extend_from_slice(piece.as_bytes());
+                continue;
+            }
+        };
+        // The bound is on the WHOLE body, so each piece may only use what is
+        // left of it.
+        let remaining = limit.saturating_sub(out.len());
+        let mut buf = Vec::new();
+        if source == "-" {
+            read_bounded(std::io::stdin().lock(), &mut buf, remaining)
+                .map_err(|e| fail(EXIT_CONFIG, format!("cannot read the body from stdin: {e}")))?;
+        } else {
+            let file = std::fs::File::open(source)
+                .map_err(|e| fail(EXIT_CONFIG, format!("cannot read body file {source}: {e}")))?;
+            read_bounded(file, &mut buf, remaining)
+                .map_err(|e| fail(EXIT_CONFIG, format!("cannot read body file {source}: {e}")))?;
+        }
+        if strip_newlines {
+            buf.retain(|b| *b != b'\r' && *b != b'\n');
+        }
+        out.extend_from_slice(&buf);
     }
-    if strip_newlines {
-        buf.retain(|b| *b != b'\r' && *b != b'\n');
-    }
-    Ok(Some(buf))
+    Ok(Some(out))
 }
 
 /// Read at most `limit` bytes, then stop: an unbounded read of a stuck producer
@@ -1181,14 +1226,22 @@ mod tests {
         data_raw: Option<&str>,
         data_binary: Option<&str>,
     ) -> CurlArgs {
+        body_args_multi(
+            data.into_iter().collect(),
+            data_raw.into_iter().collect(),
+            data_binary.into_iter().collect(),
+        )
+    }
+
+    fn body_args_multi(data: Vec<&str>, data_raw: Vec<&str>, data_binary: Vec<&str>) -> CurlArgs {
         CurlArgs {
             url: "https://api.example.com/v1".into(),
             secret: None,
             method: None,
             headers: vec![],
-            data: data.map(str::to_owned),
-            data_raw: data_raw.map(str::to_owned),
-            data_binary: data_binary.map(str::to_owned),
+            data: data.iter().map(|s| (*s).to_owned()).collect(),
+            data_raw: data_raw.iter().map(|s| (*s).to_owned()).collect(),
+            data_binary: data_binary.iter().map(|s| (*s).to_owned()).collect(),
             output: None,
             include: false,
             fail: false,
@@ -1405,6 +1458,84 @@ mod tests {
     }
 
     #[test]
+    fn repeated_data_pieces_merge_with_an_ampersand() {
+        // curl's rule, and the reason `-d a=1 -d b=2` is a form body rather
+        // than a usage error.
+        assert_eq!(
+            read_body(&body_args_multi(
+                vec!["name=daniel", "skill=lousy"],
+                vec![],
+                vec![]
+            ))
+            .unwrap()
+            .unwrap(),
+            b"name=daniel&skill=lousy"
+        );
+        assert_eq!(
+            read_body(&body_args_multi(vec![], vec!["@a", "@b"], vec![]))
+                .unwrap()
+                .unwrap(),
+            b"@a&@b",
+            "--data-raw stays literal, including the @"
+        );
+        // A file piece merges with an inline one, and CR/LF still go for -d.
+        let path = std::env::temp_dir().join(format!("keychute-merge-{}", Uuid::new_v4()));
+        std::fs::write(&path, b"b=2\n").unwrap();
+        let arg = format!("@{}", path.display());
+        assert_eq!(
+            read_body(&body_args_multi(vec!["a=1", &arg], vec![], vec![]))
+                .unwrap()
+                .unwrap(),
+            b"a=1&b=2"
+        );
+        // --data-binary merges too, byte for byte.
+        assert_eq!(
+            read_body(&body_args_multi(vec![], vec![], vec!["a=1", &arg]))
+                .unwrap()
+                .unwrap(),
+            b"a=1&b=2\n"
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn repeated_data_flags_parse_and_mixing_flavours_does_not() {
+        use clap::Parser as _;
+        let cli = crate::Cli::parse_from([
+            "keychute",
+            "curl",
+            "https://api.example.com/x",
+            "--secret",
+            "s",
+            "-d",
+            "name=daniel",
+            "-d",
+            "skill=lousy",
+        ]);
+        match cli.cmd {
+            crate::Cmd::Curl(args) => {
+                assert_eq!(args.data, vec!["name=daniel", "skill=lousy"])
+            }
+            _ => panic!("expected curl subcommand"),
+        }
+        // Mixing flavours would need curl's command-line ordering, which this
+        // parser cannot reproduce faithfully — so it is refused rather than
+        // silently reordered.
+        assert!(crate::Cli::try_parse_from([
+            "keychute",
+            "curl",
+            "https://api.example.com/x",
+            "--secret",
+            "s",
+            "-d",
+            "a=1",
+            "--data-binary",
+            "b=2",
+        ])
+        .is_err());
+    }
+
+    #[test]
     fn a_path_prefix_that_excludes_the_call_is_refused() {
         let t = parse_target("https://api.example.com/admin").unwrap();
         // Approving this would mint a grant whose very first use is a certain
@@ -1416,9 +1547,16 @@ mod tests {
         assert!(constraints_for(&t, "GET", &[], &["/".into()], 300, 1).is_ok());
         // And one of several covering is enough.
         assert!(constraints_for(&t, "GET", &[], &["/v1".into(), "/admin".into()], 300, 1).is_ok());
-        // Encoded paths compare canonically, like the server does.
+        // Encoded paths compare canonically, like the server does — and that
+        // has to hold from BOTH sides, since the server canonicalizes every
+        // prefix it stores. An encoded prefix for an encoded target is the
+        // same call and must not be refused.
         let enc = parse_target("https://api.example.com/files/a%20b").unwrap();
         assert!(constraints_for(&enc, "GET", &[], &["/files/a b".into()], 300, 1).is_ok());
+        assert!(constraints_for(&enc, "GET", &[], &["/files/a%20b".into()], 300, 1).is_ok());
+        // A prefix with no canonical form is left to the server rather than
+        // refused locally on a guess.
+        assert!(constraints_for(&enc, "GET", &[], &["/files%2Fa".into()], 300, 1).is_ok());
     }
 
     fn err_body(code: &str) -> String {
