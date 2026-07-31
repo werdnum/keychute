@@ -841,7 +841,20 @@ fn classify_proxy_error(status: reqwest::StatusCode, body: &str) -> Failure {
 /// `--idempotency-key` is for — a command that died after approval but before
 /// the proxy call), while a changed target mints a fresh request and a fresh
 /// push carrying the new target.
-pub(crate) fn call_bound_idempotency_key(user_key: &str, method: &str, target: &Target) -> String {
+///
+/// "The call" is all of it, not just the target. The body and the forwarded
+/// headers are in no constraint either, and neither is in `CreateAccessRequest`
+/// at all — so a rerun that keeps the key and changes `-d` or a signed header
+/// resumes the original approval and proxies the new bytes under it. A grant
+/// with uses to spare may legitimately carry different bodies; a RESUMPTION
+/// may not, because it claims to be the same call that was approved.
+pub(crate) fn call_bound_idempotency_key(
+    user_key: &str,
+    method: &str,
+    target: &Target,
+    headers: &[(String, String)],
+    body: Option<&[u8]>,
+) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     // Length-prefixed so no two different calls can produce the same preimage
@@ -860,6 +873,26 @@ pub(crate) fn call_bound_idempotency_key(user_key: &str, method: &str, target: &
             hasher.update([1u8]);
             hasher.update((q.len() as u64).to_be_bytes());
             hasher.update(q.as_bytes());
+        }
+    }
+    // Headers in the order they will be sent: two invocations that send the
+    // same fields in a different order are different requests, and an upstream
+    // that signs over the header block can tell.
+    hasher.update((headers.len() as u64).to_be_bytes());
+    for (name, value) in headers {
+        for field in [name.as_str(), value.as_str()] {
+            hasher.update((field.len() as u64).to_be_bytes());
+            hasher.update(field.as_bytes());
+        }
+    }
+    // Absent and empty are distinct here for the same reason `/x` and `/x?`
+    // are: `-d ''` sends `Content-Length: 0`, no body at all sends nothing.
+    match body {
+        None => hasher.update([0u8]),
+        Some(b) => {
+            hasher.update([1u8]);
+            hasher.update((b.len() as u64).to_be_bytes());
+            hasher.update(b);
         }
     }
     let digest = hex::encode(hasher.finalize());
@@ -1333,6 +1366,8 @@ pub(crate) async fn run_curl(
                 &method,
                 secret_name,
                 structured.expect("a secret selector builds its context"),
+                &headers,
+                body.as_deref(),
             )
             .await?,
             true,
@@ -1627,6 +1662,9 @@ pub(crate) fn path_covered(prefix: &str, path: &str) -> bool {
 }
 
 /// Ask for — and wait on — a grant that permits exactly this call.
+// Same shape as `proxy_call` below, and for the same reason: the arguments ARE
+// the call, and bundling them into a struct only moves the list.
+#[allow(clippy::too_many_arguments)]
 async fn acquire_grant(
     cfg: &Config,
     http: &reqwest::Client,
@@ -1635,6 +1673,8 @@ async fn acquire_grant(
     method: &str,
     secret_name: String,
     structured: serde_json::Value,
+    headers: &[(String, String)],
+    body: Option<&[u8]>,
 ) -> CliResult<Uuid> {
     let user_key = args
         .idempotency_key
@@ -1653,7 +1693,7 @@ async fn acquire_grant(
             ),
         ));
     }
-    let idem_key = call_bound_idempotency_key(&user_key, method, target);
+    let idem_key = call_bound_idempotency_key(&user_key, method, target, headers, body);
     validate_idempotency_key(&idem_key).map_err(|e| fail(EXIT_CONFIG, e))?;
     let constraints = constraints_for(
         target,
@@ -2680,23 +2720,38 @@ mod tests {
     #[test]
     fn the_idempotency_key_is_bound_to_the_exact_call() {
         let base = parse_target("https://api.example.com/transfer?to=trusted").unwrap();
-        let key = call_bound_idempotency_key("k1", "POST", &base);
+        let key = call_bound_idempotency_key("k1", "POST", &base, &[], None);
         // Same command, same key: a rerun resumes its original request, which
         // is the whole point of --idempotency-key.
-        assert_eq!(key, call_bound_idempotency_key("k1", "POST", &base));
+        assert_eq!(
+            key,
+            call_bound_idempotency_key("k1", "POST", &base, &[], None)
+        );
 
         // Change ONLY the query and the key changes — otherwise the server
         // would hand back the original approval (the MAC excludes
         // context.structured) and this command would proxy the new target
         // under a grant the operator approved for the old one.
         let swapped = parse_target("https://api.example.com/transfer?to=attacker").unwrap();
-        assert_ne!(key, call_bound_idempotency_key("k1", "POST", &swapped));
+        assert_ne!(
+            key,
+            call_bound_idempotency_key("k1", "POST", &swapped, &[], None)
+        );
         // Same for the other components of "which call is this".
         let other_path = parse_target("https://api.example.com/refund?to=trusted").unwrap();
-        assert_ne!(key, call_bound_idempotency_key("k1", "POST", &other_path));
+        assert_ne!(
+            key,
+            call_bound_idempotency_key("k1", "POST", &other_path, &[], None)
+        );
         let other_host = parse_target("https://other.example/transfer?to=trusted").unwrap();
-        assert_ne!(key, call_bound_idempotency_key("k1", "POST", &other_host));
-        assert_ne!(key, call_bound_idempotency_key("k1", "GET", &base));
+        assert_ne!(
+            key,
+            call_bound_idempotency_key("k1", "POST", &other_host, &[], None)
+        );
+        assert_ne!(
+            key,
+            call_bound_idempotency_key("k1", "GET", &base, &[], None)
+        );
         // An absent query and an empty one are different request targets —
         // `/transfer?` really is sent with the `?` — so they must not alias.
         let no_query = parse_target("https://api.example.com/transfer").unwrap();
@@ -2704,23 +2759,86 @@ mod tests {
         assert_eq!(no_query.query, None);
         assert_eq!(empty_query.query.as_deref(), Some(""));
         assert_ne!(
-            call_bound_idempotency_key("k1", "POST", &no_query),
-            call_bound_idempotency_key("k1", "POST", &empty_query)
+            call_bound_idempotency_key("k1", "POST", &no_query, &[], None),
+            call_bound_idempotency_key("k1", "POST", &empty_query, &[], None)
         );
         // A different caller key is still a different request.
-        assert_ne!(key, call_bound_idempotency_key("k2", "POST", &base));
+        assert_ne!(
+            key,
+            call_bound_idempotency_key("k2", "POST", &base, &[], None)
+        );
         // Length-prefixing: no field boundary can be shifted to collide.
         let a = parse_target("https://api.example.com/ab").unwrap();
         let b = parse_target("https://api.example.com/a?b").unwrap();
         assert_ne!(
-            call_bound_idempotency_key("k", "GET", &a),
-            call_bound_idempotency_key("k", "GET", &b)
+            call_bound_idempotency_key("k", "GET", &a, &[], None),
+            call_bound_idempotency_key("k", "GET", &b, &[], None)
+        );
+        // The body and the forwarded headers are part of "which call is
+        // this" too: neither is in `CreateAccessRequest`, so without them a
+        // rerun keeping the key sends new bytes under the old approval.
+        let hdrs = vec![("x-signature".to_string(), "abc".to_string())];
+        assert_ne!(
+            call_bound_idempotency_key("k1", "POST", &base, &[], Some(b"{\"to\":\"trusted\"}")),
+            call_bound_idempotency_key("k1", "POST", &base, &[], Some(b"{\"to\":\"attacker\"}"))
+        );
+        assert_ne!(
+            key,
+            call_bound_idempotency_key("k1", "POST", &base, &hdrs, None)
+        );
+        assert_ne!(
+            call_bound_idempotency_key("k1", "POST", &base, &hdrs, None),
+            call_bound_idempotency_key(
+                "k1",
+                "POST",
+                &base,
+                &[("x-signature".to_string(), "xyz".to_string())],
+                None
+            )
+        );
+        // Order is part of the request too.
+        let a_then_b = vec![
+            ("x-a".to_string(), "1".to_string()),
+            ("x-b".to_string(), "2".to_string()),
+        ];
+        let b_then_a = vec![
+            ("x-b".to_string(), "2".to_string()),
+            ("x-a".to_string(), "1".to_string()),
+        ];
+        assert_ne!(
+            call_bound_idempotency_key("k1", "POST", &base, &a_then_b, None),
+            call_bound_idempotency_key("k1", "POST", &base, &b_then_a, None)
+        );
+        // No body and an empty body are different requests: `-d ''` sends
+        // `Content-Length: 0`.
+        assert_ne!(
+            call_bound_idempotency_key("k1", "POST", &base, &[], None),
+            call_bound_idempotency_key("k1", "POST", &base, &[], Some(b""))
+        );
+        // Length-prefixing again, across the new fields.
+        assert_ne!(
+            call_bound_idempotency_key(
+                "k1",
+                "POST",
+                &base,
+                &[("x-a".to_string(), "bc".to_string())],
+                None
+            ),
+            call_bound_idempotency_key(
+                "k1",
+                "POST",
+                &base,
+                &[("x-ab".to_string(), "c".to_string())],
+                None
+            )
         );
         // The derived key fits the server's cap.
         assert!(validate_idempotency_key(&call_bound_idempotency_key(
             &"k".repeat(MAX_CURL_USER_KEY_BYTES),
             "POST",
-            &base
+            &base,
+            &[],
+            None
         ))
         .is_ok());
         // …and keeps 128 bits of the digest. This is a COLLISION bound, and

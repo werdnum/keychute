@@ -314,8 +314,9 @@ fn approval_notification(
 pub async fn create(
     State(state): State<AppState>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Result<Bytes, axum::extract::rejection::BytesRejection>,
 ) -> Result<Response, ApiFailure> {
+    let body = crate::api::body_bytes(body)?;
     let client = authenticate_client(&state, &headers).await?;
 
     let req: CreateAccessRequest = serde_json::from_slice(&body)

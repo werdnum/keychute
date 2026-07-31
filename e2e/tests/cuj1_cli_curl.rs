@@ -286,6 +286,28 @@ async fn framework_rejections_are_marked_too() {
         );
     }
 
+    // The body extractors carry a length limit of their own, and exceeding it
+    // rejects before the handler for the same bare, unmarked answer.
+    let huge = "x".repeat(4 * 1024 * 1024);
+    for path in ["/v1/access-requests", "/v1/secrets"] {
+        let resp = env
+            .k8s()
+            .post(path)
+            .header("content-type", "application/json")
+            .body(huge.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 413, "{path}");
+        assert_eq!(
+            resp.headers()
+                .get("x-keychute-error")
+                .map(|v| v.to_str().unwrap()),
+            Some("body-too-large"),
+            "{path} must carry the marker"
+        );
+    }
+
     // And the routes that DO match still do: the catch-all must not shadow a
     // real route, nor the proxy's own nested wildcard.
     let resp = env.k8s().get("/healthz").send().await.unwrap();

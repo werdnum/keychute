@@ -789,6 +789,65 @@ async fn removing_the_user_agent_sends_no_user_agent() {
     assert_eq!(recs[1].header("user-agent"), None);
 }
 
+/// `--idempotency-key` means "this is the same call, resumed". The server's
+/// MAC covers `CreateAccessRequest`, which carries neither the body nor the
+/// forwarded headers — so if the derived key doesn't cover them either, a
+/// rerun that keeps the key and changes `-d` gets the ORIGINAL approval back
+/// and proxies the new bytes under it. Different call, same human decision.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_changed_body_or_header_is_not_the_same_call_to_resume() {
+    let (base, st) = spawn_mock(ProxyMode::Upstream).await;
+    let run = |args: Vec<String>| {
+        let b = base.clone();
+        tokio::task::spawn_blocking(move || {
+            let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+            run_cli(&b, &refs)
+        })
+    };
+    let base_args = |body: &str, sig: &str| {
+        vec![
+            "curl".to_string(),
+            "https://api.example.com/v1/transfer".to_string(),
+            "--secret".to_string(),
+            "example-api-token".to_string(),
+            "--idempotency-key".to_string(),
+            "retry-me".to_string(),
+            "-X".to_string(),
+            "POST".to_string(),
+            "-d".to_string(),
+            body.to_string(),
+            "-H".to_string(),
+            format!("X-Signature: {sig}"),
+        ]
+    };
+
+    let (code, _, stderr) = run(base_args("{\"to\":\"trusted\"}", "abc")).await.unwrap();
+    assert_eq!(code, 0, "{stderr}");
+    // Identical rerun: same key, so it resumes rather than asking again.
+    let (code, _, stderr) = run(base_args("{\"to\":\"trusted\"}", "abc")).await.unwrap();
+    assert_eq!(code, 0, "{stderr}");
+    // Changed body, then changed header: each is a different call.
+    let (code, _, stderr) = run(base_args("{\"to\":\"attacker\"}", "abc"))
+        .await
+        .unwrap();
+    assert_eq!(code, 0, "{stderr}");
+    let (code, _, stderr) = run(base_args("{\"to\":\"trusted\"}", "xyz")).await.unwrap();
+    assert_eq!(code, 0, "{stderr}");
+
+    let keys: Vec<String> = st
+        .create_bodies
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|b| b["idempotency_key"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(keys.len(), 4);
+    assert_eq!(keys[0], keys[1], "an identical rerun still resumes");
+    assert_ne!(keys[0], keys[2], "a changed body is a different call");
+    assert_ne!(keys[0], keys[3], "a changed header is a different call");
+    assert_ne!(keys[2], keys[3]);
+}
+
 /// curl: a custom header with the same name as an internal one is used
 /// "instead of the internal one". So an explicit `User-Agent` must REPLACE the
 /// CLI's default, not join it — two `User-Agent` fields reach the upstream as

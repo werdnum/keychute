@@ -138,8 +138,9 @@ pub async fn read(
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Result<Bytes, axum::extract::rejection::BytesRejection>,
 ) -> Result<Response, ApiFailure> {
+    let body = crate::api::body_bytes(body)?;
     let client = authenticate_client(&state, &headers).await?;
     let id = path_id(&id)?;
     let req: ReadGrantRequest = serde_json::from_slice(&body)

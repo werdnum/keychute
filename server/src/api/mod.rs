@@ -132,6 +132,26 @@ pub(crate) fn path_id(raw: &str) -> Result<Uuid, ApiFailure> {
     raw.parse::<Uuid>().map_err(|_| ApiFailure::NotFound)
 }
 
+/// A `Bytes` body, with axum's rejection turned into a marked failure.
+///
+/// The body extractors carry a length limit, and exceeding it rejects before
+/// the handler runs — a bare 413 with no [`error::KEYCHUTE_ERROR_HEADER`], the
+/// same gap the id, query, route and method rejections had. Handlers take the
+/// `Result` and pass it through here so an oversize or unreadable body is
+/// Keychute's own error, marked like the rest.
+pub(crate) fn body_bytes(
+    body: Result<axum::body::Bytes, axum::extract::rejection::BytesRejection>,
+) -> Result<axum::body::Bytes, ApiFailure> {
+    use axum::response::IntoResponse as _;
+    body.map_err(|rejection| {
+        if rejection.into_response().status() == StatusCode::PAYLOAD_TOO_LARGE {
+            ApiFailure::BodyTooLarge
+        } else {
+            ApiFailure::InvalidRequest("request body could not be read")
+        }
+    })
+}
+
 /// Fetch a grant enforcing ownership (mismatch → 404, addendum #1).
 pub(crate) async fn owned_grant(
     state: &AppState,

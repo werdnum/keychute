@@ -83,8 +83,11 @@ fn validate_name(name: &str) -> Result<(), ApiFailure> {
 pub async fn store(
     State(state): State<AppState>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Result<Bytes, axum::extract::rejection::BytesRejection>,
 ) -> Result<Response, ApiFailure> {
+    // Before the credential-wiping dance below: a rejected body never became
+    // bytes this process holds, so there is nothing to wipe.
+    let body = crate::api::body_bytes(body)?;
     // Authenticate first, but do NOT return yet: an unauthenticated request
     // still carried a credential in its body, and bailing on `?` here would
     // free that allocation unwiped.
