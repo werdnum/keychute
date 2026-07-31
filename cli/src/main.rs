@@ -343,23 +343,66 @@ fn validate_api_url(url: &str, allow_insecure: bool) -> Result<(), String> {
     }
 }
 
+/// The server refuses a `context.structured` over 16 KiB (`requests.rs`). The
+/// capture below is a courtesy for the approving human, so it must never be the
+/// reason a request is refused — an agent whose parent process has a long
+/// command line (a wrapper invoked with a large inline payload, say) would
+/// otherwise find every `keychute` call rejected for a reason it did not choose
+/// and cannot act on. Each captured command is clipped to fit.
+const MAX_STRUCTURED_COMMAND_CHARS: usize = 400;
+
+/// The server's own cap on `context.structured`, mirrored so the shedding
+/// below aims at the same bar the server applies.
+const MAX_STRUCTURED_BYTES: usize = 16 * 1024;
+
+fn json_len(map: &serde_json::Map<String, serde_json::Value>) -> usize {
+    serde_json::to_vec(map).map(|v| v.len()).unwrap_or(0)
+}
+
+/// Clip one captured command line to [`MAX_STRUCTURED_COMMAND_CHARS`], marking
+/// the cut so the reader knows they are seeing a prefix. Clipping is on a char
+/// boundary; a `ps` line is not necessarily ASCII.
+fn clip_command(mut cmd: String) -> String {
+    if cmd.chars().count() <= MAX_STRUCTURED_COMMAND_CHARS {
+        return cmd;
+    }
+    let cut = cmd
+        .char_indices()
+        .nth(MAX_STRUCTURED_COMMAND_CHARS)
+        .map(|(i, _)| i)
+        .unwrap_or(cmd.len());
+    cmd.truncate(cut);
+    cmd.push('…');
+    cmd
+}
+
 /// Assemble agent-asserted structured context: best-effort pipeline capture
 /// plus $KEYCHUTE_CONTEXT verbatim under `extra`.
 pub(crate) fn build_structured_context() -> Option<serde_json::Value> {
     let mut map = serde_json::Map::new();
     if let Some(captured) = pipeline::capture() {
         // Agent-asserted: ancestor chain plus same-shell pipeline peers.
-        map.insert(
-            "pipeline".to_string(),
-            serde_json::json!(captured.ancestors),
-        );
+        let ancestors: Vec<String> = captured.ancestors.into_iter().map(clip_command).collect();
+        map.insert("pipeline".to_string(), serde_json::json!(ancestors));
         if !captured.siblings.is_empty() {
-            map.insert(
-                "pipeline_siblings".to_string(),
-                serde_json::json!(captured.siblings),
-            );
+            let siblings: Vec<String> = captured.siblings.into_iter().map(clip_command).collect();
+            map.insert("pipeline_siblings".to_string(), serde_json::json!(siblings));
+        }
+        // Clipping bounds each entry, not their number. Shed whole sections
+        // rather than let the courtesy capture sink the request; the peers are
+        // the less load-bearing of the two, so they go first.
+        for section in ["pipeline_siblings", "pipeline"] {
+            if json_len(&map) <= MAX_STRUCTURED_BYTES {
+                break;
+            }
+            if map.remove(section).is_some() {
+                map.insert(format!("{section}_omitted"), serde_json::json!(true));
+            }
         }
     }
+    // `extra` is the caller's own text. If they blow the budget with it, that
+    // is a choice they made and can undo, so it is theirs to keep — unlike the
+    // capture above, which they never asked for.
     if let Ok(extra) = std::env::var("KEYCHUTE_CONTEXT") {
         map.insert("extra".to_string(), serde_json::Value::String(extra));
     }
@@ -1248,6 +1291,23 @@ mod tests {
         read_bounded(input.as_slice(), &mut buf).unwrap();
         assert!(strip_trailing_newline(&mut buf));
         assert_eq!(buf.len(), MAX_SECRET_BYTES);
+    }
+
+    #[test]
+    fn a_long_ancestor_command_line_cannot_sink_the_request() {
+        // A courtesy capture must never be the reason a request is refused.
+        let long = "x".repeat(MAX_STRUCTURED_BYTES * 2);
+        let clipped = clip_command(long);
+        assert_eq!(clipped.chars().count(), MAX_STRUCTURED_COMMAND_CHARS + 1);
+        assert!(clipped.ends_with('…'), "the cut is visible to the reader");
+        // Short lines and multi-byte ones are left alone, and the clip lands
+        // on a char boundary rather than splitting one.
+        assert_eq!(clip_command("ps -ax".into()), "ps -ax");
+        let wide = "é".repeat(MAX_STRUCTURED_COMMAND_CHARS + 10);
+        assert_eq!(
+            clip_command(wide).chars().count(),
+            MAX_STRUCTURED_COMMAND_CHARS + 1
+        );
     }
 
     #[test]

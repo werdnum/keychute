@@ -69,6 +69,11 @@ use crate::{
 /// [`MAX_BODY_ENV`] moves it for a deployment that configured something else.
 const DEFAULT_MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 
+/// The server's fixed upper bound on a grant's lifetime (`requests.rs`). It is
+/// not deployment-configurable, so refusing a longer `--ttl` locally costs
+/// nothing and saves an invocation that would be rejected on arrival.
+const MAX_TTL_SECONDS: u64 = 30 * 24 * 3600;
+
 /// Overrides [`DEFAULT_MAX_BODY_BYTES`], for a deployment whose
 /// `limits.proxy_max_body_bytes` is not the default.
 const MAX_BODY_ENV: &str = "KEYCHUTE_MAX_BODY_BYTES";
@@ -146,7 +151,9 @@ pub(crate) struct CurlArgs {
     /// HTTP method (default GET, or POST when a body is supplied).
     #[arg(short = 'X', long = "request", value_name = "METHOD")]
     pub method: Option<String>,
-    /// Extra request header, `Name: value`. Repeatable.
+    /// Extra request header, `Name: value`. Repeatable. As in curl, `Name:`
+    /// with nothing after the colon removes the header rather than sending an
+    /// empty one, and `Name;` sends it with an empty value.
     #[arg(short = 'H', long = "header", value_name = "LINE")]
     pub headers: Vec<String>,
     /// Request body. `@path` reads a file, `@-` reads stdin (curl's spelling).
@@ -356,20 +363,42 @@ pub(crate) fn normalize_method(m: &str) -> Result<String, String> {
 
 /// Split `Name: value`. Leading whitespace on the value is dropped, exactly as
 /// curl does; the name must be a real header token.
-pub(crate) fn parse_header(line: &str) -> Result<(String, String), String> {
-    let (name, value) = line
-        .split_once(':')
-        .ok_or_else(|| format!("header {line:?} is not in `Name: value` form"))?;
+///
+/// Three spellings, all curl's:
+///   * `Name: value` — send it.
+///   * `Name:` (nothing after the colon) — *remove* the header. curl uses this
+///     to suppress its own defaults; here there are no defaults to suppress, so
+///     it resolves to "do not send", returning `None`. What it must NOT do is
+///     send `Name` with an empty value: an upstream that distinguishes an
+///     absent header from a present-but-empty one would then see a different
+///     request than the curl line it was copied from.
+///   * `Name;` — send it with an empty value. The only way to spell that, again
+///     as curl does, since `Name:` means removal.
+pub(crate) fn parse_header(line: &str) -> Result<Option<(String, String)>, String> {
+    let (name, value) = match line.split_once(':') {
+        Some((name, value)) => (name, Some(value)),
+        // No colon: the `Name;` form, or a malformed line.
+        None => match line.trim_end().strip_suffix(';') {
+            Some(name) => (name, None),
+            None => return Err(format!("header {line:?} is not in `Name: value` form")),
+        },
+    };
     let name = name.trim();
     if name.is_empty() {
         return Err(format!("header {line:?} has an empty name"));
     }
     reqwest::header::HeaderName::from_bytes(name.as_bytes())
         .map_err(|_| format!("invalid header name in {line:?}"))?;
-    let value = value.trim_start();
+    let value = match value {
+        // `Name:` — removal, and nothing here adds headers to remove.
+        Some(v) if v.trim().is_empty() => return Ok(None),
+        Some(v) => v.trim_start(),
+        // `Name;` — deliberately empty.
+        None => "",
+    };
     reqwest::header::HeaderValue::from_str(value)
         .map_err(|_| format!("invalid header value in {line:?}"))?;
-    Ok((name.to_ascii_lowercase(), value.to_string()))
+    Ok(Some((name.to_ascii_lowercase(), value.to_string())))
 }
 
 /// Would the broker drop this header? Not fatal, but silence would be worse:
@@ -674,6 +703,29 @@ fn validate_grant_options(args: &CurlArgs, target: &Target) -> CliResult<()> {
             ));
         }
     }
+    // A path with no canonical form is one the proxy refuses outright, so the
+    // call cannot succeed however it is approved. Refusing it here rather than
+    // deferring matters when an explicit `--path-prefix` is valid on its own:
+    // the request would be accepted, a human would approve it, and only then
+    // would the proxy reject the path. Saying so now costs nobody an approval.
+    if canonical_path(&target.path).is_none() {
+        return Err(fail(
+            EXIT_CONFIG,
+            format!(
+                "the path {:?} is one the broker refuses: it must percent-decode once to valid \
+                 UTF-8, with no encoded '/' or '\\', no '.' or '..' segment (judged before any \
+                 ';'), no control characters and no '//'",
+                target.path
+            ),
+        ));
+    }
+    // The server's own bound (`requests.rs`), applied unconditionally there.
+    if args.ttl < 1 || args.ttl > MAX_TTL_SECONDS {
+        return Err(fail(
+            EXIT_CONFIG,
+            format!("--ttl must be between 1 second and 30 days ({MAX_TTL_SECONDS} seconds)"),
+        ));
+    }
     for m in &args.allow_methods {
         normalize_method(m).map_err(|e| fail(EXIT_CONFIG, e))?;
     }
@@ -712,7 +764,9 @@ pub(crate) async fn run_curl(
     };
     let mut parsed = Vec::new();
     for line in &args.headers {
-        parsed.push(parse_header(line).map_err(|e| fail(EXIT_CONFIG, e))?);
+        if let Some(h) = parse_header(line).map_err(|e| fail(EXIT_CONFIG, e))? {
+            parsed.push(h);
+        }
     }
     validate_grant_options(&args, &target)?;
 
@@ -940,10 +994,24 @@ pub(crate) fn canonical_path(raw: &str) -> Option<String> {
         }
     }
     let decoded = String::from_utf8(out).ok()?;
-    // The server rejects `.` and `..` segments after decoding rather than
-    // resolving them, so a path containing one has no canonical form here
-    // either — the local checks skip it and the server gives the answer.
-    if decoded.split('/').any(|seg| seg == "." || seg == "..") {
+    // Everything below mirrors `server/src/policy/paths.rs::canonicalize`, which
+    // rejects rather than resolves. A path it refuses has no canonical form
+    // here either, so the local checks skip it and the server gives the answer.
+    // Getting this wrong is not merely a missed diagnostic: judging such a path
+    // "covered" spends a human approval on a call the proxy then refuses.
+    if decoded.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    // Dot segments are judged by the portion BEFORE any `;`, because
+    // servlet-family upstreams strip `;params` and only then normalize — so
+    // `..;x` lands on `..` upstream and escapes the approved prefix.
+    if decoded.split('/').any(|seg| {
+        let base = seg.split(';').next().unwrap_or(seg);
+        base == "." || base == ".."
+    }) {
+        return None;
+    }
+    if decoded.contains("//") {
         return None;
     }
     Some(decoded)
@@ -1325,11 +1393,23 @@ mod tests {
 
     #[test]
     fn header_parsing() {
-        let (n, v) = parse_header("Content-Type: application/json").unwrap();
+        let (n, v) = parse_header("Content-Type: application/json")
+            .unwrap()
+            .unwrap();
         assert_eq!(n, "content-type");
         assert_eq!(v, "application/json");
         // Only leading whitespace is dropped; the value is otherwise verbatim.
-        assert_eq!(parse_header("X-A:  b c ").unwrap().1, "b c ");
+        assert_eq!(parse_header("X-A:  b c ").unwrap().unwrap().1, "b c ");
+        // `Name:` is curl's removal spelling — it must not become a
+        // present-but-empty header, which is a different request upstream.
+        assert!(parse_header("X-Feature:").unwrap().is_none());
+        assert!(parse_header("X-Feature:   ").unwrap().is_none());
+        // `Name;` is how curl spells a deliberately empty value.
+        assert_eq!(
+            parse_header("X-Feature;").unwrap().unwrap(),
+            ("x-feature".to_string(), String::new())
+        );
+        assert!(parse_header(";").is_err());
         assert!(parse_header("nocolon").is_err());
         assert!(parse_header(": v").is_err());
         assert!(parse_header("Bad Name: v").is_err());
@@ -1507,6 +1587,40 @@ mod tests {
         assert!(canonical_path("/v1\\things").is_none());
         assert!(canonical_path("/v1%zz").is_none());
         assert!(canonical_path("/v1%").is_none());
+        assert!(canonical_path("/v1/../admin").is_none());
+        assert!(canonical_path("/v1/%2e%2e/admin").is_none());
+        // Path parameters: a servlet-family upstream strips `;x` and only then
+        // normalizes, so `..;x` is a dot segment. The server judges each
+        // segment by the part before `;`, and so must this — otherwise
+        // `/v1/..;x` looks covered by `/v1`, spends an approval, and is
+        // refused by the proxy.
+        assert!(canonical_path("/v1/..;x").is_none());
+        assert!(canonical_path("/v1/..%3bjsessionid=1").is_none());
+        assert!(canonical_path("/v1/.;/admin").is_none());
+        // A `;` on an ordinary segment is not a dot segment.
+        assert_eq!(canonical_path("/v1/things;v=2").unwrap(), "/v1/things;v=2");
+        // The server's remaining refusals, mirrored for the same reason.
+        assert!(canonical_path("/v1//things").is_none());
+        assert!(canonical_path("/v1/th\ning").is_none());
+    }
+
+    #[test]
+    fn a_ttl_outside_the_servers_bounds_is_refused_before_the_body_is_read() {
+        let target = parse_target("https://api.example.com/v1/things").unwrap();
+        let mut args = body_args(None, None, None);
+        args.url = "https://api.example.com/v1/things".into();
+        args.secret = Some("s".into());
+
+        args.ttl = 0;
+        let err = validate_grant_options(&args, &target).unwrap_err();
+        assert_eq!(err.code, EXIT_CONFIG);
+        assert!(err.message.contains("--ttl"), "{}", err.message);
+
+        args.ttl = MAX_TTL_SECONDS + 1;
+        assert!(validate_grant_options(&args, &target).is_err());
+
+        args.ttl = MAX_TTL_SECONDS;
+        assert!(validate_grant_options(&args, &target).is_ok());
     }
 
     #[test]
@@ -1736,6 +1850,16 @@ mod tests {
 
         args.idempotency_key = Some("k".repeat(MAX_CURL_USER_KEY_BYTES + 1));
         assert!(validate_grant_options(&args, &t).is_err());
+        args.idempotency_key = None;
+
+        // A path the proxy will refuse is refused here, even when the prefix
+        // that would be approved is itself perfectly valid — otherwise a human
+        // approves `/v1` and the call dies at the proxy anyway.
+        let doomed = parse_target("https://api.example.com/v1/..;jsessionid=1").unwrap();
+        args.path_prefixes = vec!["/v1".into()];
+        let err = validate_grant_options(&args, &doomed).unwrap_err();
+        assert_eq!(err.code, EXIT_CONFIG);
+        assert!(err.message.contains("refuses"), "{}", err.message);
     }
 
     #[test]
