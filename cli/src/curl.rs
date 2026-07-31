@@ -1194,7 +1194,7 @@ mod tests {
         assert!(nominated.contains(&"close".to_string()));
         assert!(!nominated.contains(&"content-type".to_string()));
         // No Connection header nominates nothing.
-        assert!(connection_nominated(&headers[1..].to_vec()).is_empty());
+        assert!(connection_nominated(&headers[1..]).is_empty());
     }
 
     #[test]
