@@ -271,6 +271,47 @@ or Envoy-forwarded JWT in oidc mode):
   CSRF token AND in the `UPDATE ... AND current_version = $2` — so a rotation
   between the two steps cannot vet bytes nobody saw. Both are POST: a URL that
   renders a credential would sit in browser history.
+- Deletion, also two-step: `POST /ui/secrets/{id}/delete` (confirmation page —
+  what goes with the secret: the live grants that will be revoked, the pending
+  requests that lose their stored value, and the standing policies that are
+  KEPT because a tag-scoped or wildcard row is about other secrets too, and a
+  by-name row would apply again to anything later created under the name) and
+  `POST /ui/secrets/{id}/deleted` (carries it out; audits `secret-deleted`).
+  Same version binding as the review flow — CSRF token AND
+  `DELETE ... AND current_version = $2` — so a rotation between the two steps
+  409s instead of destroying bytes the operator never saw. The delete removes
+  the secret, its `secret_versions` and its `secret_tags` (`ON DELETE CASCADE`),
+  and in the same transaction revokes every live non-passthrough grant naming
+  it, each with its own `grant-revoked` row (`detail.reason =
+  "secret-deleted"`): a grant whose secret is gone can only ever return
+  `payload-lost`, so the revocation says so rather than leaving a "live" grant
+  that cannot work. Passthrough grants are untouched — their payload was
+  entered at approval time and never came from the deleted row. Audit rows
+  naming the deleted `secret_version_id`s survive by design.
+  Deletion serializes against grant creation on a per-secret-name advisory lock
+  (`keychute-secret`; exclusive here, shared in every path that inserts a
+  payload-less grant — `ui_ext::approve_request`, the auto-approve leg of
+  `api_ext::insert_access_request_with_id`, and `requests::resolve_approve`).
+  Grants name their secret with no foreign key, so without it an approval
+  committing just after the revocation statement's snapshot would leave a live
+  grant over destroyed ciphertext. Holding the lock is not sufficient on its
+  own — a grant creator that finds the deletion already committed refuses
+  (409 in the UI; rollback-and-retry on the auto-approve path) instead of
+  minting a grant that can only return `payload-lost`. Lock order everywhere:
+  this one BEFORE the KEK lock and any per-client lock.
+  That refusal checks the secret's IDENTITY, not its name: `GrantParams` carries
+  `secret_id` — the row the decision was actually taken about — and the approving
+  transaction verifies id AND name together. Deletion makes names reusable, so a
+  name-only check would also be satisfied by a different secret created (or
+  client-deposited, hence unvetted) under the freed name between policy
+  evaluation and approval, releasing bytes nobody evaluated; grant revalidation
+  at read time does not re-check `operator_vetted` or re-run policy, so this is
+  the point where it has to be caught. A payload-less grant without a
+  `secret_id` is refused rather than falling back to the name. A rotation that loses
+  the same race returns "no such secret" as a 409 rather than a 500.
+  The confirmation page states plainly that deletion is not erasure: pre-existing
+  database backups still hold the ciphertext and the KEK still unwraps it, so
+  only provider-side rotation invalidates those copies.
 - CSRF: session-less double-submit is NOT enough with header auth; since auth is
   a header (no cookies), CSRF risk is minimal, but implement `Origin`/
   `Sec-Fetch-Site` checks on all POSTs + a per-rendered-form token MAC'd with the

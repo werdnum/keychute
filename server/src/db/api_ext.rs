@@ -79,6 +79,40 @@ pub async fn insert_access_request_with_id(
     seal_context: Option<super::SealFn<'_>>,
 ) -> anyhow::Result<InsertOutcome> {
     let mut tx = db.begin().await?;
+    // An auto-approved grant with no payload of its own releases the STORED
+    // secret, so — exactly as in `ui_ext::approve_request` — it serializes
+    // against that secret's deletion, and re-checks the secret survived once
+    // the lock is held. Taken FIRST, before the KEK and per-client locks, per
+    // the order documented on [`crate::db::take_secret_shared_lock`].
+    let stored_backed_grant = match resolution {
+        InitialResolution::Approved { grant, .. } if grant.passthrough.is_none() => {
+            Some((grant.secret_name.as_str(), grant.secret_id))
+        }
+        _ => None,
+    };
+    if let Some((secret_name, secret_id)) = stored_backed_grant {
+        super::take_secret_shared_lock(&mut tx, secret_name).await?;
+        // The row policy was evaluated against, by id: a delete plus a fresh
+        // deposit under the same name would otherwise auto-release an unvetted
+        // replacement under a decision taken about different bytes
+        // ([`crate::db::GrantParams::secret_id`]).
+        let same_row = match secret_id {
+            Some(id) => super::secret_incarnation_exists(&mut tx, id, secret_name).await?,
+            None => false,
+        };
+        if !same_row {
+            // Nothing has been written yet, and the idempotency key is
+            // unburned: the caller's retry re-evaluates policy against the
+            // world as it now is — no secret, or a different one under that
+            // name, neither of which auto-approves on these bytes. Same shape
+            // as the elapsed-deadline rollback below.
+            tx.rollback().await?;
+            anyhow::bail!(
+                "the stored secret changed identity during auto-approval; nothing was \
+                 written — a retry re-evaluates policy"
+            );
+        }
+    }
     // Same pattern as `ui_ext::approve_request`: the lock covers every
     // KEYSET-wrapped DEK inserted here, which is only the sealed request
     // context. An auto-approve grant's passthrough payload is wrapped under the

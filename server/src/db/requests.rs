@@ -221,6 +221,22 @@ impl PassthroughPayload {
 pub struct GrantParams {
     pub client_name: String,
     pub secret_name: String,
+    /// The exact stored-secret ROW the decision was made against.
+    ///
+    /// Required for a payload-less grant, and verified — id AND name together —
+    /// inside the approving transaction: names are reusable now that an
+    /// operator can delete a secret ([`crate::db::ui_ext::delete_secret_audited`]),
+    /// so "a secret called X exists" is not the same question as "the secret
+    /// this decision was made against still exists". Without the id, a delete
+    /// plus a fresh deposit under the same name between policy evaluation and
+    /// approval would release the replacement — a value nobody reviewed —
+    /// under a decision taken about different bytes. Approval refuses a
+    /// payload-less grant that does not carry it.
+    ///
+    /// `None` for passthrough grants (they carry their own payload) and for
+    /// the approval that CREATES the secret, whose row is inserted in the same
+    /// transaction.
+    pub secret_id: Option<Uuid>,
     pub mechanism: String,
     pub constraints: serde_json::Value,
     pub not_after: DateTime<Utc>,
@@ -230,8 +246,10 @@ pub struct GrantParams {
 
 /// Approve a pending request: in one transaction, flip `pending -> approved`
 /// (rowcount-checked), insert the grant, and write the `request-approved`
-/// audit row. Returns the new grant id, or `None` if the request was not
-/// pending (already resolved or expired) — nothing is written in that case.
+/// audit row. Returns the new grant id, or `None` if the approval could not
+/// happen — the request was not pending (already resolved or expired), or the
+/// stored secret a payload-less grant would release has been deleted
+/// underneath it. Nothing is written in either case.
 pub async fn resolve_approve(
     db: &PgPool,
     request_id: Uuid,
@@ -239,6 +257,23 @@ pub async fn resolve_approve(
     grant: &GrantParams,
 ) -> anyhow::Result<Option<Uuid>> {
     let mut tx = db.begin().await?;
+    // Same guard as `ui_ext::approve_request`: a grant with no payload of its
+    // own releases the stored secret, so it serializes against that secret's
+    // deletion and re-checks the secret survived
+    // ([`crate::db::take_secret_shared_lock`]).
+    if grant.passthrough.is_none() {
+        crate::db::take_secret_shared_lock(&mut tx, &grant.secret_name).await?;
+        let same_row = match grant.secret_id {
+            Some(id) => {
+                crate::db::secret_incarnation_exists(&mut tx, id, &grant.secret_name).await?
+            }
+            None => false,
+        };
+        if !same_row {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+    }
     let updated = sqlx::query(
         "UPDATE access_requests \
          SET state = 'approved', resolved_by = $2, resolved_at = now() \
