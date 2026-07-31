@@ -316,11 +316,18 @@ pub(crate) fn parse_target(raw: &str) -> Result<Target, String> {
              Percent-encode it (%09, %0D, %0A, %00 …) if it is really meant."
         ));
     }
-    if raw.starts_with(' ') || raw.ends_with(' ') {
+    // Spaces ANYWHERE, not just at the ends. At the ends the parser trims them;
+    // in the middle it keeps the character but re-spells it, so
+    // `?account=a b` is displayed and hashed with the space and arrives
+    // upstream as `a%20b`. Either way the approved spelling is not the
+    // transmitted one, which is the whole objection. curl 8.5.0 refuses the lot
+    // as a malformed URL (exit 3) rather than encoding on the caller's behalf.
+    if raw.contains(' ') {
         return Err(format!(
-            "refusing URL with a leading or trailing space {raw:?}: URL parsers trim them, \
-             so the approved spelling is not the one that would be sent. Percent-encode it \
-             (%20) if it is really part of the target."
+            "refusing URL containing a space {raw:?}: parsers trim spaces at the ends and \
+             re-encode them in the middle (a query of `a b` is sent as `a%20b`), so the \
+             approved spelling is not the one that would be sent. Percent-encode it (%20) \
+             if it is really part of the target."
         ));
     }
     if raw.contains('\\') {
@@ -507,10 +514,21 @@ pub(crate) fn constraints_for(
         // `--path-prefix /files/a%20b` for a URL of `/files/a%20b`, which is
         // the same call.
         //
-        // A prefix with no canonical form is dropped from the comparison
-        // rather than treated as non-covering: the server will reject the
-        // request itself, and guessing here could only turn a server-side
-        // answer into a wrong local one.
+        // A prefix with no canonical form is a local configuration error, not
+        // something to defer: `api/requests.rs` canonicalizes every submitted
+        // prefix and rejects the whole request if one fails, so the call cannot
+        // succeed however it is approved. Dropping it from the comparison
+        // instead would let preflight pass and `-d @-` block on a producer for
+        // an invocation already certain to be refused.
+        for p in path_prefixes {
+            if canonical_path(p).is_none() {
+                return Err(format!(
+                    "--path-prefix {p:?} is one the broker refuses: it must percent-decode \
+                     once to valid UTF-8, with no encoded '/' or '\\', no '.' or '..' segment \
+                     (judged before any ';'), no control characters and no '//'"
+                ));
+            }
+        }
         if let Some(canonical_target) = canonical_path(&target.path) {
             let canonical_prefixes: Vec<String> = path_prefixes
                 .iter()
@@ -1213,7 +1231,15 @@ pub(crate) async fn run_curl(
     // goes out, turning a best-effort courtesy into an expired grant. Still
     // printed when the call failed — a grant with uses left is exactly what
     // someone retrying wants to know about.
-    if freshly_approved && args.max_uses != 1 {
+    //
+    // A FAILED call reports even under the default `--max-uses 1`, which is the
+    // one case where the ID is otherwise never printed. A failure before the
+    // proxy accounted the use — the connection to Keychute dropping between
+    // approval and the request — leaves the single use unspent, and the default
+    // idempotency key is random, so re-running asks a human to approve the same
+    // thing again instead of reusing what they just granted. The lookup decides
+    // which it was; `report_reuse_budget` prints "spent" when it was spent.
+    if freshly_approved && (args.max_uses != 1 || result.is_err()) {
         report_reuse_budget(cfg, http, &args, grant_id).await;
     }
     result
@@ -1609,10 +1635,18 @@ async fn report_reuse_budget(
                     info.not_after.to_rfc3339()
                 );
             } else {
+                // Reachable under `--max-uses 1` now that a failed call reports
+                // too, so the "narrowed from" clause has to be conditional —
+                // "narrowed from the 1 requested" would describe a narrowing
+                // that never happened.
+                let narrowed = if args.max_uses == 1 {
+                    String::new()
+                } else {
+                    format!(" (narrowed from the {} requested)", args.max_uses)
+                };
                 eprintln!(
-                    "keychute: grant {grant_id} was approved for a single use \
-                     (narrowed from the {} requested), and this call spent it",
-                    args.max_uses
+                    "keychute: grant {grant_id} was approved for a single use{narrowed}, \
+                     and this call spent it"
                 );
             }
         }
@@ -1713,17 +1747,12 @@ async fn proxy_call(
     // upstream is free to answer 600: `is_client_error`/`is_server_error` are
     // both false there, so class-based checks would quietly hand a documented
     // failure back as a success with its body printed.
-    if args.fail && status.as_u16() >= 400 {
-        return Err(fail(
-            EXIT_OTHER,
-            format!(
-                "{} {} returned {} (--fail)",
-                method,
-                target.display(),
-                status
-            ),
-        ));
-    }
+    //
+    // Decided here but ACTED ON below the header block: curl has printed the
+    // headers of a failing response under `-i -f` since 7.75.0, and 8.5.0 does
+    // (`curl -sfi` against a 404 writes the status line and headers, no body,
+    // exit 22). `--fail` suppresses the body, not the record of what came back.
+    let failed = args.fail && status.as_u16() >= 400;
     if status.is_redirection() {
         // Neither side follows redirects: the credential must not be replayed
         // at a location nobody approved. Say so, since curl users expect -L
@@ -1756,6 +1785,22 @@ async fn proxy_call(
         }
         head.extend_from_slice(b"\r\n");
         write_all(&mut sink, &head)?;
+    }
+    // The body, and only the body, is what `--fail` withholds. Flushed first
+    // because the return abandons the sink, and a buffered `--output` file
+    // would otherwise keep the headers that were just written to it.
+    if failed {
+        sink.flush()
+            .map_err(|e| fail(EXIT_OTHER, format!("failed flushing the response: {e}")))?;
+        return Err(fail(
+            EXIT_OTHER,
+            format!(
+                "{} {} returned {} (--fail)",
+                method,
+                target.display(),
+                status
+            ),
+        ));
     }
     // Tracked so the newline below is added only when the output actually
     // needs one — see there.
@@ -1847,9 +1892,15 @@ mod tests {
         assert!(parse_target("https://api.example.com/v1?to=alice\u{0}").is_err());
         assert!(parse_target("\u{1}https://api.example.com/v1").is_err());
         assert!(parse_target("https://api.example.com/v1?a=1\u{7f}").is_err());
-        // Spaces at either end are trimmed the same way.
+        // Spaces at either end are trimmed the same way — and one in the
+        // MIDDLE is kept but re-spelled: `raw_path_and_query` hands the
+        // approval text and the call binding `account=a b`, while `proxy_call`
+        // re-parses the assembled URL and sends `account=a%20b`. curl 8.5.0
+        // refuses all three as a malformed URL rather than encoding for you.
         assert!(parse_target("https://api.example.com/v1?a=1 ").is_err());
         assert!(parse_target(" https://api.example.com/v1").is_err());
+        assert!(parse_target("https://api.example.com/v1?account=a b").is_err());
+        assert!(parse_target("https://api.example.com/a b").is_err());
         // Percent-encoded, they are ordinary bytes and survive verbatim.
         assert_eq!(
             parse_target("https://api.example.com/v1?amount=1%0A000")
@@ -2742,9 +2793,27 @@ mod tests {
         let enc = parse_target("https://api.example.com/files/a%20b").unwrap();
         assert!(constraints_for(&enc, "GET", &[], &["/files/a b".into()], 300, 1).is_ok());
         assert!(constraints_for(&enc, "GET", &[], &["/files/a%20b".into()], 300, 1).is_ok());
-        // A prefix with no canonical form is left to the server rather than
-        // refused locally on a guess.
-        assert!(constraints_for(&enc, "GET", &[], &["/files%2Fa".into()], 300, 1).is_ok());
+        // A prefix with no canonical form is a configuration error, not a
+        // guess to defer: `api/requests.rs` canonicalizes every prefix it is
+        // sent and rejects the request when one fails, so this can only end in
+        // an invalid-request — and deferring would let `-d @-` block on a
+        // producer first. Each spelling the server refuses, refused here.
+        for bad in [
+            "/files%2Fa",
+            "/files\\a",
+            "/files/../admin",
+            "/files/%2e%2e/admin",
+            "/files//a",
+            "/files/a%zz",
+            "/files/a%",
+            "/files/..;x",
+        ] {
+            let err = constraints_for(&enc, "GET", &[], &[bad.into()], 300, 1).unwrap_err();
+            assert!(
+                err.contains("the broker refuses"),
+                "{bad} should be refused locally, got {err}"
+            );
+        }
     }
 
     fn err_body(code: &str) -> String {

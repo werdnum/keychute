@@ -374,6 +374,39 @@ async fn a_keychute_refusal_exits_denied() {
     assert!(stderr.contains("policy-denied"), "{stderr}");
 }
 
+/// A freshly approved grant's ID is printed when the FIRST call fails, even
+/// under the default `--max-uses 1` where a successful call prints nothing.
+/// The failure may have come before the proxy accounted the use, leaving the
+/// approval intact — and since the default idempotency key is random, a
+/// re-run without the ID asks a human to approve the same thing over again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_first_call_still_reports_the_approved_grant() {
+    let (base, _st) = spawn_mock(ProxyMode::KeychuteError(
+        StatusCode::BAD_GATEWAY,
+        "upstream-unreachable",
+    ))
+    .await;
+
+    let (code, _stdout, stderr) = tokio::task::spawn_blocking(move || {
+        run_cli(
+            &base,
+            &[
+                "curl",
+                "https://api.example.com/v1/x",
+                "--secret",
+                "example-api-token",
+            ],
+        )
+    })
+    .await
+    .unwrap();
+    assert_ne!(code, 0, "the call failed");
+    assert!(
+        stderr.contains(GRANT_ID) && stderr.contains("--grant-id"),
+        "the caller needs the ID to reuse the approval instead of asking again: {stderr}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn an_upstream_403_is_data_not_a_denial() {
     // Same status and body shape as the refusal above, minus the marker
@@ -442,6 +475,41 @@ async fn include_prepends_the_response_head() {
     assert!(out.starts_with("HTTP/1.1 200 OK\r\n"), "{out}");
     assert!(out.contains("x-upstream: yes"), "{out}");
     assert!(out.contains("\r\n\r\n{\"ok\":true"), "head/body separator");
+}
+
+/// `--fail` withholds the BODY, not the head. curl has printed the headers of
+/// a failing response under `-i -f` since 7.75.0; 8.5.0 writes the status line
+/// and headers, no body, and exits 22. Suppressing both would leave a caller
+/// who asked to see what came back with nothing to diagnose from.
+#[tokio::test(flavor = "multi_thread")]
+async fn include_still_prints_the_head_when_fail_suppresses_the_body() {
+    let (base, _st) = spawn_mock(ProxyMode::UpstreamError(StatusCode::NOT_FOUND)).await;
+    let (code, stdout, stderr) = tokio::task::spawn_blocking(move || {
+        run_cli(
+            &base,
+            &[
+                "curl",
+                "https://api.example.com/v1/x",
+                "--grant-id",
+                GRANT_ID,
+                "-i",
+                "--fail",
+            ],
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(code, 1, "{stderr}");
+    let out = String::from_utf8_lossy(&stdout);
+    assert!(out.starts_with("HTTP/1.1 404 Not Found\r\n"), "{out}");
+    assert!(
+        out.ends_with("\r\n\r\n"),
+        "the head, and nothing after it: {out}"
+    );
+    assert!(
+        !out.contains("upstream"),
+        "--fail still suppresses the body"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
