@@ -1279,7 +1279,16 @@ fn open_output(args: &CurlArgs) -> CliResult<Option<std::fs::File>> {
 ///
 /// Checked here rather than at open time because by then the damage is the
 /// thing being prevented, and because a preflight refusal costs no approval.
+///
+/// Scoped to the case where the file is what this call actually authenticates
+/// with. `Config::bearer` prefers `KEYCHUTE_TOKEN` outright, so with one set the
+/// file is never read and emptying it cannot strand anything — and refusing
+/// there would block the one genuinely useful shape of this command: an override
+/// token used to REFRESH the token file.
 fn refuse_output_over_token_file(cfg: &Config, args: &CurlArgs) -> CliResult<()> {
+    if cfg.token.is_some() {
+        return Ok(());
+    }
     let (Some(out), Some(token_file)) = (args.output.as_ref(), cfg.token_file.as_ref()) else {
         return Ok(());
     };

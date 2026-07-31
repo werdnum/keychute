@@ -706,6 +706,53 @@ async fn output_over_the_token_file_is_refused_before_anything_is_spent() {
     assert!(st.proxied.lock().unwrap().is_empty());
 }
 
+/// The other side of the same protection. `Config::bearer` prefers
+/// `KEYCHUTE_TOKEN` outright, so with one set the token file is never read and
+/// writing over it strands nothing — and refusing there would block the one
+/// genuinely useful shape of this command: an override token used to refresh
+/// the token file.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unused_token_file_may_be_written_over() {
+    let (base, st) = spawn_mock(ProxyMode::Upstream).await;
+    let dir = std::env::temp_dir().join(format!("keychute-unused-{}", Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let token_file = dir.join("token");
+    std::fs::write(&token_file, "stale-token\n").unwrap();
+
+    let tf = token_file.clone();
+    let (code, stderr) = tokio::task::spawn_blocking(move || {
+        let out = Command::new(cli_bin())
+            .args([
+                "curl",
+                "https://api.example.com/v1/things",
+                "--grant-id",
+                GRANT_ID,
+                "-o",
+                tf.to_str().unwrap(),
+            ])
+            .env("KEYCHUTE_URL", &base)
+            .env("KEYCHUTE_TOKEN", "client-token")
+            .env("KEYCHUTE_TOKEN_FILE", &tf)
+            .env_remove("KEYCHUTE_CONTEXT")
+            .output()
+            .expect("running keychute CLI");
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(st.proxied.lock().unwrap().len(), 1);
+    assert_eq!(
+        std::fs::read(&token_file).unwrap(),
+        UPSTREAM_BODY,
+        "the file this call never authenticated with is refreshed, not protected"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unwritable_output_path_fails_before_the_request_is_sent() {
     let (base, st) = spawn_mock(ProxyMode::Upstream).await;
