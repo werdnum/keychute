@@ -5,7 +5,12 @@ use keychute_e2e::*;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn authn_and_mechanism_caps() {
-    let env = TestEnv::spawn(SpawnOpts::default()).await.unwrap();
+    let env = TestEnv::spawn(SpawnOpts {
+        clients_yaml: Some(clients_yaml(&["brokered", "autofill"], &["cli-read"])),
+        ..SpawnOpts::default()
+    })
+    .await
+    .unwrap();
 
     // No credentials → 401.
     let resp = reqwest::Client::new()
@@ -25,7 +30,10 @@ async fn authn_and_mechanism_caps() {
     assert_eq!(status, 401, "{body}");
     assert_eq!(body["error"]["code"], "unauthenticated");
 
-    // k8s-agent may only use cli-read: a brokered request is denied.
+    // A client may not use a mechanism it is not registered for. This env
+    // deliberately narrows k8s-agent to cli-read (the cluster grants it
+    // brokered too), so the cap is what refuses the brokered request below
+    // rather than the client happening to be capable of it.
     let (status, body) = env
         .k8s()
         .create_request(brokered_request(

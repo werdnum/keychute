@@ -7,6 +7,13 @@
 //! rejected outright: an all-slash prefix would strip to the empty string in
 //! `prefix_matches` and become unconstrained, and upstream servers disagree on
 //! whether `//` aliases `/`, so the ambiguity is refused at the door.
+//!
+//! This lives in the shared types crate, not in the server, because clients
+//! need the same answer BEFORE they spend a human approval — a client that
+//! judges a path "covered" when the proxy would refuse it wakes an operator
+//! for a call that was never going to work. Sharing the code is what makes
+//! those client-side preflights honest; a reimplementation kept in step by
+//! comment is the thing this replaces.
 
 /// Canonicalize the raw path portion of a URL (no query string).
 ///

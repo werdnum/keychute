@@ -1,21 +1,89 @@
-//! Grant read endpoint: single logical release with idempotent replay.
+//! Grant endpoints: metadata lookup, and the single logical release with
+//! idempotent replay.
 
 use crate::api::error::ApiFailure;
-use crate::api::{owned_grant, revalidate_grant};
+use crate::api::{owned_grant, path_id, revalidate_grant};
 use crate::audit::{insert_audit, kinds, AuditEvent};
 use crate::authn::client::authenticate_client;
 use crate::crypto::{AadContext, SecretBytes};
 use crate::db;
 use crate::state::AppState;
 use axum::body::Bytes;
+use axum::extract::rejection::PathRejection;
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use base64::Engine;
-use keychute_types::{Mechanism, ReadGrantRequest, ReadGrantResponse, SecretEncoding};
+use keychute_types::{
+    Constraints, GrantInfo, Mechanism, ReadGrantRequest, ReadGrantResponse, SecretEncoding,
+};
 use secrecy::ExposeSecret;
-use uuid::Uuid;
+
+/// `GET /v1/grants/{id}` — non-secret metadata about a grant the caller owns.
+///
+/// Exists because a client that comes back to a grant later cannot otherwise
+/// see what it actually holds. Two things make that a correctness problem, not
+/// a convenience one:
+///
+/// * The proxy takes the upstream origin from the GRANT, never from the
+///   caller's request URL. A caller that reuses a grant against a different
+///   origin gets its request delivered to the approved one — silently, with
+///   whatever side effect it carries. Only the grant can settle where a call
+///   is really going.
+/// * Approval may NARROW `ttl_seconds`/`max_uses`, so what the client asked
+///   for is not what it got.
+///
+/// Read-only and owner-scoped (a grant belonging to another client is 404, like
+/// every other grant route). Deliberately does NOT revalidate or touch use
+/// accounting: it reports the row, including a revoked or expired one, because
+/// "this grant is dead" is precisely what a caller needs to learn here rather
+/// than at the moment it applies a side effect.
+pub async fn info(
+    State(state): State<AppState>,
+    id: Result<Path<String>, PathRejection>,
+    headers: HeaderMap,
+) -> Result<Json<GrantInfo>, ApiFailure> {
+    let client = authenticate_client(&state, &headers).await?;
+    let grant = owned_grant(&state, &client, path_id(id)?).await?;
+    let mechanism = Mechanism::from_str_opt(&grant.mechanism)
+        .ok_or_else(|| ApiFailure::Internal(anyhow::anyhow!("unknown grant mechanism")))?;
+    let mut constraints: Constraints = serde_json::from_value(grant.constraints.clone())
+        .map_err(|e| ApiFailure::Internal(e.into()))?;
+    // `grant.constraints` is the REQUESTED json, stored verbatim at approval;
+    // an operator who narrows the TTL or use count changes only the
+    // `not_after` and `max_uses` columns (see `ui::approve`). Returning that
+    // json untouched would report the request back as though it were the
+    // grant — the exact confusion this endpoint exists to remove — so the two
+    // narrowable fields are replaced with what was actually granted before
+    // anything leaves. Everything else in the json (origins, methods, path
+    // prefixes) is not narrowable and is already the granted truth.
+    constraints.max_uses = grant.max_uses.map(|v| v.max(0) as u32);
+    // Rounded, not truncated: `not_after` is computed from a clock read taken
+    // a hair before the row's `created_at`, so a 600s grant spans 599.99s and
+    // truncation would report 599 — a value nobody chose, and one that reads
+    // as an off-by-one to anyone comparing it against what they asked for.
+    constraints.ttl_seconds = {
+        let millis = (grant.not_after - grant.created_at)
+            .num_milliseconds()
+            .max(0);
+        ((millis + 500) / 1000) as u64
+    };
+    Ok(Json(GrantInfo {
+        grant_id: grant.id,
+        mechanism,
+        constraints,
+        not_after: grant.not_after,
+        // The column is i32 and never negative in practice; clamp rather than
+        // surface a negative use budget if it ever were.
+        max_uses: grant.max_uses.map(|v| v.max(0) as u32),
+        use_count: grant.use_count.max(0) as u32,
+        revoked: grant.revoked,
+        // The clock `not_after` is judged against, so that a client deciding
+        // "expired" locally decides it the same way `begin_grant_use` will.
+        server_time: Some(db::db_now(&state.db).await?),
+    }))
+}
 
 /// Decrypt a grant's passthrough payload. Any failure — including a nulled
 /// payload or a process restart under the ephemeral KEK — is `payload-lost`.
@@ -72,11 +140,13 @@ fn open_secret_version(
 /// POST /v1/grants/{id}/read
 pub async fn read(
     State(state): State<AppState>,
-    Path(id): Path<Uuid>,
+    id: Result<Path<String>, PathRejection>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Result<Bytes, axum::extract::rejection::BytesRejection>,
 ) -> Result<Response, ApiFailure> {
+    let body = crate::api::body_bytes(body)?;
     let client = authenticate_client(&state, &headers).await?;
+    let id = path_id(id)?;
     let req: ReadGrantRequest = serde_json::from_slice(&body)
         .map_err(|_| ApiFailure::InvalidRequest("malformed request body"))?;
     if req.idempotency_key.is_empty() {

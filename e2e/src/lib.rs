@@ -206,6 +206,19 @@ async fn record_and_respond(
     let path = rec.path.clone();
     records.lock().unwrap().push(rec);
 
+    if path.ends_with("/forge-error") {
+        // An upstream trying to pass itself off as Keychute. The proxy strips
+        // the marker header, so a client cannot be talked into treating this
+        // as a policy denial (or a payload loss worth re-approving).
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            [("x-keychute-error", "policy-denied")],
+            axum::Json(serde_json::json!({
+                "error": {"code": "policy-denied", "message": "forged"},
+            })),
+        )
+            .into_response();
+    }
     if path.ends_with("/redirect") {
         return (
             axum::http::StatusCode::FOUND,
@@ -378,6 +391,36 @@ fn free_port() -> u16 {
     listener.local_addr().unwrap().port()
 }
 
+/// The `clients:` block for a test server: family-assistant and k8s-agent with
+/// the given mechanism lists, authenticated by the suite's fixed tokens.
+///
+/// Mirrors the cluster registration in `werdnum/kube-config`
+/// (`helm-values/workloads/keychute/values.yaml`), where k8s-agent holds
+/// `brokered` + `cli-read`. Parameterized because a test that checks the
+/// mechanism CAP needs a client that lacks the mechanism it asks for, and
+/// hardcoding one client as the perpetual outsider makes that test quietly
+/// vacuous the day the operator grants it.
+pub fn clients_yaml(fa_mechanisms: &[&str], k8s_mechanisms: &[&str]) -> String {
+    format!(
+        "clients:\n\
+         \x20 - name: family-assistant\n\
+         \x20   max_tier: trusted-client\n\
+         \x20   mechanisms: [{fa_mechs}]\n\
+         \x20   auth:\n\
+         \x20     api_token_sha256: \"{fa}\"\n\
+         \x20 - name: k8s-agent\n\
+         \x20   max_tier: cooperating-client\n\
+         \x20   mechanisms: [{k8s_mechs}]\n\
+         \x20   may_store_secrets: true\n\
+         \x20   auth:\n\
+         \x20     api_token_sha256: \"{k8s}\"\n",
+        fa_mechs = fa_mechanisms.join(", "),
+        k8s_mechs = k8s_mechanisms.join(", "),
+        fa = sha256_hex(FA_TOKEN),
+        k8s = sha256_hex(K8S_TOKEN),
+    )
+}
+
 pub fn sha256_hex(s: &str) -> String {
     hex::encode(sha2::Sha256::digest(s.as_bytes()))
 }
@@ -421,24 +464,10 @@ impl TestEnv {
         // Config.
         let server_port = free_port();
         let external_url = format!("http://127.0.0.1:{server_port}");
-        let clients_yaml = opts.clients_yaml.clone().unwrap_or_else(|| {
-            format!(
-                "clients:\n\
-                 \x20 - name: family-assistant\n\
-                 \x20   max_tier: trusted-client\n\
-                 \x20   mechanisms: [brokered, autofill]\n\
-                 \x20   auth:\n\
-                 \x20     api_token_sha256: \"{fa}\"\n\
-                 \x20 - name: k8s-agent\n\
-                 \x20   max_tier: cooperating-client\n\
-                 \x20   mechanisms: [cli-read]\n\
-                 \x20   may_store_secrets: true\n\
-                 \x20   auth:\n\
-                 \x20     api_token_sha256: \"{k8s}\"\n",
-                fa = sha256_hex(FA_TOKEN),
-                k8s = sha256_hex(K8S_TOKEN),
-            )
-        });
+        let clients_yaml = opts
+            .clients_yaml
+            .clone()
+            .unwrap_or_else(|| clients_yaml(&["brokered", "autofill"], &["brokered", "cli-read"]));
         let config = format!(
             "listen_addr: \"127.0.0.1:{server_port}\"\n\
              external_url: \"{external_url}\"\n\
@@ -789,6 +818,38 @@ impl TestEnv {
         .fetch_all(&self.db)
         .await
         .expect("audit query")
+    }
+
+    /// Audit kinds for a request, waited for until every `wanted` kind is
+    /// present.
+    ///
+    /// The completion rows — `release-completed`, `proxy-completed` — are
+    /// written by a DETACHED task on purpose (`api/grants.rs`): holding the
+    /// response for them could keep a secret alive past its replay window.
+    /// So a client that has its answer is no evidence the row has landed, and
+    /// reading once races the insert — rarely on an idle machine, readily on a
+    /// loaded CI runner. Polling asserts what the server actually promises:
+    /// the row arrives, not that it arrives before the response does.
+    ///
+    /// Only for kinds that are expected to appear. An assertion that a kind is
+    /// ABSENT cannot be made this way — waiting proves nothing about a row
+    /// that was never going to be written — so those keep reading once.
+    pub async fn wait_for_audit_kinds(
+        &self,
+        request_id: uuid::Uuid,
+        wanted: &[&str],
+    ) -> Vec<String> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let kinds = self.audit_kinds_for_request(request_id).await;
+            if wanted.iter().all(|w| kinds.iter().any(|k| k == w)) {
+                return kinds;
+            }
+            if std::time::Instant::now() >= deadline {
+                return kinds;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     /// Send a raw HTTP/1.1 request (for request-targets reqwest would

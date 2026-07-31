@@ -15,8 +15,11 @@ v1 server-side implementation (design milestones M0–M3) plus packaging:
   (idempotent access requests, wait endpoint, grant read with idempotent
   replay, brokered proxy), server-rendered approval UI with CSRF, Pushover
   notifier with request-row outbox, audit log.
-- `cli/` — the `keychute` CLI: `keychute request <secret> | consumer…` to get a
-  secret out (human approval in the loop), and `… | keychute store <secret>` to
+- `cli/` — the `keychute` CLI: `keychute curl <url> --secret <name>` to make an
+  authenticated HTTP call without ever holding the credential (tier 0 — the
+  server attaches it and streams the response back), `keychute request <secret>
+  | consumer…` to get a secret out when a consumer genuinely needs the bytes
+  (tier 2, human approval in the loop), and `… | keychute store <secret>` to
   deposit a new one (opt-in per client, create-only — it never replaces a
   stored secret).
 - `types/` — shared API types.

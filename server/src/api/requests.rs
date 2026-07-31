@@ -9,6 +9,7 @@ use crate::notify::Notification;
 use crate::policy;
 use crate::state::{AppState, SlotKind};
 use axum::body::Bytes;
+use axum::extract::rejection::PathRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -314,8 +315,9 @@ fn approval_notification(
 pub async fn create(
     State(state): State<AppState>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Result<Bytes, axum::extract::rejection::BytesRejection>,
 ) -> Result<Response, ApiFailure> {
+    let body = crate::api::body_bytes(body)?;
     let client = authenticate_client(&state, &headers).await?;
 
     let req: CreateAccessRequest = serde_json::from_slice(&body)
@@ -664,11 +666,11 @@ async fn owned_request(
 /// GET /v1/access-requests/{id}
 pub async fn status(
     State(state): State<AppState>,
-    Path(id): Path<Uuid>,
+    id: Result<Path<String>, PathRejection>,
     headers: HeaderMap,
 ) -> Result<Response, ApiFailure> {
     let client = authenticate_client(&state, &headers).await?;
-    let row = owned_request(&state, &client, id).await?;
+    let row = owned_request(&state, &client, crate::api::path_id(id)?).await?;
     let status = status_from_row(&state, &row).await?;
     Ok(Json(status).into_response())
 }
@@ -683,11 +685,19 @@ pub struct WaitParams {
 /// request resolves or the (capped) timeout elapses; may return pending.
 pub async fn wait(
     State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-    Query(params): Query<WaitParams>,
+    id: Result<Path<String>, PathRejection>,
+    uri: axum::http::Uri,
     headers: HeaderMap,
 ) -> Result<Response, ApiFailure> {
+    // Deserialized here rather than by a `Query<WaitParams>` extractor for the
+    // same reason the id is: an extractor rejection is axum's, generated
+    // before the handler and carrying no marker, so `?timeout_seconds=abc`
+    // would answer a bare 400 that a client reading the header contract would
+    // attribute to an upstream.
+    let Query(params) = Query::<WaitParams>::try_from_uri(&uri)
+        .map_err(|_| ApiFailure::InvalidRequest("malformed query string"))?;
     let client = authenticate_client(&state, &headers).await?;
+    let id = crate::api::path_id(id)?;
     let row = owned_request(&state, &client, id).await?;
 
     let max = state.config.limits.wait_max_seconds;

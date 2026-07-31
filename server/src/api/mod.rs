@@ -68,12 +68,46 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/access-requests/{id}", get(requests::status))
         .route("/v1/access-requests/{id}/wait", get(requests::wait))
         .route("/v1/secrets", post(secrets::store))
+        .route("/v1/grants/{id}", get(grants::info))
         .route("/v1/grants/{id}/read", post(grants::read))
         .route("/v1/grants/{id}/proxy", any(crate::proxy::proxy_root))
+        // The upstream root spelled with its slash. `{*path}` below requires a
+        // non-empty suffix — the same axum rule that left `/v1` itself
+        // unrouted — so `…/proxy/` matched neither route and fell through to
+        // the catch-all 404. A target of `https://api.example.com` is an
+        // ordinary thing to call, and the CLI renders it exactly this way, so
+        // the grant was spent on an approval whose first use could not reach
+        // the upstream at all. `proxy_suffix` already normalizes both
+        // spellings to `/`; only the routing was missing.
+        .route("/v1/grants/{id}/proxy/", any(crate::proxy::proxy_root))
         .route(
             "/v1/grants/{id}/proxy/{*path}",
             any(crate::proxy::proxy_path),
         )
+        // The last two ways axum answers before a handler runs, and the last
+        // two unmarked errors on the API surface: a path under /v1 that
+        // matches no route, and a method no route accepts. Both are Keychute's
+        // own refusals — the marker is what stops a client attributing them to
+        // an upstream, and on these there is no upstream at all.
+        //
+        // Scoped to /v1 by an explicit catch-all route rather than a router
+        // fallback: the UI is merged into this router and its 404 belongs to a
+        // human reading HTML, not to the API's error envelope. The proxy's own
+        // relayed upstream responses are untouched by either — they come back
+        // through a handler, which is exactly why this is done here and not as
+        // a blanket response middleware that could not tell the two apart.
+        //
+        // Three routes, not one: axum's `{*rest}` requires a non-empty suffix,
+        // so `/v1` itself matches neither the real routes nor the catch-all
+        // and would fall through to the default 404 — unmarked, and without
+        // the envelope — which is precisely the hole this closes. `/v1/` is
+        // the same hole spelled with the slash: the wildcard's capture is
+        // empty, and axum does not redirect a trailing slash onto the exact
+        // route, so it needs its own.
+        .route("/v1", any(|| async { ApiFailure::NotFound }))
+        .route("/v1/", any(|| async { ApiFailure::NotFound }))
+        .route("/v1/{*rest}", any(|| async { ApiFailure::NotFound }))
+        .method_not_allowed_fallback(|| async { ApiFailure::MethodNotAllowed })
         .with_state(state)
 }
 
@@ -98,6 +132,55 @@ pub(crate) async fn status_from_row(
         grant_id,
         deny_reason: row.deny_reason.clone(),
         expires_at: row.expires_at,
+    })
+}
+
+/// The id from a `/v1/...{id}...` path, parsed INSIDE the handler.
+///
+/// A `Path<Uuid>` extractor rejects a malformed id before any handler runs, and
+/// axum's own rejection is a bare 400 with no [`error::KEYCHUTE_ERROR_HEADER`]
+/// on it. That breaks the contract every other error response here keeps — the
+/// marker is how a client tells a Keychute answer from an upstream's, and on
+/// these routes an unmarked 400 is Keychute's own. `proxy.rs` already parses
+/// the id in the handler for exactly this reason; these routes now do too.
+///
+/// `NotFound`, not a parse error: a malformed id is certainly not a resource
+/// this client owns, and the answer must not distinguish "malformed" from
+/// "someone else's" any more than the ownership check does.
+///
+/// Takes the extractor's `Result` rather than the captured string, because
+/// `Path<String>` has a rejection of its own: it percent-decodes the segment
+/// first, so `/v1/grants/%FF` fails on invalid UTF-8 before the handler runs
+/// and answers the same bare, unmarked 400 that `Path<Uuid>` did. Handlers
+/// therefore never let the extractor reject; they pass its outcome through
+/// here, and both spellings of "that is not an id" land on the same marked
+/// answer.
+pub(crate) fn path_id(
+    raw: Result<axum::extract::Path<String>, axum::extract::rejection::PathRejection>,
+) -> Result<Uuid, ApiFailure> {
+    raw.map_err(|_| ApiFailure::NotFound)?
+        .0
+        .parse::<Uuid>()
+        .map_err(|_| ApiFailure::NotFound)
+}
+
+/// A `Bytes` body, with axum's rejection turned into a marked failure.
+///
+/// The body extractors carry a length limit, and exceeding it rejects before
+/// the handler runs — a bare 413 with no [`error::KEYCHUTE_ERROR_HEADER`], the
+/// same gap the id, query, route and method rejections had. Handlers take the
+/// `Result` and pass it through here so an oversize or unreadable body is
+/// Keychute's own error, marked like the rest.
+pub(crate) fn body_bytes(
+    body: Result<axum::body::Bytes, axum::extract::rejection::BytesRejection>,
+) -> Result<axum::body::Bytes, ApiFailure> {
+    use axum::response::IntoResponse as _;
+    body.map_err(|rejection| {
+        if rejection.into_response().status() == StatusCode::PAYLOAD_TOO_LARGE {
+            ApiFailure::BodyTooLarge
+        } else {
+            ApiFailure::InvalidRequest("request body could not be read")
+        }
     })
 }
 

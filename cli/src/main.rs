@@ -1,5 +1,12 @@
-//! keychute CLI: request secrets from a Keychute server (CUJ 2, tier-2 cli-read),
-//! and deposit new ones (`keychute store`, reading the value from stdin).
+//! keychute CLI: make authenticated HTTP calls without ever holding the
+//! credential (`keychute curl`, CUJ 1, tier-0 brokered), request secrets from
+//! a Keychute server (CUJ 2, tier-2 cli-read), and deposit new ones
+//! (`keychute store`, reading the value from stdin).
+//!
+//! `curl` is the one to reach for first: it needs no staging file and no
+//! discipline about what stdout touches, because the secret stays server-side
+//! and only the upstream's response comes back. `request` is for when a
+//! consumer genuinely needs the bytes.
 //!
 //! The secret goes to STDOUT and nowhere else; all diagnostics go to stderr.
 //! Nothing ever puts a secret value in argv — `store` reads stdin or a file.
@@ -8,6 +15,7 @@
 //! (including an expired grant), 5 payload lost, 1 anything else (including a
 //! grant whose uses are already exhausted).
 
+mod curl;
 mod pipeline;
 
 use std::io::{IsTerminal, Read, Write};
@@ -24,11 +32,11 @@ use serde::Deserialize;
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
-const EXIT_OTHER: i32 = 1;
-const EXIT_CONFIG: i32 = 2;
-const EXIT_DENIED: i32 = 3;
-const EXIT_TIMEOUT: i32 = 4;
-const EXIT_PAYLOAD_LOST: i32 = 5;
+pub(crate) const EXIT_OTHER: i32 = 1;
+pub(crate) const EXIT_CONFIG: i32 = 2;
+pub(crate) const EXIT_DENIED: i32 = 3;
+pub(crate) const EXIT_TIMEOUT: i32 = 4;
+pub(crate) const EXIT_PAYLOAD_LOST: i32 = 5;
 
 /// How long a single long-poll on the wait endpoint asks the server to hold.
 const WAIT_POLL_SECONDS: u64 = 60;
@@ -60,6 +68,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Make an authenticated HTTP request through Keychute's broker. The
+    /// credential is attached server-side and never enters this container.
+    ///
+    /// Curl-SHAPED, not a curl: the flags listed here are the whole surface,
+    /// they behave as curl's do, and anything absent is absent on purpose.
+    Curl(curl::CurlArgs),
     /// Request a secret; once approved, print it to stdout.
     Request(RequestArgs),
     /// Store a NEW secret, read from stdin (never printed, never in argv).
@@ -127,27 +141,42 @@ struct StoreArgs {
 }
 
 /// A terminal failure: message for stderr plus the process exit code.
-struct Failure {
-    code: i32,
-    message: String,
+#[derive(Debug)]
+pub(crate) struct Failure {
+    pub(crate) code: i32,
+    pub(crate) message: String,
+    /// Keychute's own refusal, identified by the marker header — as opposed to
+    /// a transport failure or an upstream's answer. The distinction matters
+    /// after a grant has been approved: a refusal is the server's considered
+    /// answer about THIS grant and will be repeated, while a dropped
+    /// connection says nothing about whether the grant is still good.
+    pub(crate) keychute_refusal: bool,
 }
 
-fn fail(code: i32, message: impl Into<String>) -> Failure {
+pub(crate) fn fail(code: i32, message: impl Into<String>) -> Failure {
     Failure {
         code,
         message: message.into(),
+        keychute_refusal: false,
     }
 }
 
-type CliResult<T> = Result<T, Failure>;
+impl Failure {
+    pub(crate) fn refused_by_keychute(mut self) -> Self {
+        self.keychute_refusal = true;
+        self
+    }
+}
 
-struct Config {
+pub(crate) type CliResult<T> = Result<T, Failure>;
+
+pub(crate) struct Config {
     /// Base URL of the Keychute API (KEYCHUTE_URL).
-    url: String,
+    pub(crate) url: String,
     /// External/UI base URL used only for the approval hint printed to stderr.
-    external_url: String,
+    pub(crate) external_url: String,
     token: Option<String>,
-    token_file: Option<PathBuf>,
+    pub(crate) token_file: Option<PathBuf>,
     ca_bundle: Option<PathBuf>,
 }
 
@@ -199,7 +228,7 @@ impl Config {
 
     /// Bearer token for one request. The token file is re-read on every call
     /// because projected service-account tokens rotate.
-    fn bearer(&self) -> CliResult<String> {
+    pub(crate) fn bearer(&self) -> CliResult<String> {
         if let Some(t) = &self.token {
             return Ok(t.clone());
         }
@@ -221,16 +250,35 @@ impl Config {
     }
 }
 
+/// The only header this CLI sets on its own behalf.
+pub(crate) const DEFAULT_USER_AGENT: &str = concat!("keychute-cli/", env!("CARGO_PKG_VERSION"));
+
 fn build_http_client(cfg: &Config) -> CliResult<reqwest::Client> {
+    build_http_client_with(cfg, Some(DEFAULT_USER_AGENT))
+}
+
+/// `user_agent: None` builds a client that sends no `User-Agent` at all.
+///
+/// That is not a stylistic option: `curl -H 'User-Agent:'` means *remove* the
+/// header, the broker forwards `User-Agent` upstream unchanged, and reqwest
+/// fills a default into any request that lacks one — so the removal can only
+/// be honoured by a client that has no default to fill in. Sending an empty
+/// value instead would be a present-but-empty header, which is the thing the
+/// removal spelling exists to avoid.
+pub(crate) fn build_http_client_with(
+    cfg: &Config,
+    user_agent: Option<&str>,
+) -> CliResult<reqwest::Client> {
     // Never follow redirects. Every call here carries the bearer token, `read`
     // carries a released secret back, and `store` carries the credential in
     // the request BODY — which a 307/308 replays verbatim at the new origin
     // even where reqwest would strip a cross-origin `Authorization` header. A
     // redirect from a secrets API is a misconfiguration or an attack, not a
     // route to follow; it surfaces as a 3xx error instead.
-    let mut builder = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .user_agent(concat!("keychute-cli/", env!("CARGO_PKG_VERSION")));
+    let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+    if let Some(ua) = user_agent {
+        builder = builder.user_agent(ua);
+    }
     if let Some(path) = &cfg.ca_bundle {
         let pem = std::fs::read(path).map_err(|e| {
             fail(
@@ -256,13 +304,13 @@ fn build_http_client(cfg: &Config) -> CliResult<reqwest::Client> {
 /// Lenient view of the server's access-request status responses: the create
 /// response may omit fields (`expires_at`) that the full status object carries.
 #[derive(Debug, Deserialize)]
-struct StatusResponse {
-    request_id: Uuid,
-    state: RequestState,
+pub(crate) struct StatusResponse {
+    pub(crate) request_id: Uuid,
+    pub(crate) state: RequestState,
     #[serde(default)]
-    grant_id: Option<Uuid>,
+    pub(crate) grant_id: Option<Uuid>,
     #[serde(default)]
-    deny_reason: Option<String>,
+    pub(crate) deny_reason: Option<String>,
 }
 
 /// Derive the grant-read idempotency key from the request's idempotency key.
@@ -276,7 +324,7 @@ fn read_idempotency_key(request_key: &str) -> String {
 /// safely under both. Checked up front so the failure is a clear usage error.
 const MAX_REQUEST_IDEM_KEY_BYTES: usize = 124;
 
-fn validate_idempotency_key(key: &str) -> Result<(), String> {
+pub(crate) fn validate_idempotency_key(key: &str) -> Result<(), String> {
     if key.is_empty() {
         return Err("idempotency key must not be empty".into());
     }
@@ -328,23 +376,77 @@ fn validate_api_url(url: &str, allow_insecure: bool) -> Result<(), String> {
     }
 }
 
+/// The server refuses a `context.structured` over 16 KiB (`requests.rs`). The
+/// capture below is a courtesy for the approving human, so it must never be the
+/// reason a request is refused — an agent whose parent process has a long
+/// command line (a wrapper invoked with a large inline payload, say) would
+/// otherwise find every `keychute` call rejected for a reason it did not choose
+/// and cannot act on. Each captured command is clipped to fit.
+const MAX_STRUCTURED_COMMAND_CHARS: usize = 400;
+
+/// The server's own cap on `context.structured`, mirrored so the shedding
+/// below aims at the same bar the server applies.
+pub(crate) const MAX_STRUCTURED_BYTES: usize = 16 * 1024;
+
+fn json_len(map: &serde_json::Map<String, serde_json::Value>) -> usize {
+    serde_json::to_vec(map).map(|v| v.len()).unwrap_or(0)
+}
+
+/// Clip one captured command line to [`MAX_STRUCTURED_COMMAND_CHARS`], marking
+/// the cut so the reader knows they are seeing a prefix. Clipping is on a char
+/// boundary; a `ps` line is not necessarily ASCII.
+fn clip_command(mut cmd: String) -> String {
+    if cmd.chars().count() <= MAX_STRUCTURED_COMMAND_CHARS {
+        return cmd;
+    }
+    let cut = cmd
+        .char_indices()
+        .nth(MAX_STRUCTURED_COMMAND_CHARS)
+        .map(|(i, _)| i)
+        .unwrap_or(cmd.len());
+    cmd.truncate(cut);
+    cmd.push('…');
+    cmd
+}
+
+/// Drop whole capture sections until the map fits the server's cap. Clipping
+/// bounds each entry, not their number, so this is the backstop; peers go
+/// first, being the less load-bearing of the two.
+///
+/// Public because a caller may add its own MANDATORY fields after the capture
+/// is built — `curl` adds the target the operator reads — and those fields
+/// have to be in the map before the shedding decides what fits. Running it
+/// only at build time would let a capture that fits on its own push a later,
+/// more important field over the line. Idempotent, so calling it again after
+/// an insertion is always safe.
+pub(crate) fn shed_structured_to_fit(map: &mut serde_json::Map<String, serde_json::Value>) {
+    for section in ["pipeline_siblings", "pipeline"] {
+        if json_len(map) <= MAX_STRUCTURED_BYTES {
+            return;
+        }
+        if map.remove(section).is_some() {
+            map.insert(format!("{section}_omitted"), serde_json::json!(true));
+        }
+    }
+}
+
 /// Assemble agent-asserted structured context: best-effort pipeline capture
 /// plus $KEYCHUTE_CONTEXT verbatim under `extra`.
-fn build_structured_context() -> Option<serde_json::Value> {
+pub(crate) fn build_structured_context() -> Option<serde_json::Value> {
     let mut map = serde_json::Map::new();
     if let Some(captured) = pipeline::capture() {
         // Agent-asserted: ancestor chain plus same-shell pipeline peers.
-        map.insert(
-            "pipeline".to_string(),
-            serde_json::json!(captured.ancestors),
-        );
+        let ancestors: Vec<String> = captured.ancestors.into_iter().map(clip_command).collect();
+        map.insert("pipeline".to_string(), serde_json::json!(ancestors));
         if !captured.siblings.is_empty() {
-            map.insert(
-                "pipeline_siblings".to_string(),
-                serde_json::json!(captured.siblings),
-            );
+            let siblings: Vec<String> = captured.siblings.into_iter().map(clip_command).collect();
+            map.insert("pipeline_siblings".to_string(), serde_json::json!(siblings));
         }
+        shed_structured_to_fit(&mut map);
     }
+    // `extra` is the caller's own text. If they blow the budget with it, that
+    // is a choice they made and can undo, so it is theirs to keep — unlike the
+    // capture above, which they never asked for.
     if let Ok(extra) = std::env::var("KEYCHUTE_CONTEXT") {
         map.insert("extra".to_string(), serde_json::Value::String(extra));
     }
@@ -356,7 +458,7 @@ fn build_structured_context() -> Option<serde_json::Value> {
 }
 
 /// Extract a human-readable message from an error response body.
-fn api_error_message(status: reqwest::StatusCode, body: &str) -> String {
+pub(crate) fn api_error_message(status: reqwest::StatusCode, body: &str) -> String {
     match serde_json::from_str::<ApiError>(body) {
         Ok(err) => format!("{} ({})", err.error.message, err.error.code),
         Err(_) => format!("server returned {status}"),
@@ -377,7 +479,7 @@ fn api_error_message(status: reqwest::StatusCode, body: &str) -> String {
 ///   callers surface it instead of treating it as "just ask again". Exit 1.
 ///
 /// An unknown or unparseable 410 body also gets the generic code.
-fn classify_gone(body: &str) -> Failure {
+pub(crate) fn classify_gone(body: &str) -> Failure {
     let code = serde_json::from_str::<ApiError>(body)
         .ok()
         .map(|e| e.error.code);
@@ -423,7 +525,9 @@ async fn run_request(cfg: &Config, http: &reqwest::Client, args: RequestArgs) ->
         return Err(fail(
             EXIT_CONFIG,
             format!(
-                "mechanism {} is not readable via the CLI (no plaintext release)",
+                "mechanism {} releases no plaintext, so `request` has nothing to print. \
+                 Brokered access is made through `keychute curl`, which sends the request \
+                 for you with the credential attached server-side",
                 mechanism.as_str()
             ),
         ));
@@ -502,7 +606,7 @@ async fn run_request(cfg: &Config, http: &reqwest::Client, args: RequestArgs) ->
 ///
 /// Retry discipline mirrors `read_grant`: transport errors, unreadable bodies
 /// and 5xx retry; a fully parsed 4xx is definitive.
-async fn create_access_request(
+pub(crate) async fn create_access_request(
     cfg: &Config,
     http: &reqwest::Client,
     body: &CreateAccessRequest,
@@ -573,7 +677,7 @@ async fn create_access_request(
 }
 
 /// Long-poll the wait endpoint until the request resolves or `deadline` passes.
-async fn wait_for_resolution(
+pub(crate) async fn wait_for_resolution(
     cfg: &Config,
     http: &reqwest::Client,
     request_id: Uuid,
@@ -1060,6 +1164,7 @@ async fn run(cli: Cli) -> CliResult<()> {
     let cfg = Config::from_env()?;
     let http = build_http_client(&cfg)?;
     match cli.cmd {
+        Cmd::Curl(args) => curl::run_curl(&cfg, &http, args).await,
         Cmd::Request(args) => run_request(&cfg, &http, args).await,
         Cmd::Store(args) => run_store(&cfg, &http, args).await,
         Cmd::Status { request_id } => run_status(&cfg, &http, &request_id).await,
@@ -1230,6 +1335,60 @@ mod tests {
         read_bounded(input.as_slice(), &mut buf).unwrap();
         assert!(strip_trailing_newline(&mut buf));
         assert_eq!(buf.len(), MAX_SECRET_BYTES);
+    }
+
+    #[test]
+    fn a_long_ancestor_command_line_cannot_sink_the_request() {
+        // A courtesy capture must never be the reason a request is refused.
+        let long = "x".repeat(MAX_STRUCTURED_BYTES * 2);
+        let clipped = clip_command(long);
+        assert_eq!(clipped.chars().count(), MAX_STRUCTURED_COMMAND_CHARS + 1);
+        assert!(clipped.ends_with('…'), "the cut is visible to the reader");
+        // Short lines and multi-byte ones are left alone, and the clip lands
+        // on a char boundary rather than splitting one.
+        assert_eq!(clip_command("ps -ax".into()), "ps -ax");
+        let wide = "é".repeat(MAX_STRUCTURED_COMMAND_CHARS + 10);
+        assert_eq!(
+            clip_command(wide).chars().count(),
+            MAX_STRUCTURED_COMMAND_CHARS + 1
+        );
+    }
+
+    #[test]
+    fn shedding_runs_again_once_a_mandatory_field_is_added() {
+        // A capture sized to land EXACTLY on the cap, so it fits on its own
+        // and has not one byte to spare.
+        let mut map = serde_json::Map::new();
+        map.insert("pipeline".to_string(), serde_json::json!([""]));
+        let filler = "x".repeat(MAX_STRUCTURED_BYTES - json_len(&map));
+        map.insert("pipeline".to_string(), serde_json::json!([filler]));
+        assert_eq!(json_len(&map), MAX_STRUCTURED_BYTES);
+        shed_structured_to_fit(&mut map);
+        assert!(map.contains_key("pipeline"), "it fits, so it stays");
+
+        // The target is mandatory and the capture is a courtesy, so adding the
+        // target must shed the capture rather than push the request over the
+        // server's cap and have it refused before anyone sees it.
+        map.insert("target".to_string(), serde_json::json!("GET https://x/y"));
+        map.insert("extra".to_string(), serde_json::json!("caller text"));
+        shed_structured_to_fit(&mut map);
+        assert!(json_len(&map) <= MAX_STRUCTURED_BYTES);
+        assert!(!map.contains_key("pipeline"));
+        assert_eq!(map["pipeline_omitted"], serde_json::json!(true));
+        // What the operator actually needs survives; so does the caller's own.
+        assert_eq!(map["target"], serde_json::json!("GET https://x/y"));
+        assert_eq!(map["extra"], serde_json::json!("caller text"));
+
+        // Peers go first: when dropping them alone gets under the cap, the
+        // ancestor chain stays.
+        let mut map = serde_json::Map::new();
+        map.insert("pipeline".to_string(), serde_json::json!(["sh -c x"]));
+        map.insert("pipeline_siblings".to_string(), serde_json::json!([""]));
+        let filler = "y".repeat(MAX_STRUCTURED_BYTES - json_len(&map) + 1);
+        map.insert("pipeline_siblings".to_string(), serde_json::json!([filler]));
+        shed_structured_to_fit(&mut map);
+        assert!(map.contains_key("pipeline"));
+        assert_eq!(map["pipeline_siblings_omitted"], serde_json::json!(true));
     }
 
     #[test]

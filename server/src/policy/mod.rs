@@ -4,7 +4,11 @@
 //! No IO here: the API layer maps DB rows into [`ClientRow`] / [`SecretRow`] /
 //! [`PolicyRow`] and calls [`evaluate`].
 
-pub mod paths;
+/// Path canonicalization and prefix matching live in `keychute-types` so the
+/// server and every client share ONE definition rather than keeping two in
+/// step by comment. Re-exported here because this is where the policy engine
+/// reaches for them.
+pub use keychute_types::paths;
 
 use chrono::{DateTime, Utc};
 use keychute_types::{Constraints, Mechanism, Origin, Tier};

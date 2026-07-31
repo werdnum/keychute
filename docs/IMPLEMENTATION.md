@@ -25,7 +25,8 @@ Milestones M0–M3 server-side, minus cluster wiring:
 - Human authn: pluggable — `static` mode (bearer token hash + subject, for
   dev/e2e) or `oidc` mode (JWT validation: issuer, audience, signature via JWKS,
   exp/nbf with skew, group/subject allowlist).
-- `keychute` CLI (request → wait → read → stdout; `store` for deposits).
+- `keychute` CLI (`curl` → wait → proxy → stdout for brokered HTTP;
+  `request` → wait → read → stdout for releasing tiers; `store` for deposits).
 - TLS: rustls listener when cert/key paths configured; plain HTTP otherwise
   (dev/e2e). Production charts always configure TLS.
 - Abuse guards: per-client pending-request cap, per-client concurrent wait cap,
@@ -104,7 +105,7 @@ clients:                   # declarative client provisioning (reconciled at star
       api_token_sha256: "<hex>"
   - name: k8s-agent
     max_tier: cooperating-client
-    mechanisms: [cli-read]
+    mechanisms: [brokered, cli-read]
     may_store_secrets: true   # optional, default false: allows POST /v1/secrets
     auth:
       service_account:
@@ -170,6 +171,12 @@ Path canonicalization: percent-decode once; reject if the decoded path contains
 `..` segments, or non-UTF8. Match prefixes at `/` boundaries only. The proxy
 forwards exactly the validated canonical path (re-encoded conservatively).
 
+This lives in `types/src/paths.rs`, not in the server, so clients share the
+one definition: a client that must decide *before* it wakes an operator —
+"does this grant cover this call?" — runs the same code the proxy will. A
+client-side reimplementation kept in step by comment is the failure mode this
+placement exists to prevent.
+
 ## HTTP API (all under `/v1`, JSON)
 
 Client authn: `Authorization: Bearer <api-token>` or
@@ -231,11 +238,37 @@ Client authn: `Authorization: Bearer <api-token>` or
   `client:<name>`, plus a best-effort FYI push. Not idempotent by design — a
   blind retry conflicts rather than silently rotating — so the CLI does not
   retry it.
+- `GET /v1/grants/{id}` — non-secret grant metadata for the OWNING client
+  (another client's grant is 404, like every grant route): mechanism,
+  constraints AS GRANTED, `not_after`, `max_uses`, `use_count`, `revoked`, and
+  `server_time` — the DB clock the expiry is judged against, so a client with a
+  skewed host does not decide "expired" differently from `begin_grant_use`. No
+  credential material and no secret name. Read-only: it neither revalidates nor
+  touches use accounting, and it reports revoked/expired grants rather than
+  hiding them. Exists because the proxy takes the upstream origin from the
+  GRANT, never from the caller's request URL — a client resuming a grant later
+  cannot otherwise tell that its request is about to be delivered somewhere
+  other than the URL it holds — and because approval may narrow
+  `ttl_seconds`/`max_uses`, so the requested constraints are not a safe
+  stand-in for the granted ones.
 - `ANY /v1/grants/{id}/proxy/{path...}` — brokered. Query string passthrough.
   The target origin comes from the grant (single-origin grants in v1: a brokered
   request must name exactly one origin). Method+path validated against grant.
   Body streamed up to limit. Response streamed back verbatim, redirects NOT
   followed. Strip-list + header synthesis per DESIGN §4.
+- Every error response Keychute generates itself carries
+  `X-Keychute-Error: <code>` — the same server-vocabulary code as the body.
+  The proxy routes parse the grant id from the raw path inside the handler
+  rather than via a `Path<Uuid>` extractor, because an extractor rejection is
+  produced by axum before any handler runs and would therefore go out
+  unmarked — a Keychute 400 that a client reads as an upstream answer, on a
+  call that never reached an upstream.
+  On the proxy path a caller otherwise cannot tell a Keychute `403
+  policy-denied` from an upstream's own `403`: same status, and an upstream may
+  well answer with the same `{"error": …}` shape. The CLI keys its exit codes
+  off this header (a Keychute refusal is exit 3; an upstream 4xx is a
+  successful call that returned an error document). The proxy strips the header
+  from every upstream response, so an upstream cannot forge one.
 - Grant access (read/proxy/wait) always revalidates: client enabled, mechanisms,
   max tiers, not revoked/expired, policy row still live (grant carries
   `not_after` already capped at approval time; revalidation re-checks client and
@@ -322,6 +355,12 @@ or Envoy-forwarded JWT in oidc mode):
 - All client-supplied context rendered via maud text nodes (auto-escaped) — never
   `PreEscaped` for anything client-derived. The approval page must render the
   server-parsed grant block separately from client context, labelled.
+- The grant block states that its path prefixes are the *canonical* (once-decoded)
+  forms the proxy matches and forwards, and a `target` string in the client's
+  structured context is promoted into its own labelled line marked as a claim.
+  A client may legitimately display `/users/%7Ealice` for a call the server
+  sends as `/users/~alice`; the page resolves that for the operator rather than
+  leaving each client to police its own spelling.
 
 ## DB schema (migrations)
 

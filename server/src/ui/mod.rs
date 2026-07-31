@@ -916,6 +916,17 @@ fn grant_block(mechanism: Mechanism, constraints: &Constraints, secret_line: Mar
                             ul .list-plain {
                                 @for p in &constraints.path_prefixes { li .mono { (p) } }
                             }
+                            // Stored canonical (`api/requests.rs` canonicalizes
+                            // every submitted prefix), and the proxy matches the
+                            // canonicalized request path against these. Say so:
+                            // a client is free to display `/users/%7Ealice`
+                            // while the path actually sent is `/users/~alice`,
+                            // and the line below is the one that decides.
+                            p .muted {
+                                "Canonical form: percent-escapes are decoded once. "
+                                "The request is matched and forwarded using these "
+                                "paths, whatever spelling the client shows below."
+                            }
                         }
                     }
                 }
@@ -934,6 +945,17 @@ fn grant_block(mechanism: Mechanism, constraints: &Constraints, secret_line: Mar
             }
         }
     }
+}
+
+/// The `target` a client may put in its structured context, if it is a string.
+///
+/// `keychute curl` writes `"target": "GET https://host/path?query"` here so the
+/// operator sees the query string, which no constraint covers. It is still
+/// client narration, so it is lifted out and labelled as a claim rather than
+/// left to read as fact among the other keys. It stays in the JSON below too:
+/// this promotes it, it does not launder it.
+fn claimed_target(structured: Option<&serde_json::Value>) -> Option<&str> {
+    structured?.get("target")?.as_str()
 }
 
 /// Client-asserted context block. ALL values here are untrusted client input
@@ -959,6 +981,27 @@ fn context_block(context: Option<&RequestContext>, mechanism: Mechanism) -> Mark
                     h3 { "Reason" }
                     @if ctx.reason.is_empty() { p .muted { "(no reason given)" } }
                     @else { p { (ctx.reason) } }
+                    // Brokered only. The caveat below describes what a BROKERED
+                    // grant constrains — an origin, a method, a canonical path,
+                    // and a query string forwarded as written. No other
+                    // mechanism has any of that, and `target` is a key any
+                    // client can put in its own context: on a cli-read or
+                    // autofill request this block would have told the operator
+                    // the server enforces protections that do not exist there,
+                    // on the strength of a string the client chose. The value
+                    // still renders below with the rest of the structured
+                    // context, as one more thing the client claims.
+                    @if let Some(target) = claimed_target(ctx.structured.as_ref())
+                        .filter(|_| mechanism == Mechanism::Brokered) {
+                        h3 { "Target claimed by the client" }
+                        p .mono { (target) }
+                        p .caveat {
+                            "A claim, not a constraint. What the server enforces is the "
+                            "origin, method and canonical path above; a query string is "
+                            "forwarded as written and is not constrained at all. Read this "
+                            "line for intent, and the block above for what it can do."
+                        }
+                    }
                     @if let Some(structured) = &ctx.structured {
                         h3 { "Structured context" }
                         pre {
@@ -3592,6 +3635,73 @@ mod tests {
         assert!(rendered.contains("3600"));
         assert!(rendered.contains("unlimited within TTL"));
         assert!(rendered.contains("the client never sees the secret"));
+        // The prefixes shown are the canonical ones the proxy matches, and the
+        // page says so — that is what lets a client display an escaped
+        // spelling without misleading anyone.
+        assert!(rendered.contains("Canonical form"));
+    }
+
+    /// A client-supplied `target` is promoted out of the JSON blob and marked
+    /// as a claim. It is the one context key an operator is likely to read as
+    /// fact, because it looks like a request line — so the page says outright
+    /// that the block above is what constrains the call.
+    #[test]
+    fn a_claimed_target_is_labelled_a_claim() {
+        let ctx = RequestContext {
+            reason: "ship it".to_owned(),
+            structured: Some(serde_json::json!({
+                "target": "GET https://api.example.com/users/%7Ealice?force=1",
+                "cwd": "/srv/app",
+            })),
+        };
+        let rendered = context_block(Some(&ctx), Mechanism::Brokered).into_string();
+        assert!(rendered.contains("Target claimed by the client"));
+        assert!(rendered.contains("A claim, not a constraint"));
+        // Promoted, not moved: the raw structured blob still shows everything.
+        assert!(rendered.contains("Structured context"));
+        assert!(rendered.contains("cwd"));
+        // Escaped like every other client string.
+        let ctx = RequestContext {
+            reason: String::new(),
+            structured: Some(serde_json::json!({ "target": "<img src=x>" })),
+        };
+        let rendered = context_block(Some(&ctx), Mechanism::Brokered).into_string();
+        assert!(rendered.contains("&lt;img src=x&gt;"));
+        assert!(!rendered.contains("<img src=x"));
+        // A non-string `target` is not a request line; no promoted line.
+        let ctx = RequestContext {
+            reason: String::new(),
+            structured: Some(serde_json::json!({ "target": 7 })),
+        };
+        let rendered = context_block(Some(&ctx), Mechanism::Brokered).into_string();
+        assert!(!rendered.contains("Target claimed by the client"));
+
+        // Brokered only: the caveat speaks of an approved origin, method and
+        // canonical path, and of a query string forwarded as written. A
+        // cli-read grant has none of those, so promoting a client-chosen
+        // `target` there would describe protections that do not exist — the
+        // page's own claim, made on the client's say-so.
+        let ctx = RequestContext {
+            reason: "ship it".to_owned(),
+            structured: Some(serde_json::json!({
+                "target": "GET https://api.example.com/users",
+            })),
+        };
+        for mechanism in [
+            Mechanism::CliRead,
+            Mechanism::Autofill,
+            Mechanism::DirectRead,
+        ] {
+            let rendered = context_block(Some(&ctx), mechanism).into_string();
+            assert!(
+                !rendered.contains("Target claimed by the client"),
+                "{mechanism:?} has no brokered constraints to point at"
+            );
+            assert!(!rendered.contains("A claim, not a constraint"));
+            // Still visible as ordinary client context, just not promoted.
+            assert!(rendered.contains("Structured context"));
+            assert!(rendered.contains("api.example.com"));
+        }
     }
 
     fn secret_row(name: &str, version: i32) -> db::SecretRow {
