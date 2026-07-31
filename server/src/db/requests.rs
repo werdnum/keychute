@@ -230,8 +230,10 @@ pub struct GrantParams {
 
 /// Approve a pending request: in one transaction, flip `pending -> approved`
 /// (rowcount-checked), insert the grant, and write the `request-approved`
-/// audit row. Returns the new grant id, or `None` if the request was not
-/// pending (already resolved or expired) — nothing is written in that case.
+/// audit row. Returns the new grant id, or `None` if the approval could not
+/// happen — the request was not pending (already resolved or expired), or the
+/// stored secret a payload-less grant would release has been deleted
+/// underneath it. Nothing is written in either case.
 pub async fn resolve_approve(
     db: &PgPool,
     request_id: Uuid,
@@ -239,6 +241,17 @@ pub async fn resolve_approve(
     grant: &GrantParams,
 ) -> anyhow::Result<Option<Uuid>> {
     let mut tx = db.begin().await?;
+    // Same guard as `ui_ext::approve_request`: a grant with no payload of its
+    // own releases the stored secret, so it serializes against that secret's
+    // deletion and re-checks the secret survived
+    // ([`crate::db::take_secret_shared_lock`]).
+    if grant.passthrough.is_none() {
+        crate::db::take_secret_shared_lock(&mut tx, &grant.secret_name).await?;
+        if !crate::db::secret_name_exists(&mut tx, &grant.secret_name).await? {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+    }
     let updated = sqlx::query(
         "UPDATE access_requests \
          SET state = 'approved', resolved_by = $2, resolved_at = now() \

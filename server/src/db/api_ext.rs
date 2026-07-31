@@ -79,6 +79,31 @@ pub async fn insert_access_request_with_id(
     seal_context: Option<super::SealFn<'_>>,
 ) -> anyhow::Result<InsertOutcome> {
     let mut tx = db.begin().await?;
+    // An auto-approved grant with no payload of its own releases the STORED
+    // secret, so — exactly as in `ui_ext::approve_request` — it serializes
+    // against that secret's deletion, and re-checks the secret survived once
+    // the lock is held. Taken FIRST, before the KEK and per-client locks, per
+    // the order documented on [`crate::db::take_secret_shared_lock`].
+    let stored_backed_grant = match resolution {
+        InitialResolution::Approved { grant, .. } if grant.passthrough.is_none() => {
+            Some(grant.secret_name.as_str())
+        }
+        _ => None,
+    };
+    if let Some(secret_name) = stored_backed_grant {
+        super::take_secret_shared_lock(&mut tx, secret_name).await?;
+        if !super::secret_name_exists(&mut tx, secret_name).await? {
+            // Nothing has been written yet, and the idempotency key is
+            // unburned: the caller's retry re-evaluates policy against a world
+            // where the secret is gone, which no longer auto-approves. Same
+            // shape as the elapsed-deadline rollback below.
+            tx.rollback().await?;
+            anyhow::bail!(
+                "the secret was deleted during auto-approval; nothing was written — \
+                 a retry re-evaluates policy"
+            );
+        }
+    }
     // Same pattern as `ui_ext::approve_request`: the lock covers every
     // KEYSET-wrapped DEK inserted here, which is only the sealed request
     // context. An auto-approve grant's passthrough payload is wrapped under the

@@ -288,6 +288,21 @@ or Envoy-forwarded JWT in oidc mode):
   that cannot work. Passthrough grants are untouched — their payload was
   entered at approval time and never came from the deleted row. Audit rows
   naming the deleted `secret_version_id`s survive by design.
+  Deletion serializes against grant creation on a per-secret-name advisory lock
+  (`keychute-secret`; exclusive here, shared in every path that inserts a
+  payload-less grant — `ui_ext::approve_request`, the auto-approve leg of
+  `api_ext::insert_access_request_with_id`, and `requests::resolve_approve`).
+  Grants name their secret with no foreign key, so without it an approval
+  committing just after the revocation statement's snapshot would leave a live
+  grant over destroyed ciphertext. Holding the lock is not sufficient on its
+  own — a grant creator that finds the deletion already committed refuses
+  (409 in the UI; rollback-and-retry on the auto-approve path) instead of
+  minting a grant that can only return `payload-lost`. Lock order everywhere:
+  this one BEFORE the KEK lock and any per-client lock. A rotation that loses
+  the same race returns "no such secret" as a 409 rather than a 500.
+  The confirmation page states plainly that deletion is not erasure: pre-existing
+  database backups still hold the ciphertext and the KEK still unwraps it, so
+  only provider-side rotation invalidates those copies.
 - CSRF: session-less double-submit is NOT enough with header auth; since auth is
   a header (no cookies), CSRF risk is minimal, but implement `Origin`/
   `Sec-Fetch-Site` checks on all POSTs + a per-rendered-form token MAC'd with the

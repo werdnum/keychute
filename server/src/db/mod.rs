@@ -38,6 +38,58 @@ pub(crate) async fn take_kek_shared_lock(tx: &mut sqlx::PgConnection) -> Result<
     Ok(())
 }
 
+/// Serializes stored-secret DELETION against stored-backed GRANT CREATION for
+/// the same secret name. Grants reference a secret by name with no foreign
+/// key, so without this a grant inserted after the delete's `UPDATE ... SET
+/// revoked` took its snapshot commits unrevoked against a secret whose
+/// ciphertext is already gone — an apparently live grant that can only ever
+/// return `payload-lost`.
+///
+/// Grant creators take the SHARED side before inserting a non-passthrough
+/// grant, and re-check the secret still exists once they hold it (holding the
+/// lock is not enough on its own: a delete that got there first has already
+/// committed, and the approval must then fail rather than mint a dud grant).
+/// [`crate::db::ui_ext::delete_secret_audited`] takes the exclusive side.
+///
+/// Lock ORDER, everywhere it is taken: this one first, before the KEK lock and
+/// before any per-client lock. Nothing may take it after those, or the two
+/// orders could deadlock against each other.
+pub(crate) async fn take_secret_shared_lock(
+    tx: &mut sqlx::PgConnection,
+    secret_name: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_xact_lock_shared(hashtext('keychute-secret'), hashtext($1))")
+        .bind(secret_name)
+        .execute(tx)
+        .await?;
+    Ok(())
+}
+
+/// Exclusive side of [`take_secret_shared_lock`] — deletion's half.
+pub(crate) async fn take_secret_exclusive_lock(
+    tx: &mut sqlx::PgConnection,
+    secret_name: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('keychute-secret'), hashtext($1))")
+        .bind(secret_name)
+        .execute(tx)
+        .await?;
+    Ok(())
+}
+
+/// True when a secret of this name exists — read inside a transaction that
+/// already holds the secret lock, by grant creators checking that a deletion
+/// did not just win the race.
+pub(crate) async fn secret_name_exists(
+    tx: &mut sqlx::PgConnection,
+    secret_name: &str,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM secrets WHERE name = $1)")
+        .bind(secret_name)
+        .fetch_one(tx)
+        .await
+}
+
 /// Addendum #19 (`verify_no_references`): true when nothing still references
 /// `kek_id`, i.e. it is safe to retire. Takes the EXCLUSIVE form of the KEK
 /// advisory lock for the check's transaction, so it serializes against every

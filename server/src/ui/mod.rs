@@ -2057,6 +2057,16 @@ async fn approve(
                  the secret that is now stored.",
             ));
         }
+        db::ui_ext::ApproveOutcome::SecretGone => {
+            // Another operator's deletion committed while this approval was in
+            // flight. The grant would have been born unusable (`payload-lost`
+            // on first read), so nothing was approved.
+            return Err(UiError::new(
+                StatusCode::CONFLICT,
+                "that secret was deleted while you were reviewing. Nothing was \
+                 approved — reload the request and decide again.",
+            ));
+        }
     }
     state.resolve_notify.notify_waiters();
     Ok(Redirect::to("/ui/requests").into_response())
@@ -3197,9 +3207,13 @@ async fn delete_secret_page(
         "/ui/secrets",
         html! {
             (page_head("Delete a stored secret", html! {
-                "This removes the credential itself — every stored version of it — and "
-                "cannot be undone. Keychute holds no other copy: if this is the only "
-                "place the value lives, rotate it at the provider first."
+                "This removes the credential itself — every stored version of it — from "
+                "the live database, and cannot be undone here. It is "
+                b { "not erasure" }
+                ": database backups taken before now still contain the ciphertext, and "
+                "the KEK that unwraps it still exists, so a restore can bring this "
+                "credential back. Only rotating the credential at the provider makes "
+                "those copies worthless — do that first if that is what you are after."
             }))
             div .card {
                 h2 { span .mono { (secret.name) } }
@@ -3411,7 +3425,7 @@ async fn save_secret(
     match db::get_secret_by_name(&state.db, &name).await? {
         Some(existing) => {
             // Rotation: append a new version; metadata unchanged.
-            db::ui_ext::rotate_secret_version(
+            let rotated = db::ui_ext::rotate_secret_version(
                 &state.db,
                 existing.id,
                 &existing.name,
@@ -3427,6 +3441,17 @@ async fn save_secret(
                 },
             )
             .await?;
+            if rotated.is_none() {
+                // The row was deleted between the lookup above and the update —
+                // another operator's confirmed deletion. Nothing was written;
+                // say so rather than surfacing it as a 500, and warn that the
+                // same submission now means something different.
+                return Err(UiError::new(
+                    StatusCode::CONFLICT,
+                    "that secret was deleted while you were editing it. \
+                     Reload the page: submitting again would CREATE it, not rotate it.",
+                ));
+            }
         }
         None => {
             let max_tier = match non_empty(&form.max_tier) {

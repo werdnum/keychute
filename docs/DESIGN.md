@@ -335,7 +335,11 @@ k8s-agent image).
   secret outright (a deliberate, confirmed UI action — not the purge lifecycle)
   is the one exception: it takes every version with it, and revokes the live
   grants backed by them in the same transaction, so no grant is left promising
-  a replay of bytes that no longer exist.
+  a replay of bytes that no longer exist. Grant creation serializes against it
+  on a per-secret advisory lock, so a concurrent approval either precedes the
+  deletion (and is revoked by it) or fails. Deletion is not erasure: backups
+  taken beforehand still contain the ciphertext, and the KEK recovery chain
+  still unwraps it — only rotating the credential at the provider does that.
 - Plaintext exists only transiently in Keychute memory during a release or proxy
   call, and is never logged, never in error messages, never in the DB (enforced
   by types, reviewed as an invariant). Application-owned buffers zeroize on drop;

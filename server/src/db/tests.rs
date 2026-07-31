@@ -338,6 +338,11 @@ async fn begin_grant_use_single_use_semantics() -> anyhow::Result<()> {
     let Some(t) = setup().await? else {
         return Ok(());
     };
+    // A grant with no passthrough payload releases the STORED secret, so the
+    // row has to exist: `resolve_approve` refuses to mint one over a secret
+    // that is absent (or has just been deleted), which would only ever return
+    // payload-lost.
+    crate::db::create_secret(&t.pool, "example-api-token", "", 2, "bearer", None).await?;
     let req = insert_access_request(&t.pool, &new_request("fa", "grant-key", b"mac"), None).await?;
     let grant_id = resolve_approve(
         &t.pool,
