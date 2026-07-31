@@ -97,14 +97,31 @@ async fn brokered_proxy_injects_credential_and_strips_caller_headers() {
     // Audit rows carry method/path/status.
     type AuditRow = (String, Option<String>, Option<String>, Option<i32>);
     let rid: uuid::Uuid = request_id.parse().unwrap();
-    let rows: Vec<AuditRow> = sqlx::query_as(
-        "SELECT kind, method, path, status FROM audit_log \
-         WHERE request_id = $1 AND kind IN ('proxy-attempt', 'proxy-completed') ORDER BY id",
+    // Polled, not read once: the completion row is written by a DETACHED task
+    // (server/src/proxy.rs — audit persistence must never delay delivery of the
+    // upstream body, or a slow insert would eat the caller's deadline), so it
+    // can legitimately land just after the response the client already holds.
+    // Reading immediately makes this test race the server for no reason; the
+    // invariant being asserted is that the row appears, not when.
+    let rows: Vec<AuditRow> = poll_until(
+        "proxy-attempt + proxy-completed audit rows",
+        std::time::Duration::from_secs(10),
+        || async {
+            let rows: Vec<AuditRow> = sqlx::query_as(
+                "SELECT kind, method, path, status FROM audit_log \
+                 WHERE request_id = $1 AND kind IN ('proxy-attempt', 'proxy-completed') \
+                 ORDER BY id",
+            )
+            .bind(rid)
+            .fetch_all(&env.db)
+            .await
+            .ok()?;
+            rows.iter()
+                .any(|r| r.0 == "proxy-completed")
+                .then_some(rows)
+        },
     )
-    .bind(rid)
-    .fetch_all(&env.db)
-    .await
-    .unwrap();
+    .await;
     let kinds: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
     assert!(kinds.contains(&"proxy-attempt"), "{kinds:?}");
     assert!(kinds.contains(&"proxy-completed"), "{kinds:?}");
