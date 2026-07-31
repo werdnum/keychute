@@ -124,6 +124,14 @@ pub(crate) struct CurlArgs {
     /// Request body taken literally, `@` and all.
     #[arg(long = "data-raw", value_name = "DATA", conflicts_with = "data")]
     pub data_raw: Option<String>,
+    /// Like -d, but file and stdin input is sent byte for byte — no CR/LF
+    /// stripping (curl's --data-binary).
+    #[arg(
+        long = "data-binary",
+        value_name = "DATA",
+        conflicts_with_all = ["data", "data_raw"]
+    )]
+    pub data_binary: Option<String>,
     /// Write the response body here instead of stdout.
     #[arg(short = 'o', long = "output", value_name = "FILE")]
     pub output: Option<PathBuf>,
@@ -283,6 +291,18 @@ pub(crate) fn is_stripped_header(name: &str) -> bool {
     STRIPPED_HEADERS.contains(&n.as_str()) || n.starts_with("x-forwarded-")
 }
 
+/// Header names nominated as hop-by-hop by a caller-supplied `Connection`
+/// value (comma-separated tokens, case-insensitive), lowercased.
+pub(crate) fn connection_nominated(headers: &[(String, String)]) -> Vec<String> {
+    headers
+        .iter()
+        .filter(|(n, _)| n == "connection")
+        .flat_map(|(_, v)| v.split(','))
+        .map(|t| t.trim().to_ascii_lowercase())
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
 /// The constraints a grant needs to permit exactly this call.
 pub(crate) fn constraints_for(
     target: &Target,
@@ -321,22 +341,28 @@ pub(crate) fn constraints_for(
     })
 }
 
-/// Read the request body. `@path` is a file, `@-` is stdin, anything else is
-/// the literal argument (curl's rules); `--data-raw` skips the `@` reading.
-fn read_body(data: Option<&str>, data_raw: Option<&str>) -> CliResult<Option<Vec<u8>>> {
-    read_body_bounded(data, data_raw, max_body_bytes()?)
+/// Read the request body, following curl's rules so that swapping `curl` for
+/// `keychute curl` sends the same bytes:
+///
+/// * `-d @path` / `-d @-` read a file or stdin **with CR and LF stripped** —
+///   curl does this so a form body typed into a file does not carry the
+///   editor's line breaks. A body that must survive intact is what
+///   `--data-binary` is for.
+/// * `-d value` and `--data-raw value` take the argument literally
+///   (`--data-raw` also declines to treat a leading `@` as a file).
+fn read_body(args: &CurlArgs) -> CliResult<Option<Vec<u8>>> {
+    read_body_bounded(args, max_body_bytes()?)
 }
 
-fn read_body_bounded(
-    data: Option<&str>,
-    data_raw: Option<&str>,
-    limit: usize,
-) -> CliResult<Option<Vec<u8>>> {
-    if let Some(raw) = data_raw {
+fn read_body_bounded(args: &CurlArgs, limit: usize) -> CliResult<Option<Vec<u8>>> {
+    if let Some(raw) = args.data_raw.as_deref() {
         return Ok(Some(raw.as_bytes().to_vec()));
     }
-    let Some(data) = data else {
-        return Ok(None);
+    // --data-binary keeps every byte; -d strips CR/LF from file/stdin input.
+    let (data, strip_newlines) = match (args.data.as_deref(), args.data_binary.as_deref()) {
+        (Some(d), _) => (d, true),
+        (None, Some(d)) => (d, false),
+        (None, None) => return Ok(None),
     };
     let Some(source) = data.strip_prefix('@') else {
         return Ok(Some(data.as_bytes().to_vec()));
@@ -350,6 +376,9 @@ fn read_body_bounded(
             .map_err(|e| fail(EXIT_CONFIG, format!("cannot read body file {source}: {e}")))?;
         read_bounded(file, &mut buf, limit)
             .map_err(|e| fail(EXIT_CONFIG, format!("cannot read body file {source}: {e}")))?;
+    }
+    if strip_newlines {
+        buf.retain(|b| *b != b'\r' && *b != b'\n');
     }
     Ok(Some(buf))
 }
@@ -394,34 +423,17 @@ fn classify_proxy_error(status: reqwest::StatusCode, body: &str) -> Failure {
     )
 }
 
-pub(crate) async fn run_curl(
-    cfg: &Config,
-    http: &reqwest::Client,
-    args: CurlArgs,
-) -> CliResult<()> {
-    let target = parse_target(&args.url).map_err(|e| fail(EXIT_CONFIG, e))?;
-    let body = read_body(args.data.as_deref(), args.data_raw.as_deref())?;
-    let method = match &args.method {
-        Some(m) => normalize_method(m).map_err(|e| fail(EXIT_CONFIG, e))?,
-        // curl's default: a body implies POST.
-        None if body.is_some() => "POST".to_string(),
-        None => "GET".to_string(),
-    };
+/// Which credential this call authenticates with: a grant already approved,
+/// or a secret to request one for.
+enum Selector {
+    Grant(Uuid),
+    Secret(String),
+}
 
-    let mut headers = Vec::new();
-    for line in &args.headers {
-        let (name, value) = parse_header(line).map_err(|e| fail(EXIT_CONFIG, e))?;
-        if is_stripped_header(&name) {
-            eprintln!(
-                "keychute: header {name:?} is not forwarded by the broker (it would let the \
-                 caller redirect or re-authenticate the credentialed request); dropping it"
-            );
-            continue;
-        }
-        headers.push((name, value));
-    }
-
-    let grant_id = match &args.grant_id {
+/// Resolve the selector and validate its shape. Pure argument checking, so it
+/// can run before anything is read or sent.
+fn credential_selector(args: &CurlArgs) -> CliResult<Selector> {
+    match &args.grant_id {
         Some(g) => {
             if args.secret.is_some() {
                 eprintln!(
@@ -432,16 +444,75 @@ pub(crate) async fn run_curl(
             let id = g
                 .parse::<Uuid>()
                 .map_err(|_| fail(EXIT_CONFIG, format!("invalid grant id {g:?}")))?;
+            Ok(Selector::Grant(id))
+        }
+        None => args.secret.clone().map(Selector::Secret).ok_or_else(|| {
+            fail(
+                EXIT_CONFIG,
+                "--secret <name> is required (or --grant-id to reuse an approved grant)",
+            )
+        }),
+    }
+}
+
+pub(crate) async fn run_curl(
+    cfg: &Config,
+    http: &reqwest::Client,
+    args: CurlArgs,
+) -> CliResult<()> {
+    let target = parse_target(&args.url).map_err(|e| fail(EXIT_CONFIG, e))?;
+
+    // Settle every usage question BEFORE reading the body. `-d @-` consumes
+    // stdin, and doing that first means an invocation missing --secret blocks
+    // on a slow producer instead of reporting the error — or, with a finite
+    // producer, swallows the input and only then fails.
+    let selector = credential_selector(&args)?;
+
+    let body = read_body(&args)?;
+    let method = match &args.method {
+        Some(m) => normalize_method(m).map_err(|e| fail(EXIT_CONFIG, e))?,
+        // curl's default: a body implies POST.
+        None if body.is_some() => "POST".to_string(),
+        None => "GET".to_string(),
+    };
+
+    let mut parsed = Vec::new();
+    for line in &args.headers {
+        parsed.push(parse_header(line).map_err(|e| fail(EXIT_CONFIG, e))?);
+    }
+    // A `Connection: X-Internal` header nominates X-Internal as hop-by-hop,
+    // and the broker honours that — but only if it can still SEE the
+    // Connection header. Since `Connection` is itself on the strip list, a
+    // naive drop would leave X-Internal looking like an ordinary header and
+    // forward it upstream, which is not what the same headers sent straight
+    // at the proxy would do. So the nomination is resolved here, before its
+    // evidence is discarded.
+    let nominated = connection_nominated(&parsed);
+    let mut headers = Vec::new();
+    for (name, value) in parsed {
+        if is_stripped_header(&name) {
+            eprintln!(
+                "keychute: header {name:?} is not forwarded by the broker (it would let the \
+                 caller redirect or re-authenticate the credentialed request); dropping it"
+            );
+            continue;
+        }
+        if nominated.contains(&name) {
+            eprintln!(
+                "keychute: header {name:?} is named by your Connection header, so it is \
+                 hop-by-hop and not forwarded; dropping it"
+            );
+            continue;
+        }
+        headers.push((name, value));
+    }
+
+    let grant_id = match selector {
+        Selector::Grant(id) => {
             check_grant_covers(cfg, http, id, &target, &method).await?;
             id
         }
-        None => {
-            let secret_name = args.secret.clone().ok_or_else(|| {
-                fail(
-                    EXIT_CONFIG,
-                    "--secret <name> is required (or --grant-id to reuse an approved grant)",
-                )
-            })?;
+        Selector::Secret(secret_name) => {
             acquire_grant(cfg, http, &args, &target, &method, secret_name).await?
         }
     };
@@ -558,34 +629,81 @@ async fn check_grant_covers(
             ),
         ));
     }
-    if !info.constraints.path_prefixes.is_empty()
-        && !info
-            .constraints
-            .path_prefixes
-            .iter()
-            .any(|p| path_covered(p, &target.path))
-    {
-        return Err(fail(
-            EXIT_CONFIG,
-            format!(
-                "grant {grant_id} covers {} but this call is for {}",
-                info.constraints.path_prefixes.join(", "),
-                target.path
-            ),
-        ));
+    // Compare canonical against canonical: the grant holds the decoded prefix
+    // and the URL holds the raw path. A path the server would reject outright
+    // has no canonical form — leave that answer to the server rather than
+    // inventing a local one.
+    if let Some(canonical) = canonical_path(&target.path) {
+        if !info.constraints.path_prefixes.is_empty()
+            && !info
+                .constraints
+                .path_prefixes
+                .iter()
+                .any(|p| path_covered(p, &canonical))
+        {
+            return Err(fail(
+                EXIT_CONFIG,
+                format!(
+                    "grant {grant_id} covers {} but this call is for {canonical}",
+                    info.constraints.path_prefixes.join(", "),
+                ),
+            ));
+        }
     }
     Ok(())
+}
+
+/// Percent-decode a path once, the way the server canonicalizes before it
+/// stores a prefix or matches a request (`policy::paths::canonicalize`).
+///
+/// Returns None when the server would reject the path outright (encoded `/`
+/// or `\\`, a truncated or invalid escape, non-UTF-8) — the caller then skips
+/// the local check rather than guessing, and lets the server give its own
+/// answer.
+///
+/// This matters because the two sides hold different spellings: a grant made
+/// for `/files/a%20b` stores the canonical `/files/a b`, while the URL a
+/// reuse is given still reads `/files/a%20b`. Comparing those raw would refuse
+/// the identical call the grant was made for.
+pub(crate) fn canonical_path(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' => {
+                if i + 3 > bytes.len() {
+                    return None;
+                }
+                let hex = |b: u8| match b {
+                    b'0'..=b'9' => Some(b - b'0'),
+                    b'a'..=b'f' => Some(b - b'a' + 10),
+                    b'A'..=b'F' => Some(b - b'A' + 10),
+                    _ => None,
+                };
+                let v = (hex(bytes[i + 1])? << 4) | hex(bytes[i + 2])?;
+                // The server rejects these rather than decoding them.
+                if v == b'/' || v == b'\\' {
+                    return None;
+                }
+                out.push(v);
+                i += 3;
+            }
+            b'\\' => return None,
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 /// Prefix match at `/` segment boundaries, mirroring the server's rule:
 /// `/v1/account` covers `/v1/account` and `/v1/account/…`, never
 /// `/v1/account-delete`.
 ///
-/// A local approximation on the RAW path, deliberately advisory: the server
-/// canonicalizes before matching, so a percent-encoded path may match there
-/// and not here. Being conservative is the right way round — a false "not
-/// covered" costs a clear local error, while a false "covered" just defers to
-/// the server's own 403.
+/// Both arguments must already be canonical — see [`canonical_path`].
 pub(crate) fn path_covered(prefix: &str, path: &str) -> bool {
     let prefix = prefix.trim_end_matches('/');
     if prefix.is_empty() {
@@ -766,8 +884,14 @@ async fn proxy_call(
         .map_err(|_| fail(EXIT_CONFIG, "invalid HTTP method"))?;
     let mut req = http
         .request(method.clone(), &url)
-        .bearer_auth(cfg.bearer()?)
-        .timeout(Duration::from_secs(args.max_time));
+        .bearer_auth(cfg.bearer()?);
+    // curl reads --max-time 0 as "no limit"; passing it to reqwest verbatim
+    // would instead time out instantly — and a request that was already sent
+    // can still commit upstream, so the caller would be told it failed and
+    // invited to repeat a side effect that succeeded.
+    if args.max_time > 0 {
+        req = req.timeout(Duration::from_secs(args.max_time));
+    }
     for (name, value) in headers {
         req = req.header(name, value);
     }
@@ -813,15 +937,20 @@ async fn proxy_call(
     }
 
     if args.include {
-        let mut head = format!("HTTP/1.1 {status}\r\n");
+        // Byte-faithful: header values may carry obs-text (a legacy
+        // Set-Cookie with a 0xff in it), which `HeaderValue` and the proxy
+        // both pass through intact. Rendering them through a lossy UTF-8
+        // conversion would silently substitute replacement characters into
+        // output whose whole purpose is to show what actually arrived.
+        let mut head: Vec<u8> = format!("HTTP/1.1 {status}\r\n").into_bytes();
         for (name, value) in resp.headers() {
-            head.push_str(name.as_str());
-            head.push_str(": ");
-            head.push_str(&String::from_utf8_lossy(value.as_bytes()));
-            head.push_str("\r\n");
+            head.extend_from_slice(name.as_str().as_bytes());
+            head.extend_from_slice(b": ");
+            head.extend_from_slice(value.as_bytes());
+            head.extend_from_slice(b"\r\n");
         }
-        head.push_str("\r\n");
-        write_all(&mut sink, head.as_bytes())?;
+        head.extend_from_slice(b"\r\n");
+        write_all(&mut sink, &head)?;
     }
     while let Some(chunk) = resp.chunk().await.map_err(|e| {
         fail(
@@ -963,21 +1092,126 @@ mod tests {
         assert!(constraints_for(&t, "GET", &[], &["v1".into()], 600, 1).is_err());
     }
 
+    /// Minimal args for body tests: only the data fields matter.
+    fn body_args(
+        data: Option<&str>,
+        data_raw: Option<&str>,
+        data_binary: Option<&str>,
+    ) -> CurlArgs {
+        CurlArgs {
+            url: "https://api.example.com/v1".into(),
+            secret: None,
+            method: None,
+            headers: vec![],
+            data: data.map(str::to_owned),
+            data_raw: data_raw.map(str::to_owned),
+            data_binary: data_binary.map(str::to_owned),
+            output: None,
+            include: false,
+            fail: false,
+            reason: String::new(),
+            ttl: 300,
+            max_uses: 1,
+            timeout: 900,
+            max_time: 120,
+            idempotency_key: None,
+            grant_id: None,
+            path_prefixes: vec![],
+            allow_methods: vec![],
+        }
+    }
+
     #[test]
     fn body_sources_follow_curls_spelling() {
-        assert_eq!(read_body(Some("plain"), None).unwrap().unwrap(), b"plain");
+        assert_eq!(
+            read_body(&body_args(Some("plain"), None, None))
+                .unwrap()
+                .unwrap(),
+            b"plain"
+        );
         // --data-raw takes the argument literally, @ and all.
         assert_eq!(
-            read_body(None, Some("@literal")).unwrap().unwrap(),
+            read_body(&body_args(None, Some("@literal"), None))
+                .unwrap()
+                .unwrap(),
             b"@literal"
         );
-        assert_eq!(read_body(None, None).unwrap(), None);
+        assert_eq!(read_body(&body_args(None, None, None)).unwrap(), None);
         let dir = std::env::temp_dir().join(format!("keychute-curl-{}", Uuid::new_v4()));
         std::fs::write(&dir, b"from-file").unwrap();
         let path = format!("@{}", dir.display());
-        assert_eq!(read_body(Some(&path), None).unwrap().unwrap(), b"from-file");
+        assert_eq!(
+            read_body(&body_args(Some(&path), None, None))
+                .unwrap()
+                .unwrap(),
+            b"from-file"
+        );
         std::fs::remove_file(&dir).unwrap();
-        assert!(read_body(Some("@/nonexistent/keychute-test"), None).is_err());
+        assert!(read_body(&body_args(Some("@/nonexistent/keychute-test"), None, None)).is_err());
+    }
+
+    #[test]
+    fn data_strips_newlines_from_files_but_data_binary_does_not() {
+        // curl's rule: -d on file/stdin input drops CR and LF (a form body
+        // should not carry the editor's line breaks), --data-binary keeps
+        // every byte. Swapping curl for keychute curl must not change what
+        // arrives upstream.
+        let path = std::env::temp_dir().join(format!("keychute-nl-{}", Uuid::new_v4()));
+        std::fs::write(&path, b"a=1\r\nb=2\n").unwrap();
+        let arg = format!("@{}", path.display());
+        assert_eq!(
+            read_body(&body_args(Some(&arg), None, None))
+                .unwrap()
+                .unwrap(),
+            b"a=1b=2"
+        );
+        assert_eq!(
+            read_body(&body_args(None, None, Some(&arg)))
+                .unwrap()
+                .unwrap(),
+            b"a=1\r\nb=2\n"
+        );
+        // An inline -d value is taken literally either way — the stripping is
+        // a property of file/stdin input, not of the flag.
+        assert_eq!(
+            read_body(&body_args(Some("a=1\nb=2"), None, None))
+                .unwrap()
+                .unwrap(),
+            b"a=1\nb=2"
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn connection_nominated_headers_are_resolved_before_connection_is_dropped() {
+        let headers = vec![
+            ("connection".to_string(), "X-Internal, close".to_string()),
+            ("x-internal".to_string(), "v".to_string()),
+            ("content-type".to_string(), "application/json".to_string()),
+        ];
+        let nominated = connection_nominated(&headers);
+        assert!(nominated.contains(&"x-internal".to_string()));
+        assert!(nominated.contains(&"close".to_string()));
+        assert!(!nominated.contains(&"content-type".to_string()));
+        // No Connection header nominates nothing.
+        assert!(connection_nominated(&headers[1..].to_vec()).is_empty());
+    }
+
+    #[test]
+    fn canonical_paths_match_what_the_grant_stores() {
+        // The grant holds the decoded prefix; the URL holds the raw path.
+        assert_eq!(canonical_path("/files/a%20b").unwrap(), "/files/a b");
+        assert!(path_covered(
+            "/files/a b",
+            &canonical_path("/files/a%20b").unwrap()
+        ));
+        assert_eq!(canonical_path("/v1/things").unwrap(), "/v1/things");
+        // Paths the server rejects outright have no canonical form here
+        // either, so the local check defers instead of guessing.
+        assert!(canonical_path("/v1%2Fthings").is_none());
+        assert!(canonical_path("/v1\\things").is_none());
+        assert!(canonical_path("/v1%zz").is_none());
+        assert!(canonical_path("/v1%").is_none());
     }
 
     #[test]
@@ -994,7 +1228,9 @@ mod tests {
     fn the_read_bound_is_configurable_and_validated() {
         // A body under an explicit bound reads fine...
         assert_eq!(
-            read_body_bounded(Some("hello"), None, 4).unwrap().unwrap(),
+            read_body_bounded(&body_args(Some("hello"), None, None), 4)
+                .unwrap()
+                .unwrap(),
             b"hello",
             "an inline body is not read through the bounded reader"
         );
@@ -1002,15 +1238,36 @@ mod tests {
         std::fs::write(&path, b"0123456789").unwrap();
         let arg = format!("@{}", path.display());
         assert_eq!(
-            read_body_bounded(Some(&arg), None, 10).unwrap().unwrap(),
+            read_body_bounded(&body_args(Some(&arg), None, None), 10)
+                .unwrap()
+                .unwrap(),
             b"0123456789"
         );
         // ...and over it fails with a message naming the override, since the
         // bound is ours and the deployment's real cap may be higher.
-        let err = read_body_bounded(Some(&arg), None, 9).unwrap_err();
+        let err = read_body_bounded(&body_args(Some(&arg), None, None), 9).unwrap_err();
         assert!(err.message.contains(MAX_BODY_ENV), "{}", err.message);
         assert_eq!(err.code, EXIT_CONFIG);
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn the_credential_selector_is_decided_from_arguments_alone() {
+        // Resolvable without touching stdin or the network, which is what
+        // lets it run before `-d @-` consumes a producer.
+        let mut args = body_args(None, None, None);
+        assert!(matches!(
+            credential_selector(&args),
+            Err(f) if f.code == EXIT_CONFIG && f.message.contains("--secret")
+        ));
+        args.secret = Some("example-api-token".into());
+        assert!(
+            matches!(credential_selector(&args), Ok(Selector::Secret(s)) if s == "example-api-token")
+        );
+        args.grant_id = Some("22222222-2222-2222-2222-222222222222".into());
+        assert!(matches!(credential_selector(&args), Ok(Selector::Grant(_))));
+        args.grant_id = Some("not-a-uuid".into());
+        assert!(credential_selector(&args).is_err());
     }
 
     #[test]

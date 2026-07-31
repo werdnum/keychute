@@ -433,6 +433,13 @@ async fn grant_info_is_owner_scoped_and_reports_the_granted_limits() {
     );
     assert_eq!(info["use_count"], 0);
     assert_eq!(info["revoked"], false);
+    // The constraints block reports what was GRANTED, not what was requested:
+    // approval narrows ttl/max_uses in their own columns and leaves the
+    // request json alone, so those two fields are replaced before they are
+    // returned. Reporting the request back as the grant is the exact
+    // confusion this endpoint exists to remove.
+    assert_eq!(info["constraints"]["ttl_seconds"], 600);
+    assert!(info["constraints"]["max_uses"].is_null());
     // Never any credential material, and not even the secret's name.
     assert!(info.get("secret").is_none());
     assert!(info.get("secret_name").is_none());
@@ -461,5 +468,61 @@ async fn grant_info_is_owner_scoped_and_reports_the_granted_limits() {
     assert_eq!(
         info["use_count"], 0,
         "metadata lookup must not consume a use"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grant_info_reports_operator_narrowed_limits_not_the_requested_ones() {
+    let env = TestEnv::spawn(SpawnOpts::default()).await.unwrap();
+    env.seed_secret("example-api-token", "tok-abc", "brokered", "bearer", "")
+        .await
+        .unwrap();
+
+    // Ask for an hour and 5 uses...
+    let (status, body) = env
+        .fa()
+        .create_request(brokered_request(
+            "narrowed",
+            "example-api-token",
+            "localhost",
+            env.upstream_port,
+            &["GET"],
+            &["/v1"],
+            3600,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(status, 201, "{body}");
+    let request_id = body["request_id"].as_str().unwrap().to_owned();
+
+    // ...and have the operator cut it down at approval time.
+    env.approve(&request_id, &[("ttl_seconds", "60"), ("max_uses", "1")])
+        .await
+        .unwrap();
+
+    let resp = env
+        .fa()
+        .get(&format!("/v1/access-requests/{request_id}"))
+        .send()
+        .await
+        .unwrap();
+    let st: serde_json::Value = resp.json().await.unwrap();
+    let grant_id = st["grant_id"].as_str().unwrap().to_owned();
+
+    let resp = env
+        .fa()
+        .get(&format!("/v1/grants/{grant_id}"))
+        .send()
+        .await
+        .unwrap();
+    let info: serde_json::Value = resp.json().await.unwrap();
+    // What the operator decided, not what the client asked for — in both the
+    // top-level fields and the constraints block a consumer might read.
+    assert_eq!(info["max_uses"], 1);
+    assert_eq!(info["constraints"]["max_uses"], 1);
+    let ttl = info["constraints"]["ttl_seconds"].as_i64().unwrap();
+    assert!(
+        (0..=120).contains(&ttl),
+        "granted ttl should reflect the narrowed 60s, got {ttl}"
     );
 }

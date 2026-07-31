@@ -48,8 +48,27 @@ pub async fn info(
     let grant = owned_grant(&state, &client, id).await?;
     let mechanism = Mechanism::from_str_opt(&grant.mechanism)
         .ok_or_else(|| ApiFailure::Internal(anyhow::anyhow!("unknown grant mechanism")))?;
-    let constraints: Constraints = serde_json::from_value(grant.constraints.clone())
+    let mut constraints: Constraints = serde_json::from_value(grant.constraints.clone())
         .map_err(|e| ApiFailure::Internal(e.into()))?;
+    // `grant.constraints` is the REQUESTED json, stored verbatim at approval;
+    // an operator who narrows the TTL or use count changes only the
+    // `not_after` and `max_uses` columns (see `ui::approve`). Returning that
+    // json untouched would report the request back as though it were the
+    // grant — the exact confusion this endpoint exists to remove — so the two
+    // narrowable fields are replaced with what was actually granted before
+    // anything leaves. Everything else in the json (origins, methods, path
+    // prefixes) is not narrowable and is already the granted truth.
+    constraints.max_uses = grant.max_uses.map(|v| v.max(0) as u32);
+    // Rounded, not truncated: `not_after` is computed from a clock read taken
+    // a hair before the row's `created_at`, so a 600s grant spans 599.99s and
+    // truncation would report 599 — a value nobody chose, and one that reads
+    // as an off-by-one to anyone comparing it against what they asked for.
+    constraints.ttl_seconds = {
+        let millis = (grant.not_after - grant.created_at)
+            .num_milliseconds()
+            .max(0);
+        ((millis + 500) / 1000) as u64
+    };
     Ok(Json(GrantInfo {
         grant_id: grant.id,
         mechanism,
