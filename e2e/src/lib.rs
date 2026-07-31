@@ -723,6 +723,45 @@ impl TestEnv {
         Ok(())
     }
 
+    /// Delete a stored secret through the real two-step UI flow: the list
+    /// page's Delete button, then the confirmation page's button (whose token
+    /// and hidden field carry the version being deleted). Returns the
+    /// confirmation page's HTML, which is where the consequences are spelled
+    /// out.
+    pub async fn delete_secret(&self, name: &str) -> anyhow::Result<String> {
+        let id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM secrets WHERE name = $1")
+            .bind(name)
+            .fetch_one(&self.db)
+            .await?;
+        let page = self.ui_get("/ui/secrets").await?;
+        let action = format!("/ui/secrets/{id}/delete");
+        let token = extract_csrf(&page, &action).context("delete button csrf token not found")?;
+        let (status, confirm) = self.ui_post(&action, &[("csrf_token", &token)]).await?;
+        anyhow::ensure!(
+            status.is_success(),
+            "delete confirmation page: {status}: {confirm}"
+        );
+        let confirm_action = format!("/ui/secrets/{id}/deleted");
+        let confirm_token =
+            extract_csrf(&confirm, &confirm_action).context("confirm form csrf token not found")?;
+        let version = extract_form_field(&confirm, &confirm_action, "current_version")
+            .context("confirm form version marker not found")?;
+        let (status, body) = self
+            .ui_post(
+                &confirm_action,
+                &[
+                    ("csrf_token", &confirm_token),
+                    ("current_version", &version),
+                ],
+            )
+            .await?;
+        anyhow::ensure!(
+            status.is_redirection(),
+            "delete_secret failed: {status}: {body}"
+        );
+        Ok(confirm)
+    }
+
     /// Create a standing policy row via the UI form.
     /// `fields` are the non-CSRF form fields (see PolicyForm in ui/mod.rs).
     pub async fn create_policy(&self, fields: &[(&str, &str)]) -> anyhow::Result<()> {

@@ -271,6 +271,23 @@ or Envoy-forwarded JWT in oidc mode):
   CSRF token AND in the `UPDATE ... AND current_version = $2` — so a rotation
   between the two steps cannot vet bytes nobody saw. Both are POST: a URL that
   renders a credential would sit in browser history.
+- Deletion, also two-step: `POST /ui/secrets/{id}/delete` (confirmation page —
+  what goes with the secret: the live grants that will be revoked, the pending
+  requests that lose their stored value, and the standing policies that are
+  KEPT because a tag-scoped or wildcard row is about other secrets too, and a
+  by-name row would apply again to anything later created under the name) and
+  `POST /ui/secrets/{id}/deleted` (carries it out; audits `secret-deleted`).
+  Same version binding as the review flow — CSRF token AND
+  `DELETE ... AND current_version = $2` — so a rotation between the two steps
+  409s instead of destroying bytes the operator never saw. The delete removes
+  the secret, its `secret_versions` and its `secret_tags` (`ON DELETE CASCADE`),
+  and in the same transaction revokes every live non-passthrough grant naming
+  it, each with its own `grant-revoked` row (`detail.reason =
+  "secret-deleted"`): a grant whose secret is gone can only ever return
+  `payload-lost`, so the revocation says so rather than leaving a "live" grant
+  that cannot work. Passthrough grants are untouched — their payload was
+  entered at approval time and never came from the deleted row. Audit rows
+  naming the deleted `secret_version_id`s survive by design.
 - CSRF: session-less double-submit is NOT enough with header auth; since auth is
   a header (no cookies), CSRF risk is minimal, but implement `Origin`/
   `Sec-Fetch-Site` checks on all POSTs + a per-rendered-form token MAC'd with the

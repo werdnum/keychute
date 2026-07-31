@@ -320,6 +320,123 @@ pub async fn rotate_secret_version(
     Ok(row)
 }
 
+/// Outcome of [`delete_secret_audited`]. `Stale` means nothing at all was
+/// written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteSecretOutcome {
+    Deleted {
+        /// Live stored-backed grants revoked along with the secret.
+        grants_revoked: u64,
+    },
+    /// No such secret, or it was rotated between the confirmation page and
+    /// the confirmation.
+    Stale,
+}
+
+/// Delete a stored secret, its versions and its tags, and revoke every live
+/// grant that could still have released it — one transaction, audited.
+///
+/// `expected_version` is `current_version` as the confirmation page displayed
+/// it, and the delete only lands if that is still true. A rotation arriving in
+/// between means the operator is looking at a decision about bytes that are no
+/// longer the ones stored, so they are asked to look again rather than
+/// destroying a credential they never saw.
+///
+/// Revoking the dependent grants is part of deletion, not a courtesy: a grant
+/// whose secret is gone can no longer release anything (the read path pins a
+/// `secret_version_id` that cascade-deletes with the secret and would report
+/// `payload-lost`), so leaving it "live" would show the operator a grant that
+/// cannot work and quietly rely on a downstream failure for the security
+/// property. Revoking says it out loud, in the audit log, in the same
+/// transaction that removes the bytes.
+///
+/// Passthrough grants are deliberately left alone: their payload was entered
+/// at approval time and wrapped under the ephemeral KEK — it never came from
+/// this secret row, so deleting the row takes nothing away from them.
+///
+/// The `secret_versions` rows go with the secret (`ON DELETE CASCADE`), and
+/// with them the ciphertext: this is the one operation that removes stored
+/// credential bytes. Audit rows naming those version ids survive by design —
+/// they are how an incident responder reconstructs what was released before
+/// the deletion.
+pub async fn delete_secret_audited(
+    db: &PgPool,
+    secret_id: Uuid,
+    expected_version: i32,
+    actor: &str,
+) -> anyhow::Result<DeleteSecretOutcome> {
+    let mut tx = db.begin().await?;
+    // Counted before the delete, inside the same transaction, so the audit row
+    // records how many version rows actually went with it.
+    let versions: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM secret_versions WHERE secret_id = $1")
+            .bind(secret_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    let name: Option<String> = sqlx::query_scalar(
+        "DELETE FROM secrets WHERE id = $1 AND current_version = $2 RETURNING name",
+    )
+    .bind(secret_id)
+    .bind(expected_version)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(name) = name else {
+        tx.rollback().await?;
+        return Ok(DeleteSecretOutcome::Stale);
+    };
+    // Same shape as `grants::revoke_grant`, in bulk: a revoked grant also
+    // loses any passthrough payload. `NOT passthrough_ephemeral` keeps this to
+    // the grants that were actually backed by these bytes.
+    let revoked: Vec<(Uuid, Uuid, String)> = sqlx::query_as(
+        "UPDATE grants SET revoked = true, \
+             passthrough_ciphertext = NULL, passthrough_nonce = NULL, \
+             passthrough_wrapped_dek = NULL \
+         WHERE secret_name = $1 AND NOT revoked AND now() < not_after \
+           AND NOT passthrough_ephemeral \
+         RETURNING id, request_id, client_name",
+    )
+    .bind(&name)
+    .fetch_all(&mut *tx)
+    .await?;
+    for (grant_id, request_id, client_name) in &revoked {
+        insert_audit(
+            &mut *tx,
+            &AuditEvent {
+                kind: kinds::GRANT_REVOKED,
+                request_id: Some(*request_id),
+                grant_id: Some(*grant_id),
+                client_name: Some(client_name.clone()),
+                secret_name: Some(name.clone()),
+                actor: Some(actor.to_owned()),
+                // Server vocabulary: why the revocation happened, so the log
+                // distinguishes these from an operator revoking one grant.
+                detail: Some(serde_json::json!({"reason": "secret-deleted"})),
+                ..Default::default()
+            },
+        )
+        .await?;
+    }
+    insert_audit(
+        &mut *tx,
+        &AuditEvent {
+            kind: kinds::SECRET_DELETED,
+            secret_name: Some(name.clone()),
+            actor: Some(actor.to_owned()),
+            detail: Some(serde_json::json!({
+                "current_version": expected_version,
+                "versions_deleted": versions,
+                "grants_revoked": revoked.len(),
+            })),
+            ..Default::default()
+        },
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(DeleteSecretOutcome::Deleted {
+        grants_revoked: revoked.len() as u64,
+    })
+}
+
 /// Grants that can still release a credential: not revoked, not past
 /// `not_after`, and either with uses remaining (the fresh-use predicate
 /// `begin_grant_use` increments under) OR still inside a replay window.
@@ -1020,6 +1137,127 @@ mod tests {
         writer.await??;
         assert!(sealed.load(Ordering::SeqCst));
         assert!(crate::db::get_secret_by_name(db, "locked").await?.is_some());
+
+        t.teardown().await;
+        Ok(())
+    }
+
+    /// Deleting a secret takes its versions and tags with it, revokes the live
+    /// grants that were backed by it (with an audit row each), leaves a
+    /// passthrough grant of the same name alone, and refuses outright once the
+    /// secret has been rotated past the version the operator confirmed.
+    #[tokio::test]
+    async fn delete_secret_revokes_dependent_grants_and_binds_the_version(
+    ) -> anyhow::Result<()> {
+        let Some(t) = setup().await? else {
+            return Ok(());
+        };
+        let db = &t.pool;
+        let keyset = test_keyset();
+        let ephemeral = EphemeralKek::generate();
+
+        let secret_id = Uuid::new_v4();
+        assert!(
+            create_secret_with_version(
+                db,
+                StoreSecretParams {
+                    secret_id,
+                    name: "s1".into(),
+                    description: String::new(),
+                    max_tier: 2,
+                    injection_kind: "bearer".into(),
+                    injection_header: None,
+                    injection_username: None,
+                    seal: Box::new(|| keyset.seal(
+                        &SecretBox::new(b"v1".as_slice().into()),
+                        AadContext::SecretVersion {
+                            secret_id,
+                            version: 1,
+                        },
+                    )),
+                },
+                "andrew",
+            )
+            .await?
+        );
+        crate::db::set_secret_tags(db, secret_id, &["prod".to_owned()]).await?;
+
+        // A stored-backed grant and a passthrough grant, both naming "s1".
+        let stored_req = insert_pending(db, "s1", "d1", Utc::now() + Duration::seconds(600)).await?;
+        let stored_grant = Uuid::new_v4();
+        approve_request(
+            db,
+            stored_req.id,
+            "andrew",
+            stored_grant,
+            &grant_params(None),
+            None,
+        )
+        .await?;
+        let pt_req = insert_pending(db, "s1", "d2", Utc::now() + Duration::seconds(600)).await?;
+        let pt_grant = Uuid::new_v4();
+        let pt = PassthroughPayload::seal(
+            &ephemeral,
+            pt_grant,
+            &SecretBox::new(b"typed-in".as_slice().into()),
+        )
+        .unwrap();
+        approve_request(
+            db,
+            pt_req.id,
+            "andrew",
+            pt_grant,
+            &grant_params(Some(pt)),
+            None,
+        )
+        .await?;
+
+        // Confirming against a version that is no longer current writes
+        // nothing at all.
+        assert_eq!(
+            delete_secret_audited(db, secret_id, 7, "andrew").await?,
+            DeleteSecretOutcome::Stale
+        );
+        assert!(crate::db::get_secret_by_name(db, "s1").await?.is_some());
+        assert!(!crate::db::get_grant(db, stored_grant).await?.unwrap().revoked);
+
+        assert_eq!(
+            delete_secret_audited(db, secret_id, 1, "andrew").await?,
+            DeleteSecretOutcome::Deleted { grants_revoked: 1 }
+        );
+        assert!(crate::db::get_secret_by_name(db, "s1").await?.is_none());
+        // Versions and tags cascade with the row.
+        let versions: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM secret_versions WHERE secret_id = $1")
+                .bind(secret_id)
+                .fetch_one(db)
+                .await?;
+        assert_eq!(versions, 0);
+        let tags: i64 = sqlx::query_scalar("SELECT count(*) FROM secret_tags WHERE secret_id = $1")
+            .bind(secret_id)
+            .fetch_one(db)
+            .await?;
+        assert_eq!(tags, 0);
+        // The grant that could only have released these bytes is revoked; the
+        // one carrying its own payload is untouched.
+        assert!(crate::db::get_grant(db, stored_grant).await?.unwrap().revoked);
+        let pt_row = crate::db::get_grant(db, pt_grant).await?.unwrap();
+        assert!(!pt_row.revoked);
+        assert!(pt_row.passthrough_ciphertext.is_some());
+        // Audit: the deletion and the revocation it caused.
+        let kinds: Vec<String> = sqlx::query_scalar(
+            "SELECT kind FROM audit_log WHERE secret_name = 's1' ORDER BY id",
+        )
+        .fetch_all(db)
+        .await?;
+        assert!(kinds.contains(&kinds::SECRET_DELETED.to_owned()), "{kinds:?}");
+        assert!(kinds.contains(&kinds::GRANT_REVOKED.to_owned()), "{kinds:?}");
+
+        // Deleting again is a no-op, not an error.
+        assert_eq!(
+            delete_secret_audited(db, secret_id, 1, "andrew").await?,
+            DeleteSecretOutcome::Stale
+        );
 
         t.teardown().await;
         Ok(())

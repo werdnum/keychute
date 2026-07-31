@@ -47,6 +47,8 @@ const R_POLICY_DELETE: &str = "/ui/policies/delete";
 const R_SECRET_SAVE: &str = "/ui/secrets/save";
 const R_SECRET_REVEAL: &str = "/ui/secrets/reveal";
 const R_SECRET_VET: &str = "/ui/secrets/vet";
+const R_SECRET_DELETE: &str = "/ui/secrets/delete";
+const R_SECRET_DELETE_CONFIRM: &str = "/ui/secrets/delete-confirm";
 
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -69,6 +71,8 @@ pub fn router(state: AppState) -> Router {
         .route("/ui/secrets", post(save_secret))
         .route("/ui/secrets/{id}/review", post(review_secret))
         .route("/ui/secrets/{id}/reviewed", post(mark_reviewed))
+        .route("/ui/secrets/{id}/delete", post(delete_secret_page))
+        .route("/ui/secrets/{id}/deleted", post(delete_secret))
         .layer(axum::middleware::from_fn(security_headers))
         .with_state(state)
 }
@@ -2654,6 +2658,16 @@ async fn secrets_page(State(state): State<AppState>, headers: HeaderMap) -> UiRe
                                                 button .small type="submit" { "Review value" }
                                             }
                                         }
+                                        // Goes to a confirmation page, never
+                                        // straight to the delete: this is the
+                                        // one action that destroys credential
+                                        // bytes.
+                                        form method="post"
+                                            action={ "/ui/secrets/" (s.id) "/delete" } .inline {
+                                            input type="hidden" name="csrf_token"
+                                                value=(csrf::issue_token(&state.keyset, R_SECRET_DELETE, &s.id.to_string(), &op.subject, "", now));
+                                            button .small .danger type="submit" { "Delete" }
+                                        }
                                     }
                                 }
                             }
@@ -3089,6 +3103,279 @@ async fn mark_reviewed(
         ));
     }
     Ok(Redirect::to("/ui/secrets").into_response())
+}
+
+/// Standing policy rows that select this secret — by name, by one of its
+/// tags, or by matching everything. They are NOT deleted with the secret: a
+/// tag-scoped or wildcard row is about other secrets too, and silently
+/// removing an authorization rule an operator wrote elsewhere is not something
+/// a delete button should do. Listed on the confirmation page instead, because
+/// a by-name row outliving its secret would apply again to anything later
+/// created under that name.
+fn policies_selecting_secret<'a>(
+    policies: &'a [db::PolicyRow],
+    secret_name: &str,
+    tags: &[String],
+) -> Vec<&'a db::PolicyRow> {
+    policies
+        .iter()
+        .filter(|p| match (&p.secret_name, &p.secret_tag) {
+            (Some(name), _) => name == secret_name,
+            (None, Some(tag)) => tags.contains(tag),
+            (None, None) => true,
+        })
+        .collect()
+}
+
+/// POST /ui/secrets/{id}/delete — the confirmation page for a deletion.
+///
+/// Deleting a secret destroys the only copy of a credential Keychute holds,
+/// so the button on the list page lands here rather than doing the work: this
+/// page says what else goes with it — the live grants that will be revoked,
+/// the pending requests that will no longer have a stored value to release,
+/// and the standing policies that will outlive the name.
+///
+/// POST like the review page, and for the same reason in reverse: no URL that
+/// mutates or that a browser might re-issue from history should sit between
+/// the operator and a destructive action.
+///
+/// The confirm form is bound to the version shown here (CSRF token AND the
+/// `AND current_version = $2` in the delete), so a rotation landing in between
+/// sends the operator back to look rather than destroying bytes they never saw.
+async fn delete_secret_page(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    Form(form): Form<CsrfOnlyForm>,
+) -> UiResult<Response> {
+    let op = operator(&state, &headers).await?;
+    check_post(
+        &state,
+        &headers,
+        R_SECRET_DELETE,
+        &id.to_string(),
+        &op.subject,
+        "",
+        &form.csrf_token,
+    )?;
+    let secret = db::list_secrets(&state.db)
+        .await?
+        .into_iter()
+        .find(|s| s.id == id)
+        .ok_or_else(|| UiError::new(StatusCode::NOT_FOUND, "no such secret"))?;
+    let now = Utc::now();
+    let tags = db::get_tags_for_secret(&state.db, secret.id).await?;
+    let policies = db::list_policies(&state.db).await?;
+    let selecting = policies_selecting_secret(&policies, &secret.name, &tags);
+    // Same "active" definition the grants page uses, so the two cannot
+    // disagree about what deletion is about to revoke. Passthrough grants are
+    // excluded here for the same reason the delete leaves them alone: their
+    // payload never came from this row.
+    let grants: Vec<db::GrantRow> =
+        db::ui_ext::list_active_grants(&state.db, state.config.limits.replay_window_seconds)
+            .await?
+            .into_iter()
+            .filter(|g| g.secret_name == secret.name && !g.passthrough_ephemeral)
+            .collect();
+    let pending: Vec<db::AccessRequestRow> = db::list_pending(&state.db)
+        .await?
+        .into_iter()
+        .filter(|r| r.secret_name == secret.name)
+        .collect();
+
+    let marker = secret.current_version.to_string();
+    let confirm_token = csrf::issue_token(
+        &state.keyset,
+        R_SECRET_DELETE_CONFIRM,
+        &id.to_string(),
+        &op.subject,
+        &marker,
+        now,
+    );
+    Ok(html_page_at(
+        "Delete secret",
+        "/ui/secrets",
+        html! {
+            (page_head("Delete a stored secret", html! {
+                "This removes the credential itself — every stored version of it — and "
+                "cannot be undone. Keychute holds no other copy: if this is the only "
+                "place the value lives, rotate it at the provider first."
+            }))
+            div .card {
+                h2 { span .mono { (secret.name) } }
+                table .kv {
+                    tr {
+                        th { "Versions stored" }
+                        td { (secret.current_version) " (all of them go)" }
+                    }
+                    tr {
+                        th { "Max tier" }
+                        td {
+                            @match Tier::from_int(secret.max_tier) {
+                                Some(t) => { (tier_badge(t)) }
+                                None => { span .badge .muted { "?" } }
+                            }
+                        }
+                    }
+                    tr {
+                        th { "Injection" }
+                        td {
+                            span .mono { (secret.injection_kind) }
+                            @if let Some(h) = &secret.injection_header {
+                                " into header " span .mono { (h) }
+                            }
+                            @if let Some(u) = &secret.injection_username {
+                                " as user " span .mono { (u) }
+                            }
+                        }
+                    }
+                    @if !secret.description.is_empty() {
+                        tr { th { "Description" } td { (secret.description) } }
+                    }
+                    @if !tags.is_empty() {
+                        tr {
+                            th { "Tags" }
+                            td { @for t in &tags { span .mono { (t) } " " } }
+                        }
+                    }
+                }
+            }
+            div .card {
+                h2 { "What goes with it" }
+                @if grants.is_empty() {
+                    p { "No live grant can currently release this secret." }
+                } @else {
+                    div .callout .callout-danger {
+                        p {
+                            "These live grants will be " b { "revoked" }
+                            " — a grant whose secret is gone cannot release anything, "
+                            "and the client will be told so on its next call:"
+                        }
+                        ul {
+                            @for g in &grants {
+                                li {
+                                    span .mono { (g.client_name) }
+                                    " via " span .mono { (g.mechanism) }
+                                    ", until " (g.not_after.format("%Y-%m-%d %H:%M UTC"))
+                                }
+                            }
+                        }
+                    }
+                }
+                @if !pending.is_empty() {
+                    div .callout .callout-attention {
+                        p {
+                            (pending.len())
+                            @if pending.len() == 1 { " pending request asks" } @else { " pending requests ask" }
+                            " for this secret. They stay pending: approving one after the "
+                            "deletion means typing a value in yourself or releasing a "
+                            "different stored secret instead."
+                        }
+                    }
+                }
+                @if !selecting.is_empty() {
+                    div .callout .callout-attention {
+                        p {
+                            "These standing policies select this secret and are "
+                            b { "kept" } " — a by-name row would apply again to anything "
+                            "later created under the same name. Delete them separately on "
+                            a href="/ui/policies" { "the policies page" } " if they are no "
+                            "longer wanted:"
+                        }
+                        ul {
+                            @for p in &selecting {
+                                li {
+                                    (policy_outcome_badge(&p.outcome)) " "
+                                    span .mono { (p.mechanism) }
+                                    " for client "
+                                    span .mono {
+                                        @match &p.client_name {
+                                            Some(c) => { (c) }
+                                            None => { "ANY CLIENT" }
+                                        }
+                                    }
+                                    @match (&p.secret_name, &p.secret_tag) {
+                                        (Some(_), _) => { " (this secret by name)" }
+                                        (None, Some(tag)) => { " (tag " span .mono { (tag) } ")" }
+                                        (None, None) => { " (any secret)" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                p .muted {
+                    "The audit log keeps its record of this secret — every release, "
+                    "rotation and the deletion itself. Only the credential bytes go."
+                }
+            }
+            div .card {
+                p .muted {
+                    "This deletes version " (secret.current_version) " and everything "
+                    "before it. If the secret is rotated before you confirm, you will be "
+                    "asked to look again."
+                }
+                div .actions-bar {
+                    form method="post" action={ "/ui/secrets/" (secret.id) "/deleted" } .inline {
+                        input type="hidden" name="csrf_token" value=(confirm_token);
+                        input type="hidden" name="current_version" value=(marker);
+                        button .danger type="submit" {
+                            "Delete " (secret.name) " permanently"
+                        }
+                    }
+                    a .btn href="/ui/secrets" { "Keep it" }
+                }
+            }
+        },
+    )
+    .into_response())
+}
+
+#[derive(Deserialize)]
+struct DeleteSecretForm {
+    csrf_token: String,
+    /// The version the confirmation page displayed. Echoed back and bound into
+    /// the CSRF token, so it cannot be swapped for another.
+    current_version: String,
+}
+
+/// POST /ui/secrets/{id}/deleted — carry out a confirmed deletion.
+async fn delete_secret(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    Form(form): Form<DeleteSecretForm>,
+) -> UiResult<Response> {
+    let op = operator(&state, &headers).await?;
+    // The version is part of the token's binding: only the confirmation page
+    // that actually described those versions can produce a token that verifies
+    // here.
+    check_post(
+        &state,
+        &headers,
+        R_SECRET_DELETE_CONFIRM,
+        &id.to_string(),
+        &op.subject,
+        &form.current_version,
+        &form.csrf_token,
+    )?;
+    let current_version: i32 = form
+        .current_version
+        .parse()
+        .map_err(|_| UiError::bad_request("invalid version"))?;
+    // Gone or rotated since the confirmation page rendered: nothing was
+    // written and nothing audited, so say so rather than redirecting as if
+    // this call did the work — same as the revoke and vet handlers.
+    match db::ui_ext::delete_secret_audited(&state.db, id, current_version, &op.subject).await? {
+        db::ui_ext::DeleteSecretOutcome::Stale => Err(UiError::new(
+            StatusCode::CONFLICT,
+            "that secret no longer exists, or has been rotated since you opened the \
+             confirmation — open it again to delete the current value",
+        )),
+        db::ui_ext::DeleteSecretOutcome::Deleted { .. } => {
+            Ok(Redirect::to("/ui/secrets").into_response())
+        }
+    }
 }
 
 async fn save_secret(
