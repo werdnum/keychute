@@ -77,15 +77,25 @@ const MAX_BODY_ENV: &str = "KEYCHUTE_MAX_BODY_BYTES";
 /// error rather than a silent fallback: quietly using a different bound than
 /// the one asked for is how a body gets truncated without anyone noticing.
 fn max_body_bytes() -> CliResult<usize> {
-    match std::env::var(MAX_BODY_ENV) {
-        Err(_) => Ok(DEFAULT_MAX_BODY_BYTES),
-        Ok(raw) => match raw.trim().parse::<usize>() {
-            Ok(n) if n > 0 => Ok(n),
-            _ => Err(fail(
-                EXIT_CONFIG,
-                format!("{MAX_BODY_ENV} must be a positive byte count, got {raw:?}"),
-            )),
-        },
+    parse_max_body(std::env::var(MAX_BODY_ENV).ok().as_deref())
+}
+
+/// The parsing half, kept pure so it is testable without mutating process
+/// environment that sibling tests read concurrently.
+fn parse_max_body(raw: Option<&str>) -> CliResult<usize> {
+    let Some(raw) = raw else {
+        return Ok(DEFAULT_MAX_BODY_BYTES);
+    };
+    match raw.trim().parse::<usize>() {
+        // The reader needs `limit + 1` to tell "at the bound" from "over it".
+        // A value with no room for that would wrap in release builds and make
+        // `take(0)` read NOTHING — turning a side-effecting request into one
+        // with an empty body, silently.
+        Ok(n) if n > 0 && n < usize::MAX => Ok(n),
+        _ => Err(fail(
+            EXIT_CONFIG,
+            format!("{MAX_BODY_ENV} must be a positive byte count, got {raw:?}"),
+        )),
     }
 }
 
@@ -269,11 +279,44 @@ pub(crate) fn parse_target(raw: &str) -> Result<Target, String> {
         .ok_or_else(|| format!("URL {raw:?} has no host"))?;
     let mut origin = Origin::parse(host)?;
     origin.port = url.port();
+    // Path and query come from the ORIGINAL string, not from `url`: the URL
+    // parser resolves dot segments at parse time, including ENCODED ones, so
+    // `url.path()` for `/a/%2e%2e/admin` is already `/admin`. Taking it from
+    // there would send a request to a resource the caller did not name and
+    // launder past `policy::paths::canonicalize`, which exists to reject that
+    // exact input. The authority is still the parser's answer — that is what
+    // it is good for, and `Origin::parse` re-checks it.
+    let (path, query) = raw_path_and_query(raw);
     Ok(Target {
         origin,
-        path: url.path().to_string(),
-        query: url.query().map(|q| q.to_string()),
+        path,
+        query,
     })
+}
+
+/// The path and query EXACTLY as written, without the normalization a URL
+/// parser applies. Assumes the scheme/authority have already been validated by
+/// one, which is why it can simply scan past `://`.
+fn raw_path_and_query(raw: &str) -> (String, Option<String>) {
+    let after_scheme = match raw.find("://") {
+        Some(i) => &raw[i + 3..],
+        None => raw,
+    };
+    // The authority runs to the first '/', '?' or '#'.
+    let start = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let rest = &after_scheme[start..];
+    let (path_part, query_part) = match rest.split_once('?') {
+        Some((p, q)) => (p, Some(q.split('#').next().unwrap_or(q))),
+        None => (rest.split('#').next().unwrap_or(rest), None),
+    };
+    let path = if path_part.is_empty() {
+        "/".to_string()
+    } else {
+        path_part.to_string()
+    };
+    (path, query_part.map(|q| q.to_string()))
 }
 
 /// Normalize and validate an HTTP method. Uppercased because that is the form
@@ -428,11 +471,17 @@ fn read_body_bounded(args: &CurlArgs, limit: usize) -> CliResult<Option<Vec<u8>>
     };
 
     let mut out: Vec<u8> = Vec::new();
-    for piece in pieces {
-        if !out.is_empty() {
+    for (i, piece) in pieces.iter().enumerate() {
+        if i > 0 {
             // curl's rule for repeated data options: the pieces are merged
             // with a separating `&`, which is what makes `-d a=1 -d b=2` a
             // form body rather than an error.
+            //
+            // Keyed on the piece INDEX, not on whether anything has been
+            // written: an empty first piece (`-d '' -d action=delete`, or an
+            // empty `@file`) still separates, so the body is `&action=delete`
+            // the way curl sends it. A body that differs by a byte can
+            // invalidate a signature or mean something else entirely.
             out.push(b'&');
         }
         let source = match piece.strip_prefix('@') {
@@ -467,7 +516,13 @@ fn read_body_bounded(args: &CurlArgs, limit: usize) -> CliResult<Option<Vec<u8>>
 /// or a `@/dev/zero` slip would eat memory to no purpose. The message names the
 /// override, because the bound is ours and the deployment's real cap may differ.
 fn read_bounded(source: impl Read, buf: &mut Vec<u8>, limit: usize) -> std::io::Result<()> {
-    source.take(limit as u64 + 1).read_to_end(buf)?;
+    // Saturating rather than wrapping: `max_body_bytes` already refuses a
+    // limit with no room for the lookahead, and this is the other half of
+    // that — a caller passing one directly gets a read that is merely
+    // unbounded-in-practice, never one that reads zero bytes.
+    source
+        .take((limit as u64).saturating_add(1))
+        .read_to_end(buf)?;
     if buf.len() > limit {
         buf.clear();
         return Err(std::io::Error::other(format!(
@@ -573,6 +628,48 @@ fn credential_selector(args: &CurlArgs) -> CliResult<Selector> {
     }
 }
 
+/// Everything about the grant this invocation would ask for that can be
+/// judged from arguments alone: the idempotency key's length, each
+/// `--allow-method`, and whether the `--path-prefix` set covers the call.
+///
+/// Separate from [`constraints_for`], which builds the real object once the
+/// method is known (it depends on whether a body was supplied). This runs
+/// BEFORE the body is read, so `-d @-` cannot leave an already-invalid
+/// invocation blocked on a producer, or swallow a finite one's input and only
+/// then report the error. `constraints_for` re-runs the same rules rather than
+/// trusting this to have happened.
+fn validate_grant_options(args: &CurlArgs, target: &Target) -> CliResult<()> {
+    if let Some(key) = &args.idempotency_key {
+        if key.len() > MAX_CURL_USER_KEY_BYTES {
+            return Err(fail(
+                EXIT_CONFIG,
+                format!(
+                    "--idempotency-key too long ({} bytes; max {MAX_CURL_USER_KEY_BYTES} here, \
+                     because the call is bound into the key sent to the server)",
+                    key.len()
+                ),
+            ));
+        }
+    }
+    for m in &args.allow_methods {
+        normalize_method(m).map_err(|e| fail(EXIT_CONFIG, e))?;
+    }
+    // Reuses the real rule so the two cannot drift; the method is irrelevant
+    // to every check it performs on the prefixes.
+    if !args.path_prefixes.is_empty() {
+        constraints_for(
+            target,
+            "GET",
+            &[],
+            &args.path_prefixes,
+            args.ttl,
+            args.max_uses,
+        )
+        .map_err(|e| fail(EXIT_CONFIG, e))?;
+    }
+    Ok(())
+}
+
 pub(crate) async fn run_curl(
     cfg: &Config,
     http: &reqwest::Client,
@@ -594,6 +691,7 @@ pub(crate) async fn run_curl(
     for line in &args.headers {
         parsed.push(parse_header(line).map_err(|e| fail(EXIT_CONFIG, e))?);
     }
+    validate_grant_options(&args, &target)?;
 
     let body = read_body(&args)?;
     let method = match explicit_method {
@@ -818,7 +916,14 @@ pub(crate) fn canonical_path(raw: &str) -> Option<String> {
             }
         }
     }
-    String::from_utf8(out).ok()
+    let decoded = String::from_utf8(out).ok()?;
+    // The server rejects `.` and `..` segments after decoding rather than
+    // resolving them, so a path containing one has no canonical form here
+    // either — the local checks skip it and the server gives the answer.
+    if decoded.split('/').any(|seg| seg == "." || seg == "..") {
+        return None;
+    }
+    Some(decoded)
 }
 
 /// Prefix match at `/` segment boundaries, mirroring the server's rule:
@@ -851,6 +956,9 @@ async fn acquire_grant(
         .idempotency_key
         .clone()
         .unwrap_or_else(|| Uuid::new_v4().to_string());
+    // Re-checked here rather than assumed: `validate_grant_options` runs it
+    // earlier so the failure lands before stdin is read, but this is the call
+    // site that depends on it holding.
     if user_key.len() > MAX_CURL_USER_KEY_BYTES {
         return Err(fail(
             EXIT_CONFIG,
@@ -1477,6 +1585,100 @@ mod tests {
             &base
         ))
         .is_ok());
+    }
+
+    #[test]
+    fn encoded_dot_segments_reach_the_server_unresolved() {
+        // `reqwest::Url` resolves dot segments at parse time, encoded ones
+        // included, so taking the path from it would send this call to
+        // /admin — a resource the caller never named — and launder past the
+        // server check that exists to reject it.
+        let t = parse_target("https://api.example.com/a/%2e%2e/admin").unwrap();
+        assert_eq!(t.path, "/a/%2e%2e/admin");
+        // No canonical form locally either, so the local checks defer and the
+        // server returns invalid-path.
+        assert!(canonical_path(&t.path).is_none());
+        // A literal `/../` is equally preserved.
+        let t = parse_target("https://api.example.com/a/../admin").unwrap();
+        assert_eq!(t.path, "/a/../admin");
+        assert!(canonical_path(&t.path).is_none());
+        // Ordinary paths and queries are unaffected.
+        let t = parse_target("https://api.example.com/v1/things?x=1&y=2").unwrap();
+        assert_eq!(t.path, "/v1/things");
+        assert_eq!(t.query.as_deref(), Some("x=1&y=2"));
+        assert_eq!(parse_target("https://api.example.com").unwrap().path, "/");
+        let t = parse_target("https://api.example.com?x=1").unwrap();
+        assert_eq!(t.path, "/");
+        assert_eq!(t.query.as_deref(), Some("x=1"));
+        // A port in the authority is not mistaken for the path.
+        let t = parse_target("https://api.example.com:8443/v1").unwrap();
+        assert_eq!(t.path, "/v1");
+        assert_eq!(t.origin.port, Some(8443));
+    }
+
+    #[test]
+    fn an_empty_first_data_piece_still_separates() {
+        // curl merges pieces with `&` by position, so an empty first piece
+        // yields a LEADING separator. A body that differs by one byte can
+        // invalidate a signature.
+        assert_eq!(
+            read_body(&body_args_multi(vec!["", "action=delete"], vec![], vec![]))
+                .unwrap()
+                .unwrap(),
+            b"&action=delete"
+        );
+        assert_eq!(
+            read_body(&body_args_multi(vec!["a=1", "", "b=2"], vec![], vec![]))
+                .unwrap()
+                .unwrap(),
+            b"a=1&&b=2"
+        );
+    }
+
+    #[test]
+    fn a_body_limit_with_no_room_for_the_lookahead_is_refused() {
+        // usize::MAX would wrap `limit + 1` to zero and make the reader take
+        // NOTHING — an @file request silently sending an empty body.
+        let err = parse_max_body(Some(&usize::MAX.to_string())).unwrap_err();
+        assert_eq!(err.code, EXIT_CONFIG);
+        assert!(parse_max_body(Some("0")).is_err());
+        assert!(parse_max_body(Some("not-a-number")).is_err());
+        assert_eq!(parse_max_body(Some("4096")).unwrap(), 4096);
+        assert_eq!(parse_max_body(None).unwrap(), DEFAULT_MAX_BODY_BYTES);
+        // The reader itself is safe against a bound passed directly, too.
+        let mut buf = Vec::new();
+        assert!(read_bounded(std::io::repeat(b'x'), &mut buf, 64).is_err());
+    }
+
+    #[test]
+    fn grant_options_are_validated_from_arguments_alone() {
+        // These all run before the body is read, so `-d @-` cannot block an
+        // invocation that is already known to be invalid.
+        let t = parse_target("https://api.example.com/admin").unwrap();
+        let mut args = body_args(None, None, None);
+        args.url = "https://api.example.com/admin".into();
+        args.secret = Some("s".into());
+        assert!(validate_grant_options(&args, &t).is_ok());
+
+        args.allow_methods = vec!["TRACE".into()];
+        assert!(validate_grant_options(&args, &t).is_err());
+        args.allow_methods = vec![];
+
+        args.path_prefixes = vec!["v1".into()];
+        assert!(
+            validate_grant_options(&args, &t).is_err(),
+            "relative prefix"
+        );
+        args.path_prefixes = vec!["/v1".into()];
+        assert!(
+            validate_grant_options(&args, &t).is_err(),
+            "prefix that cannot cover the call"
+        );
+        args.path_prefixes = vec!["/admin".into()];
+        assert!(validate_grant_options(&args, &t).is_ok());
+
+        args.idempotency_key = Some("k".repeat(MAX_CURL_USER_KEY_BYTES + 1));
+        assert!(validate_grant_options(&args, &t).is_err());
     }
 
     #[test]
