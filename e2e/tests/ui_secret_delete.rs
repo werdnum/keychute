@@ -145,7 +145,10 @@ async fn delete_is_guarded_and_bound_to_the_displayed_version() {
 
     // A POST without the form token is refused.
     let (status, _) = env
-        .ui_post(&format!("/ui/secrets/{id}/delete"), &[("csrf_token", "nope")])
+        .ui_post(
+            &format!("/ui/secrets/{id}/delete"),
+            &[("csrf_token", "nope")],
+        )
         .await
         .unwrap();
     assert_eq!(status, 403);

@@ -1147,8 +1147,7 @@ mod tests {
     /// passthrough grant of the same name alone, and refuses outright once the
     /// secret has been rotated past the version the operator confirmed.
     #[tokio::test]
-    async fn delete_secret_revokes_dependent_grants_and_binds_the_version(
-    ) -> anyhow::Result<()> {
+    async fn delete_secret_revokes_dependent_grants_and_binds_the_version() -> anyhow::Result<()> {
         let Some(t) = setup().await? else {
             return Ok(());
         };
@@ -1183,7 +1182,8 @@ mod tests {
         crate::db::set_secret_tags(db, secret_id, &["prod".to_owned()]).await?;
 
         // A stored-backed grant and a passthrough grant, both naming "s1".
-        let stored_req = insert_pending(db, "s1", "d1", Utc::now() + Duration::seconds(600)).await?;
+        let stored_req =
+            insert_pending(db, "s1", "d1", Utc::now() + Duration::seconds(600)).await?;
         let stored_grant = Uuid::new_v4();
         approve_request(
             db,
@@ -1219,7 +1219,12 @@ mod tests {
             DeleteSecretOutcome::Stale
         );
         assert!(crate::db::get_secret_by_name(db, "s1").await?.is_some());
-        assert!(!crate::db::get_grant(db, stored_grant).await?.unwrap().revoked);
+        assert!(
+            !crate::db::get_grant(db, stored_grant)
+                .await?
+                .unwrap()
+                .revoked
+        );
 
         assert_eq!(
             delete_secret_audited(db, secret_id, 1, "andrew").await?,
@@ -1240,18 +1245,28 @@ mod tests {
         assert_eq!(tags, 0);
         // The grant that could only have released these bytes is revoked; the
         // one carrying its own payload is untouched.
-        assert!(crate::db::get_grant(db, stored_grant).await?.unwrap().revoked);
+        assert!(
+            crate::db::get_grant(db, stored_grant)
+                .await?
+                .unwrap()
+                .revoked
+        );
         let pt_row = crate::db::get_grant(db, pt_grant).await?.unwrap();
         assert!(!pt_row.revoked);
         assert!(pt_row.passthrough_ciphertext.is_some());
         // Audit: the deletion and the revocation it caused.
-        let kinds: Vec<String> = sqlx::query_scalar(
-            "SELECT kind FROM audit_log WHERE secret_name = 's1' ORDER BY id",
-        )
-        .fetch_all(db)
-        .await?;
-        assert!(kinds.contains(&kinds::SECRET_DELETED.to_owned()), "{kinds:?}");
-        assert!(kinds.contains(&kinds::GRANT_REVOKED.to_owned()), "{kinds:?}");
+        let kinds: Vec<String> =
+            sqlx::query_scalar("SELECT kind FROM audit_log WHERE secret_name = 's1' ORDER BY id")
+                .fetch_all(db)
+                .await?;
+        assert!(
+            kinds.contains(&kinds::SECRET_DELETED.to_owned()),
+            "{kinds:?}"
+        );
+        assert!(
+            kinds.contains(&kinds::GRANT_REVOKED.to_owned()),
+            "{kinds:?}"
+        );
 
         // Deleting again is a no-op, not an error.
         assert_eq!(
