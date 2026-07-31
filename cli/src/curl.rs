@@ -220,9 +220,10 @@ pub(crate) struct CurlArgs {
     /// How long to wait for approval before giving up, in seconds.
     #[arg(long, default_value_t = 900)]
     pub timeout: u64,
-    /// Deadline for the proxied call itself, in seconds.
-    #[arg(long, default_value_t = 120)]
-    pub max_time: u64,
+    /// Deadline for the proxied call itself, in seconds. Fractional, as curl
+    /// takes it (`--max-time 0.5`); 0 disables the limit.
+    #[arg(long, default_value_t = 120.0)]
+    pub max_time: f64,
     /// Idempotency key for the access request (random UUID if omitted).
     #[arg(long)]
     pub idempotency_key: Option<String>,
@@ -656,6 +657,24 @@ fn read_body_with(
         }
         out.extend_from_slice(&buf);
     }
+    // The per-piece bound governs each READ; it cannot govern the separators
+    // or the inline pieces, which are argv and never went through
+    // `read_bounded` at all. `-d @empty -d @empty -d @empty` under a 1-byte
+    // bound assembles `&&` from three reads that each fitted. The bound is on
+    // the whole body, so the whole body is what is finally measured — and with
+    // the override set to mirror a deployment's proxy cap, this is the
+    // difference between saying so now and spending an approval to be told in
+    // a 413.
+    if out.len() > limit {
+        return Err(fail(
+            EXIT_CONFIG,
+            format!(
+                "assembled request body is {} bytes, over the local {limit}-byte bound \
+                 (raise it with {MAX_BODY_ENV} if this deployment allows more)",
+                out.len()
+            ),
+        ));
+    }
     Ok(Some(out))
 }
 
@@ -848,6 +867,20 @@ fn validate_grant_options(args: &CurlArgs, target: &Target, method: &str) -> Cli
             format!("--max-uses must be at most {MAX_SERVER_USES} (0 means no cap)"),
         ));
     }
+    // `Duration::from_secs_f64` PANICS on a negative, NaN or overflowing
+    // value, so the range is checked rather than trusted to clap, which only
+    // knows the argument parses as a float.
+    if !(args.max_time.is_finite()
+        && args.max_time >= 0.0
+        && args.max_time <= MAX_APPROVAL_WAIT_SECONDS as f64)
+    {
+        return Err(fail(
+            EXIT_CONFIG,
+            format!(
+                "--max-time must be between 0 (no limit) and {MAX_APPROVAL_WAIT_SECONDS} seconds"
+            ),
+        ));
+    }
     if args.timeout > MAX_APPROVAL_WAIT_SECONDS {
         return Err(fail(
             EXIT_CONFIG,
@@ -925,6 +958,47 @@ fn validate_grant_options(args: &CurlArgs, target: &Target, method: &str) -> Cli
         .map_err(|e| fail(EXIT_CONFIG, e))?;
     }
     Ok(())
+}
+
+/// Build the agent-asserted context for the access request, and prove it fits.
+///
+/// The grant block the server parses out of the constraints is what the
+/// approval page presents as fact, but the full target — query string included
+/// — is what the operator actually reads, and it is forwarded verbatim, so it
+/// belongs in front of them.
+///
+/// The shedding runs after the target is inserted, not just at build time: the
+/// target is MANDATORY and the capture is a courtesy, so a capture that fitted
+/// on its own must not be what pushes the target past the server's cap.
+///
+/// And then the result is measured. Shedding can only drop capture sections;
+/// a target whose own displayed URL exceeds the cap — a ~17 KiB query is well
+/// within argv limits — leaves a map nothing can shrink, which the server
+/// rejects outright. Deciding that here is what keeps `-d @-` from blocking on
+/// a producer for a request already certain to be refused.
+fn build_request_context(target: &Target, method: &str) -> CliResult<serde_json::Value> {
+    let mut structured = build_structured_context().unwrap_or(serde_json::json!({}));
+    if let Some(map) = structured.as_object_mut() {
+        map.insert(
+            "target".to_string(),
+            serde_json::Value::String(format!("{method} {}", target.display())),
+        );
+        crate::shed_structured_to_fit(map);
+        let len = serde_json::to_vec(map).map(|v| v.len()).unwrap_or(0);
+        if len > crate::MAX_STRUCTURED_BYTES {
+            return Err(fail(
+                EXIT_CONFIG,
+                format!(
+                    "the approval context is {len} bytes, over the server's \
+                     {}-byte limit, and nothing left in it can be dropped — the target \
+                     itself is too long. Shorten the URL (its query string is the usual \
+                     culprit) or move the detail into --reason.",
+                    crate::MAX_STRUCTURED_BYTES
+                ),
+            ));
+        }
+    }
+    Ok(structured)
 }
 
 /// Open `--output` before any approval is asked for, and KEEP the handle.
@@ -1011,6 +1085,21 @@ pub(crate) async fn run_curl(
         }
     }
     validate_grant_options(&args, &target, &method)?;
+    // The last body-independent question, and the only one that needs the
+    // network: whether a reused grant covers this call at all. Its mechanism,
+    // origin, method and path are properties of the GRANT, so an invocation
+    // certain to be refused should not first block on a producer.
+    //
+    // The fresh-grant path is the other way round on purpose — `acquire_grant`
+    // waits for a human, and asking for that before the body is in hand would
+    // spend the approval on a call that might still fail to assemble.
+    let structured = match &selector {
+        Selector::Grant(id) => {
+            check_grant_covers(cfg, http, *id, &target, &method).await?;
+            None
+        }
+        Selector::Secret(_) => Some(build_request_context(&target, &method)?),
+    };
     // Inputs before outputs, so `-d @payload -o payload` cannot answer its own
     // missing file with an empty one.
     let sources = open_body_sources(&args)?;
@@ -1045,12 +1134,19 @@ pub(crate) async fn run_curl(
     }
 
     let (grant_id, freshly_approved) = match selector {
-        Selector::Grant(id) => {
-            check_grant_covers(cfg, http, id, &target, &method).await?;
-            (id, false)
-        }
+        // Already validated, above.
+        Selector::Grant(id) => (id, false),
         Selector::Secret(secret_name) => (
-            acquire_grant(cfg, http, &args, &target, &method, secret_name).await?,
+            acquire_grant(
+                cfg,
+                http,
+                &args,
+                &target,
+                &method,
+                secret_name,
+                structured.expect("a secret selector builds its context"),
+            )
+            .await?,
             true,
         ),
     };
@@ -1313,6 +1409,7 @@ async fn acquire_grant(
     target: &Target,
     method: &str,
     secret_name: String,
+    structured: serde_json::Value,
 ) -> CliResult<Uuid> {
     let user_key = args
         .idempotency_key
@@ -1342,22 +1439,6 @@ async fn acquire_grant(
         args.max_uses,
     )
     .map_err(|e| fail(EXIT_CONFIG, e))?;
-
-    // Agent-asserted context: the grant block the server parses out of the
-    // constraints is what the approval page presents as fact, but the full
-    // target — query string included — is what the operator actually reads,
-    // and it is forwarded verbatim, so it belongs in front of them.
-    let mut structured = build_structured_context().unwrap_or(serde_json::json!({}));
-    if let Some(map) = structured.as_object_mut() {
-        map.insert(
-            "target".to_string(),
-            serde_json::Value::String(format!("{method} {}", target.display())),
-        );
-        // Re-run after the insertion, not just at build time: the target is
-        // mandatory and the capture is a courtesy, so a capture that fitted on
-        // its own must not be what pushes the target past the server's cap.
-        crate::shed_structured_to_fit(map);
-    }
 
     let body = CreateAccessRequest {
         idempotency_key: idem_key.clone(),
@@ -1532,8 +1613,8 @@ async fn proxy_call(
     // would instead time out instantly — and a request that was already sent
     // can still commit upstream, so the caller would be told it failed and
     // invited to repeat a side effect that succeeded.
-    if args.max_time > 0 {
-        req = req.timeout(Duration::from_secs(args.max_time));
+    if args.max_time > 0.0 {
+        req = req.timeout(Duration::from_secs_f64(args.max_time));
     }
     for (name, value) in headers {
         req = req.header(name, value);
@@ -1834,7 +1915,7 @@ mod tests {
             ttl: 300,
             max_uses: 1,
             timeout: 900,
-            max_time: 120,
+            max_time: 120.0,
             idempotency_key: None,
             grant_id: None,
             path_prefixes: vec![],
@@ -1869,6 +1950,55 @@ mod tests {
         );
         std::fs::remove_file(&dir).unwrap();
         assert!(read_body(&body_args(Some("@/nonexistent/keychute-test"), None, None)).is_err());
+    }
+
+    #[test]
+    fn a_target_too_long_for_the_approval_context_is_refused() {
+        // Shedding drops capture sections; the target is not one of them, so a
+        // URL whose own query fills the cap leaves a map nothing can shrink
+        // and a request the server will certainly reject.
+        let huge = format!(
+            "https://api.example.com/v1/things?q={}",
+            "x".repeat(crate::MAX_STRUCTURED_BYTES)
+        );
+        let target = parse_target(&huge).unwrap();
+        let err = build_request_context(&target, "GET").unwrap_err();
+        assert_eq!(err.code, EXIT_CONFIG);
+        assert!(err.message.contains("approval context"), "{}", err.message);
+
+        // An ordinary target fits, and carries the method and URL the operator
+        // reads.
+        let target = parse_target("https://api.example.com/v1/things?a=1").unwrap();
+        let ctx = build_request_context(&target, "POST").unwrap();
+        assert_eq!(
+            ctx["target"],
+            serde_json::json!("POST https://api.example.com/v1/things?a=1")
+        );
+    }
+
+    #[test]
+    fn max_time_takes_curls_fractional_seconds() {
+        let target = parse_target("https://api.example.com/v1/things").unwrap();
+        let mut args = body_args(None, None, None);
+        args.url = "https://api.example.com/v1/things".into();
+        args.secret = Some("s".into());
+
+        // curl's own spelling for a sub-second deadline.
+        args.max_time = 0.5;
+        assert!(validate_grant_options(&args, &target, "GET").is_ok());
+        // 0 is "no limit", which is why it is not rejected as too small.
+        args.max_time = 0.0;
+        assert!(validate_grant_options(&args, &target, "GET").is_ok());
+
+        // `Duration::from_secs_f64` panics on each of these, so none may reach
+        // it.
+        for bad in [-1.0, f64::NAN, f64::INFINITY, 1e30] {
+            args.max_time = bad;
+            assert!(
+                validate_grant_options(&args, &target, "GET").is_err(),
+                "--max-time {bad} must be refused"
+            );
+        }
     }
 
     #[test]
@@ -2118,12 +2248,23 @@ mod tests {
     fn the_read_bound_is_configurable_and_validated() {
         // A body under an explicit bound reads fine...
         assert_eq!(
-            read_body_bounded(&body_args(Some("hello"), None, None), 4)
+            read_body_bounded(&body_args(Some("hello"), None, None), 5)
                 .unwrap()
                 .unwrap(),
-            b"hello",
-            "an inline body is not read through the bounded reader"
+            b"hello"
         );
+        // ...and the bound is on the WHOLE body, not on each read. An inline
+        // piece never passes through the bounded reader at all, and neither do
+        // the `&` separators — three empty files still assemble two bytes.
+        assert!(read_body_bounded(&body_args(Some("hello"), None, None), 4).is_err());
+        let empty = std::env::temp_dir().join(format!("keychute-empty-{}", Uuid::new_v4()));
+        std::fs::write(&empty, b"").unwrap();
+        let at_empty = format!("@{}", empty.display());
+        let three = body_args_multi(vec![&at_empty, &at_empty, &at_empty], vec![], vec![]);
+        assert_eq!(read_body_bounded(&three, 2).unwrap().unwrap(), b"&&");
+        let err = read_body_bounded(&three, 1).unwrap_err();
+        assert!(err.message.contains(MAX_BODY_ENV), "{}", err.message);
+        std::fs::remove_file(&empty).unwrap();
         let path = std::env::temp_dir().join(format!("keychute-bound-{}", Uuid::new_v4()));
         std::fs::write(&path, b"0123456789").unwrap();
         let arg = format!("@{}", path.display());

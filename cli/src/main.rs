@@ -372,7 +372,7 @@ const MAX_STRUCTURED_COMMAND_CHARS: usize = 400;
 
 /// The server's own cap on `context.structured`, mirrored so the shedding
 /// below aims at the same bar the server applies.
-const MAX_STRUCTURED_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_STRUCTURED_BYTES: usize = 16 * 1024;
 
 fn json_len(map: &serde_json::Map<String, serde_json::Value>) -> usize {
     serde_json::to_vec(map).map(|v| v.len()).unwrap_or(0)

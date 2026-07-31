@@ -97,6 +97,12 @@ async fn brokered_proxy_injects_credential_and_strips_caller_headers() {
     // Audit rows carry method/path/status.
     type AuditRow = (String, Option<String>, Option<String>, Option<i32>);
     let rid: uuid::Uuid = request_id.parse().unwrap();
+    // `proxy-completed` is written by a DETACHED task, deliberately: holding
+    // the response for it could keep a credential alive past its replay
+    // window. So having the response is no evidence the row has landed, and
+    // reading once races the insert.
+    env.wait_for_audit_kinds(rid, &["proxy-attempt", "proxy-completed"])
+        .await;
     let rows: Vec<AuditRow> = sqlx::query_as(
         "SELECT kind, method, path, status FROM audit_log \
          WHERE request_id = $1 AND kind IN ('proxy-attempt', 'proxy-completed') ORDER BY id",
