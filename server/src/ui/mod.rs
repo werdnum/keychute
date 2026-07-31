@@ -981,7 +981,18 @@ fn context_block(context: Option<&RequestContext>, mechanism: Mechanism) -> Mark
                     h3 { "Reason" }
                     @if ctx.reason.is_empty() { p .muted { "(no reason given)" } }
                     @else { p { (ctx.reason) } }
-                    @if let Some(target) = claimed_target(ctx.structured.as_ref()) {
+                    // Brokered only. The caveat below describes what a BROKERED
+                    // grant constrains — an origin, a method, a canonical path,
+                    // and a query string forwarded as written. No other
+                    // mechanism has any of that, and `target` is a key any
+                    // client can put in its own context: on a cli-read or
+                    // autofill request this block would have told the operator
+                    // the server enforces protections that do not exist there,
+                    // on the strength of a string the client chose. The value
+                    // still renders below with the rest of the structured
+                    // context, as one more thing the client claims.
+                    @if let Some(target) = claimed_target(ctx.structured.as_ref())
+                        .filter(|_| mechanism == Mechanism::Brokered) {
                         h3 { "Target claimed by the client" }
                         p .mono { (target) }
                         p .caveat {
@@ -3664,6 +3675,33 @@ mod tests {
         };
         let rendered = context_block(Some(&ctx), Mechanism::Brokered).into_string();
         assert!(!rendered.contains("Target claimed by the client"));
+
+        // Brokered only: the caveat speaks of an approved origin, method and
+        // canonical path, and of a query string forwarded as written. A
+        // cli-read grant has none of those, so promoting a client-chosen
+        // `target` there would describe protections that do not exist — the
+        // page's own claim, made on the client's say-so.
+        let ctx = RequestContext {
+            reason: "ship it".to_owned(),
+            structured: Some(serde_json::json!({
+                "target": "GET https://api.example.com/users",
+            })),
+        };
+        for mechanism in [
+            Mechanism::CliRead,
+            Mechanism::Autofill,
+            Mechanism::DirectRead,
+        ] {
+            let rendered = context_block(Some(&ctx), mechanism).into_string();
+            assert!(
+                !rendered.contains("Target claimed by the client"),
+                "{mechanism:?} has no brokered constraints to point at"
+            );
+            assert!(!rendered.contains("A claim, not a constraint"));
+            // Still visible as ordinary client context, just not promoted.
+            assert!(rendered.contains("Structured context"));
+            assert!(rendered.contains("api.example.com"));
+        }
     }
 
     fn secret_row(name: &str, version: i32) -> db::SecretRow {

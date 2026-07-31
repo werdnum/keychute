@@ -1463,6 +1463,23 @@ pub(crate) async fn run_curl(
         headers.push((name, value));
     }
 
+    // A `User-Agent:` removal cannot be expressed on a client that has a
+    // default one — reqwest fills the default into any request without the
+    // header — so the removal is honoured by using a client that has none.
+    //
+    // Built HERE, before any approval is asked for: it rereads the CA bundle
+    // from disk, so constructing it after `acquire_grant` would let a bundle
+    // that moved or went unreadable during the wait fail the call with a human
+    // approval already spent — and on a path that returns before the grant id
+    // is ever reported, leaving nothing to reuse it with.
+    let ua_free;
+    let proxy_http = if suppress_user_agent {
+        ua_free = crate::build_http_client_with(cfg, None)?;
+        &ua_free
+    } else {
+        http
+    };
+
     let (grant_id, freshly_approved) = match selector {
         // Already validated, above.
         Selector::Grant(id) => (id, false),
@@ -1484,16 +1501,6 @@ pub(crate) async fn run_curl(
         ),
     };
 
-    // A `User-Agent:` removal cannot be expressed on a client that has a
-    // default one — reqwest fills the default into any request without the
-    // header — so the removal is honoured by using a client that has none.
-    let ua_free;
-    let proxy_http = if suppress_user_agent {
-        ua_free = crate::build_http_client_with(cfg, None)?;
-        &ua_free
-    } else {
-        http
-    };
     let result = proxy_call(
         cfg, proxy_http, &args, &target, &method, headers, body, grant_id, output,
     )
