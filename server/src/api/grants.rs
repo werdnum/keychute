@@ -2,7 +2,7 @@
 //! idempotent replay.
 
 use crate::api::error::ApiFailure;
-use crate::api::{owned_grant, revalidate_grant};
+use crate::api::{owned_grant, path_id, revalidate_grant};
 use crate::audit::{insert_audit, kinds, AuditEvent};
 use crate::authn::client::authenticate_client;
 use crate::crypto::{AadContext, SecretBytes};
@@ -18,7 +18,6 @@ use keychute_types::{
     Constraints, GrantInfo, Mechanism, ReadGrantRequest, ReadGrantResponse, SecretEncoding,
 };
 use secrecy::ExposeSecret;
-use uuid::Uuid;
 
 /// `GET /v1/grants/{id}` — non-secret metadata about a grant the caller owns.
 ///
@@ -41,11 +40,11 @@ use uuid::Uuid;
 /// than at the moment it applies a side effect.
 pub async fn info(
     State(state): State<AppState>,
-    Path(id): Path<Uuid>,
+    Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<GrantInfo>, ApiFailure> {
     let client = authenticate_client(&state, &headers).await?;
-    let grant = owned_grant(&state, &client, id).await?;
+    let grant = owned_grant(&state, &client, path_id(&id)?).await?;
     let mechanism = Mechanism::from_str_opt(&grant.mechanism)
         .ok_or_else(|| ApiFailure::Internal(anyhow::anyhow!("unknown grant mechanism")))?;
     let mut constraints: Constraints = serde_json::from_value(grant.constraints.clone())
@@ -137,11 +136,12 @@ fn open_secret_version(
 /// POST /v1/grants/{id}/read
 pub async fn read(
     State(state): State<AppState>,
-    Path(id): Path<Uuid>,
+    Path(id): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiFailure> {
     let client = authenticate_client(&state, &headers).await?;
+    let id = path_id(&id)?;
     let req: ReadGrantRequest = serde_json::from_slice(&body)
         .map_err(|_| ApiFailure::InvalidRequest("malformed request body"))?;
     if req.idempotency_key.is_empty() {

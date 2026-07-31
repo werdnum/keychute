@@ -162,7 +162,7 @@ pub(crate) struct Config {
     /// External/UI base URL used only for the approval hint printed to stderr.
     pub(crate) external_url: String,
     token: Option<String>,
-    token_file: Option<PathBuf>,
+    pub(crate) token_file: Option<PathBuf>,
     ca_bundle: Option<PathBuf>,
 }
 

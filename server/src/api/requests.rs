@@ -664,11 +664,11 @@ async fn owned_request(
 /// GET /v1/access-requests/{id}
 pub async fn status(
     State(state): State<AppState>,
-    Path(id): Path<Uuid>,
+    Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, ApiFailure> {
     let client = authenticate_client(&state, &headers).await?;
-    let row = owned_request(&state, &client, id).await?;
+    let row = owned_request(&state, &client, crate::api::path_id(&id)?).await?;
     let status = status_from_row(&state, &row).await?;
     Ok(Json(status).into_response())
 }
@@ -683,11 +683,12 @@ pub struct WaitParams {
 /// request resolves or the (capped) timeout elapses; may return pending.
 pub async fn wait(
     State(state): State<AppState>,
-    Path(id): Path<Uuid>,
+    Path(id): Path<String>,
     Query(params): Query<WaitParams>,
     headers: HeaderMap,
 ) -> Result<Response, ApiFailure> {
     let client = authenticate_client(&state, &headers).await?;
+    let id = crate::api::path_id(&id)?;
     let row = owned_request(&state, &client, id).await?;
 
     let max = state.config.limits.wait_max_seconds;

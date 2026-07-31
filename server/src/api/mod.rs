@@ -102,6 +102,22 @@ pub(crate) async fn status_from_row(
     })
 }
 
+/// The id from a `/v1/...{id}...` path, parsed INSIDE the handler.
+///
+/// A `Path<Uuid>` extractor rejects a malformed id before any handler runs, and
+/// axum's own rejection is a bare 400 with no [`error::KEYCHUTE_ERROR_HEADER`]
+/// on it. That breaks the contract every other error response here keeps — the
+/// marker is how a client tells a Keychute answer from an upstream's, and on
+/// these routes an unmarked 400 is Keychute's own. `proxy.rs` already parses
+/// the id in the handler for exactly this reason; these routes now do too.
+///
+/// `NotFound`, not a parse error: a malformed id is certainly not a resource
+/// this client owns, and the answer must not distinguish "malformed" from
+/// "someone else's" any more than the ownership check does.
+pub(crate) fn path_id(raw: &str) -> Result<Uuid, ApiFailure> {
+    raw.parse::<Uuid>().map_err(|_| ApiFailure::NotFound)
+}
+
 /// Fetch a grant enforcing ownership (mismatch → 404, addendum #1).
 pub(crate) async fn owned_grant(
     state: &AppState,

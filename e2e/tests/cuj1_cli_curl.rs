@@ -202,4 +202,37 @@ async fn a_malformed_grant_id_is_marked_as_keychutes_own_error() {
         "Keychute-generated errors on the proxy route must be marked"
     );
     assert_eq!(resp.headers().get("x-keychute-error").unwrap(), "not-found");
+
+    // The contract is every route's, not the proxy's alone: the grant and
+    // access-request routes took the same id through a `Path<Uuid>` extractor,
+    // which rejects before the handler and answers an unmarked 400.
+    for path in [
+        "/v1/grants/not-a-uuid",
+        "/v1/access-requests/not-a-uuid",
+        "/v1/access-requests/not-a-uuid/wait",
+    ] {
+        let resp = env.k8s().get(path).send().await.unwrap();
+        assert_eq!(resp.status(), 404, "{path}");
+        assert_eq!(
+            resp.headers()
+                .get("x-keychute-error")
+                .map(|v| v.to_str().unwrap()),
+            Some("not-found"),
+            "{path} must carry the marker like every other Keychute error"
+        );
+    }
+    let resp = env
+        .k8s()
+        .post("/v1/grants/not-a-uuid/read")
+        .json(&serde_json::json!({"idempotency_key": "k"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    assert_eq!(
+        resp.headers()
+            .get("x-keychute-error")
+            .map(|v| v.to_str().unwrap()),
+        Some("not-found")
+    );
 }

@@ -603,6 +603,65 @@ async fn reusing_a_grant_that_does_not_cover_the_path_is_refused_locally() {
     assert!(st.proxied.lock().unwrap().is_empty());
 }
 
+/// `-o` naming KEYCHUTE_TOKEN_FILE would destroy the CLI's own credential in
+/// the worst possible window: `proxy_call` truncates the output file only
+/// after the approval (so a file survives the wait), and `Config::bearer`
+/// re-reads the token file immediately after. The approval would be spent, the
+/// call would fail on an empty token, and nothing would be left to look the
+/// grant up with. Refused in preflight, with the token file intact.
+#[tokio::test(flavor = "multi_thread")]
+async fn output_over_the_token_file_is_refused_before_anything_is_spent() {
+    let (base, st) = spawn_mock(ProxyMode::Upstream).await;
+    let dir = std::env::temp_dir().join(format!("keychute-token-{}", Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let token_file = dir.join("token");
+    std::fs::write(&token_file, "client-token\n").unwrap();
+
+    // Also spelled indirectly: the check resolves both paths, so `.` or `..`
+    // in the middle cannot walk around it.
+    let indirect = dir.join("sub").join("..").join("token");
+    std::fs::create_dir(dir.join("sub")).unwrap();
+    for spelling in [token_file.clone(), indirect] {
+        let base2 = base.clone();
+        let tf = token_file.clone();
+        let (code, stderr) = tokio::task::spawn_blocking(move || {
+            let out = std::process::Command::new(cli_bin())
+                .args([
+                    "curl",
+                    "https://api.example.com/v1/x",
+                    "--secret",
+                    "example-api-token",
+                    "-o",
+                    spelling.to_str().unwrap(),
+                ])
+                .env("KEYCHUTE_URL", &base2)
+                .env("KEYCHUTE_TOKEN_FILE", &tf)
+                .env_remove("KEYCHUTE_TOKEN")
+                .env_remove("KEYCHUTE_CONTEXT")
+                .output()
+                .expect("running keychute CLI");
+            (
+                out.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+            )
+        })
+        .await
+        .unwrap();
+        assert_eq!(code, 2, "usage error: {stderr}");
+        assert!(
+            stderr.contains("KEYCHUTE_TOKEN_FILE"),
+            "says what it collides with: {stderr}"
+        );
+    }
+    // The credential is untouched and no approval was asked for.
+    assert_eq!(
+        std::fs::read_to_string(&token_file).unwrap(),
+        "client-token\n"
+    );
+    assert!(st.create_bodies.lock().unwrap().is_empty());
+    assert!(st.proxied.lock().unwrap().is_empty());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unwritable_output_path_fails_before_the_request_is_sent() {
     let (base, st) = spawn_mock(ProxyMode::Upstream).await;

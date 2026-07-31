@@ -371,11 +371,50 @@ pub(crate) fn parse_target(raw: &str) -> Result<Target, String> {
     // exact input. The authority is still the parser's answer — that is what
     // it is good for, and `Origin::parse` re-checks it.
     let (path, query) = raw_path_and_query(raw);
+    // The last of the same family, and the general case of the space rule
+    // above: characters the parser neither rejects nor deletes but RE-SPELLS.
+    // `?q="x"` is displayed and hashed with the quotes and arrives upstream as
+    // `%22x%22`, and `é` arrives as `%C3%A9` — a distinction an upstream that
+    // signs or logs the raw request target can see. curl sends both verbatim,
+    // so this is a divergence from curl and from the approval text at once.
+    //
+    // The sets are the parser's own, pinned by
+    // `every_character_the_parser_respells_is_refused` — which derives them
+    // from `Url::parse` at test time, so a url-crate change fails the test
+    // rather than silently reopening the gap.
+    if let Some(bad) = path
+        .chars()
+        .find(|c| !c.is_ascii() || PATH_RESPELLED.contains(*c))
+    {
+        return Err(respelled_error(bad, raw));
+    }
+    if let Some(bad) = query
+        .as_deref()
+        .unwrap_or("")
+        .chars()
+        .find(|c| !c.is_ascii() || QUERY_RESPELLED.contains(*c))
+    {
+        return Err(respelled_error(bad, raw));
+    }
     Ok(Target {
         origin,
         path,
         query,
     })
+}
+
+/// Characters `Url::parse` percent-encodes rather than passing through, per
+/// component. Non-ASCII is re-spelled in both and handled separately.
+const PATH_RESPELLED: &str = "\"<>`{}";
+const QUERY_RESPELLED: &str = "\"'<>";
+
+fn respelled_error(bad: char, raw: &str) -> String {
+    format!(
+        "refusing URL containing {bad:?} {raw:?}: URL parsers percent-encode it on the way \
+         out, so the target an operator approves is not the one that would be sent \
+         (an upstream that signs or logs the raw target can tell them apart). \
+         Percent-encode it yourself if it is really part of the target."
+    )
 }
 
 /// The path and query EXACTLY as written, without the normalization a URL
@@ -439,27 +478,41 @@ pub(crate) fn parse_header(line: &str) -> Result<Option<(String, String)>, Strin
     let (name, value) = match line.split_once(':') {
         Some((name, value)) => (name, Some(value)),
         // No colon: the `Name;` form, or a malformed line.
-        None => match line.trim_end().strip_suffix(';') {
+        None => match line.trim_end_matches([' ', '\t']).strip_suffix(';') {
             Some(name) => (name, None),
             None => return Err(format!("header {line:?} is not in `Name: value` form")),
         },
     };
-    let name = name.trim();
+    let name = trim_ows(name);
     if name.is_empty() {
         return Err(format!("header {line:?} has an empty name"));
     }
     reqwest::header::HeaderName::from_bytes(name.as_bytes())
         .map_err(|_| format!("invalid header name in {line:?}"))?;
     let value = match value {
-        // `Name:` — removal, and nothing here adds headers to remove.
-        Some(v) if v.trim().is_empty() => return Ok(None),
-        Some(v) => v.trim_start(),
+        // `Name:` — removal, and nothing here adds headers to remove. Only
+        // ASCII space and tab count as the emptiness curl means: `X-Sig:\u{a0}`
+        // sends the two NBSP bytes in curl 8.5.0, it does not remove anything.
+        Some(v) if v.trim_start_matches([' ', '\t']).is_empty() => return Ok(None),
+        // Leading OWS only, and ASCII only. `str::trim_start` would also eat
+        // NBSP, U+2007 and the rest of the Unicode whitespace class, which are
+        // ordinary value bytes to curl and to HTTP — silently shortening a
+        // signature or an opaque token copied from a working curl line.
+        // Trailing bytes were already preserved, as curl preserves them.
+        Some(v) => v.trim_start_matches([' ', '\t']),
         // `Name;` — deliberately empty.
         None => "",
     };
     reqwest::header::HeaderValue::from_str(value)
         .map_err(|_| format!("invalid header value in {line:?}"))?;
     Ok(Some((name.to_ascii_lowercase(), value.to_string())))
+}
+
+/// HTTP's optional whitespace: ASCII space and tab, and nothing else. Used
+/// instead of `str::trim`, whose Unicode whitespace class includes bytes that
+/// are legitimate header content.
+fn trim_ows(s: &str) -> &str {
+    s.trim_matches([' ', '\t'])
 }
 
 /// Would the broker drop this header? Not fatal, but silence would be worse:
@@ -1100,6 +1153,60 @@ fn open_output(args: &CurlArgs) -> CliResult<Option<std::fs::File>> {
         })
 }
 
+/// Refuse `--output` naming the file the CLI's own bearer token is read from.
+///
+/// `Config::bearer` re-reads that file on every call, and `proxy_call`
+/// truncates the output file at the last moment — deliberately, so an existing
+/// file survives the approval wait. Together those two make `-o $KEYCHUTE_TOKEN_FILE`
+/// destroy the credential BETWEEN the approval and the call that needed it:
+/// the request is created and approved with a token that still exists, the
+/// truncate empties the file, and the bearer read a few lines later fails. The
+/// grant is stranded, and the CLI has no credential left to look it up with or
+/// to make any other call — including the one that would write the token back.
+///
+/// Checked here rather than at open time because by then the damage is the
+/// thing being prevented, and because a preflight refusal costs no approval.
+fn refuse_output_over_token_file(cfg: &Config, args: &CurlArgs) -> CliResult<()> {
+    let (Some(out), Some(token_file)) = (args.output.as_ref(), cfg.token_file.as_ref()) else {
+        return Ok(());
+    };
+    if out.as_os_str() == "-" {
+        return Ok(());
+    }
+    if !same_file(out, token_file) {
+        return Ok(());
+    }
+    Err(fail(
+        EXIT_CONFIG,
+        format!(
+            "refusing --output {}: that is KEYCHUTE_TOKEN_FILE, and the response would \
+             overwrite the token this CLI authenticates with — after the approval was \
+             spent and before the call could use it. Write the body somewhere else.",
+            out.display()
+        ),
+    ))
+}
+
+/// Whether two paths name the same file, including via symlinks and `..`.
+/// The output file may not exist yet, so it resolves the deepest existing
+/// ancestor and compares the remainder literally; an unresolvable pair falls
+/// back to comparing the paths as given, which still catches the plain spelling.
+fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    fn resolve(p: &std::path::Path) -> std::path::PathBuf {
+        if let Ok(c) = std::fs::canonicalize(p) {
+            return c;
+        }
+        match (p.parent(), p.file_name()) {
+            (Some(dir), Some(name)) => match std::fs::canonicalize(dir) {
+                Ok(d) => d.join(name),
+                Err(_) => p.to_path_buf(),
+            },
+            _ => p.to_path_buf(),
+        }
+    }
+    resolve(a) == resolve(b)
+}
+
 pub(crate) async fn run_curl(
     cfg: &Config,
     http: &reqwest::Client,
@@ -1113,6 +1220,7 @@ pub(crate) async fn run_curl(
     // may never close — or, with a finite one, swallows its input and only
     // then reports the error. Selector, method and headers all qualify.
     let selector = credential_selector(&args)?;
+    refuse_output_over_token_file(cfg, &args)?;
     // Decidable without reading a byte of it: curl's rule is that a body
     // implies POST, and whether there will BE a body is settled by the mere
     // presence of a data argument. Inferring it here rather than after
@@ -1901,6 +2009,16 @@ mod tests {
         assert!(parse_target(" https://api.example.com/v1").is_err());
         assert!(parse_target("https://api.example.com/v1?account=a b").is_err());
         assert!(parse_target("https://api.example.com/a b").is_err());
+        // Same divergence, other characters: the parser re-spells these too.
+        assert!(parse_target("https://api.example.com/v1?q=\"x\"").is_err());
+        assert!(parse_target("https://api.example.com/caf\u{e9}").is_err());
+        assert!(parse_target("https://api.example.com/v1?a=\u{e9}").is_err());
+        assert!(parse_target("https://api.example.com/v1/a<b").is_err());
+        // Characters it passes through are NOT refused: `'` is legal in a
+        // path, and refusing it would break a call the parser sends verbatim.
+        assert!(parse_target("https://api.example.com/o'brien").is_ok());
+        assert!(parse_target("https://api.example.com/v1?q=a|b^c").is_ok());
+        assert!(parse_target("https://api.example.com/v1?q=%22x%22").is_ok());
         // Percent-encoded, they are ordinary bytes and survive verbatim.
         assert_eq!(
             parse_target("https://api.example.com/v1?amount=1%0A000")
@@ -1924,6 +2042,45 @@ mod tests {
                 .port,
             None
         );
+    }
+
+    /// The refusal sets are the URL parser's behaviour, not a guess at it —
+    /// so they are derived from it here rather than restated. Every printable
+    /// ASCII character is put through `Url::parse` in each component: one that
+    /// comes back re-spelled must be refused, and one that survives verbatim
+    /// must not be (refusing those would break calls the parser would have
+    /// sent unchanged). A url-crate change fails this test instead of quietly
+    /// reopening the gap between the approved target and the sent one.
+    #[test]
+    fn every_character_the_parser_respells_is_refused() {
+        for b in 0x21u8..=0x7e {
+            let c = b as char;
+            // Structural characters, refused for their own reasons above.
+            if matches!(c, '#' | '?' | '%' | '\\') {
+                continue;
+            }
+            let respelled_in_path = reqwest::Url::parse(&format!("https://h/x{c}y"))
+                .map(|u| u.path() != format!("/x{c}y"))
+                .unwrap_or(true);
+            assert_eq!(
+                PATH_RESPELLED.contains(c),
+                respelled_in_path,
+                "path {c:?}: parser re-spells = {respelled_in_path}"
+            );
+            let respelled_in_query = reqwest::Url::parse(&format!("https://h/p?a={c}b"))
+                .map(|u| u.query() != Some(&format!("a={c}b")))
+                .unwrap_or(true);
+            assert_eq!(
+                QUERY_RESPELLED.contains(c),
+                respelled_in_query,
+                "query {c:?}: parser re-spells = {respelled_in_query}"
+            );
+        }
+        // Non-ASCII is re-spelled in both, which is why it is refused outright
+        // rather than by either list.
+        let u = reqwest::Url::parse("https://h/caf\u{e9}?a=\u{e9}").unwrap();
+        assert_eq!(u.path(), "/caf%C3%A9");
+        assert_eq!(u.query(), Some("a=%C3%A9"));
     }
 
     #[test]
@@ -1962,6 +2119,24 @@ mod tests {
         assert!(parse_header("nocolon").is_err());
         assert!(parse_header(": v").is_err());
         assert!(parse_header("Bad Name: v").is_err());
+        // OWS is ASCII space and tab. Everything else in Unicode's whitespace
+        // class is a value BYTE — curl 8.5.0 sends `X-Sig:\u{a0}abc` as the
+        // NBSP bytes followed by abc, and sends `X-Sig:\u{a0}` rather than
+        // treating it as the removal spelling. Eating those bytes would
+        // shorten a signature copied from a working curl line.
+        assert_eq!(parse_header("X-A:\tb").unwrap().unwrap().1, "b");
+        assert_eq!(
+            parse_header("X-Sig:\u{a0}abc").unwrap().unwrap().1,
+            "\u{a0}abc"
+        );
+        assert_eq!(
+            parse_header("X-Sig: \u{a0}").unwrap().unwrap().1,
+            "\u{a0}",
+            "not empty: NBSP is content, so this is not curl's removal spelling"
+        );
+        // A name is not a place for Unicode whitespace either: trimming it
+        // there would turn an invalid name into a valid-looking different one.
+        assert!(parse_header("X-A\u{a0}: v").is_err());
     }
 
     #[test]
