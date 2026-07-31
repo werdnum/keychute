@@ -9,6 +9,7 @@ use crate::crypto::{AadContext, SecretBytes};
 use crate::db;
 use crate::state::AppState;
 use axum::body::Bytes;
+use axum::extract::rejection::PathRejection;
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -40,11 +41,11 @@ use secrecy::ExposeSecret;
 /// than at the moment it applies a side effect.
 pub async fn info(
     State(state): State<AppState>,
-    Path(id): Path<String>,
+    id: Result<Path<String>, PathRejection>,
     headers: HeaderMap,
 ) -> Result<Json<GrantInfo>, ApiFailure> {
     let client = authenticate_client(&state, &headers).await?;
-    let grant = owned_grant(&state, &client, path_id(&id)?).await?;
+    let grant = owned_grant(&state, &client, path_id(id)?).await?;
     let mechanism = Mechanism::from_str_opt(&grant.mechanism)
         .ok_or_else(|| ApiFailure::Internal(anyhow::anyhow!("unknown grant mechanism")))?;
     let mut constraints: Constraints = serde_json::from_value(grant.constraints.clone())
@@ -139,13 +140,13 @@ fn open_secret_version(
 /// POST /v1/grants/{id}/read
 pub async fn read(
     State(state): State<AppState>,
-    Path(id): Path<String>,
+    id: Result<Path<String>, PathRejection>,
     headers: HeaderMap,
     body: Result<Bytes, axum::extract::rejection::BytesRejection>,
 ) -> Result<Response, ApiFailure> {
     let body = crate::api::body_bytes(body)?;
     let client = authenticate_client(&state, &headers).await?;
-    let id = path_id(&id)?;
+    let id = path_id(id)?;
     let req: ReadGrantRequest = serde_json::from_slice(&body)
         .map_err(|_| ApiFailure::InvalidRequest("malformed request body"))?;
     if req.idempotency_key.is_empty() {

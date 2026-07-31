@@ -9,6 +9,7 @@ use crate::notify::Notification;
 use crate::policy;
 use crate::state::{AppState, SlotKind};
 use axum::body::Bytes;
+use axum::extract::rejection::PathRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -665,11 +666,11 @@ async fn owned_request(
 /// GET /v1/access-requests/{id}
 pub async fn status(
     State(state): State<AppState>,
-    Path(id): Path<String>,
+    id: Result<Path<String>, PathRejection>,
     headers: HeaderMap,
 ) -> Result<Response, ApiFailure> {
     let client = authenticate_client(&state, &headers).await?;
-    let row = owned_request(&state, &client, crate::api::path_id(&id)?).await?;
+    let row = owned_request(&state, &client, crate::api::path_id(id)?).await?;
     let status = status_from_row(&state, &row).await?;
     Ok(Json(status).into_response())
 }
@@ -684,7 +685,7 @@ pub struct WaitParams {
 /// request resolves or the (capped) timeout elapses; may return pending.
 pub async fn wait(
     State(state): State<AppState>,
-    Path(id): Path<String>,
+    id: Result<Path<String>, PathRejection>,
     uri: axum::http::Uri,
     headers: HeaderMap,
 ) -> Result<Response, ApiFailure> {
@@ -696,7 +697,7 @@ pub async fn wait(
     let Query(params) = Query::<WaitParams>::try_from_uri(&uri)
         .map_err(|_| ApiFailure::InvalidRequest("malformed query string"))?;
     let client = authenticate_client(&state, &headers).await?;
-    let id = crate::api::path_id(&id)?;
+    let id = crate::api::path_id(id)?;
     let row = owned_request(&state, &client, id).await?;
 
     let max = state.config.limits.wait_max_seconds;

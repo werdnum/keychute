@@ -134,8 +134,21 @@ pub(crate) async fn status_from_row(
 /// `NotFound`, not a parse error: a malformed id is certainly not a resource
 /// this client owns, and the answer must not distinguish "malformed" from
 /// "someone else's" any more than the ownership check does.
-pub(crate) fn path_id(raw: &str) -> Result<Uuid, ApiFailure> {
-    raw.parse::<Uuid>().map_err(|_| ApiFailure::NotFound)
+///
+/// Takes the extractor's `Result` rather than the captured string, because
+/// `Path<String>` has a rejection of its own: it percent-decodes the segment
+/// first, so `/v1/grants/%FF` fails on invalid UTF-8 before the handler runs
+/// and answers the same bare, unmarked 400 that `Path<Uuid>` did. Handlers
+/// therefore never let the extractor reject; they pass its outcome through
+/// here, and both spellings of "that is not an id" land on the same marked
+/// answer.
+pub(crate) fn path_id(
+    raw: Result<axum::extract::Path<String>, axum::extract::rejection::PathRejection>,
+) -> Result<Uuid, ApiFailure> {
+    raw.map_err(|_| ApiFailure::NotFound)?
+        .0
+        .parse::<Uuid>()
+        .map_err(|_| ApiFailure::NotFound)
 }
 
 /// A `Bytes` body, with axum's rejection turned into a marked failure.

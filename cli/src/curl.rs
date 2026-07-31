@@ -181,10 +181,25 @@ pub(crate) struct CurlArgs {
     /// Request body. `@path` reads a file, `@-` reads stdin (curl's spelling).
     /// Repeatable: pieces are joined with `&`, as curl does. Unlike curl, this
     /// does NOT imply a Content-Type: pass one with -H.
-    #[arg(short = 'd', long = "data", value_name = "DATA")]
+    ///
+    /// `allow_hyphen_values`, on all three data flags, because a body is data
+    /// and data starts with whatever it starts with: curl sends `-d -1` as the
+    /// two bytes `-1`, and a parser that read them as a flag would drop the
+    /// payload out of a command copied verbatim from a working curl line.
+    #[arg(
+        short = 'd',
+        long = "data",
+        value_name = "DATA",
+        allow_hyphen_values = true
+    )]
     pub data: Vec<String>,
     /// Request body taken literally, `@` and all. Repeatable, joined with `&`.
-    #[arg(long = "data-raw", value_name = "DATA", conflicts_with = "data")]
+    #[arg(
+        long = "data-raw",
+        value_name = "DATA",
+        conflicts_with = "data",
+        allow_hyphen_values = true
+    )]
     pub data_raw: Vec<String>,
     /// Like -d, but file and stdin input is sent byte for byte — no CR/LF
     /// stripping (curl's --data-binary). Repeatable, joined with `&`.
@@ -197,7 +212,8 @@ pub(crate) struct CurlArgs {
     #[arg(
         long = "data-binary",
         value_name = "DATA",
-        conflicts_with_all = ["data", "data_raw"]
+        conflicts_with_all = ["data", "data_raw"],
+        allow_hyphen_values = true
     )]
     pub data_binary: Vec<String>,
     /// Write the response body here instead of stdout.
@@ -1843,38 +1859,19 @@ async fn proxy_call(
     // reporting "cannot open /nope/out.json" after a POST has committed
     // upstream invites a retry that repeats the side effect.
     //
-    // Emptying it is deferred to here, the last moment before anything leaves:
-    // an existing file must survive an approval wait that ends in a denial.
-    // Truncating one we then fail to fill is the lesser harm, and is what curl
-    // does too.
+    // Emptying it is deferred all the way to the first byte written — see
+    // [`LazyTruncate`]. An existing file must survive an approval wait that
+    // ends in a denial, and equally a `--fail` run that withholds the body.
     // `open_output` returns no file for stdout — either no `--output` or
     // curl's `-o -` spelling for it.
     let to_stdout = output.is_none();
-    let mut sink: Box<dyn Write> = match output {
+    let mut sink: Box<dyn ResponseSink> = match output {
         None => Box::new(std::io::stdout().lock()),
-        Some(file) => {
-            // Regular files ONLY. `ftruncate` on a character device is EINVAL,
-            // so `-o /dev/null` — which curl's own manual recommends for
-            // discarding a body — failed here, AFTER the approval was given
-            // and before the call went out, stranding it. There is also
-            // nothing to empty: a device or a pipe carries no leftover bytes
-            // from a previous run. `unwrap_or(true)` keeps the old behaviour
-            // when the kind cannot be determined, rather than silently
-            // skipping a truncation a regular file needed.
-            let regular = file.metadata().map(|m| m.is_file()).unwrap_or(true);
-            if regular {
-                file.set_len(0).map_err(|e| {
-                    fail(
-                        EXIT_CONFIG,
-                        format!(
-                            "cannot write --output {}: {e}",
-                            args.output.as_ref().expect("a file means a path").display()
-                        ),
-                    )
-                })?;
-            }
-            Box::new(file)
-        }
+        Some(file) => Box::new(LazyTruncate {
+            file,
+            path: args.output.clone().expect("a file means a path"),
+            truncated: false,
+        }),
     };
 
     // The path goes on RAW: the server canonicalizes it and rejects ambiguous
@@ -1977,6 +1974,10 @@ async fn proxy_call(
             ),
         ));
     }
+    // Past every way this call can still be refused, so the destination is now
+    // certainly being replaced — including by a zero-byte body, which is a
+    // result and not an absence of one.
+    sink.commit()?;
     // Tracked so the newline below is added only when the output actually
     // needs one — see there.
     let mut last_byte: Option<u8> = None;
@@ -2004,9 +2005,90 @@ async fn proxy_call(
     Ok(())
 }
 
-fn write_all(sink: &mut Box<dyn Write>, bytes: &[u8]) -> CliResult<()> {
+fn write_all(sink: &mut Box<dyn ResponseSink>, bytes: &[u8]) -> CliResult<()> {
     sink.write_all(bytes)
         .map_err(|e| fail(EXIT_OTHER, format!("failed writing the response: {e}")))
+}
+
+/// Where the response goes: stdout, or the `--output` file.
+///
+/// [`Self::commit`] is the extra operation stdout does not need. An
+/// `--output` file is emptied at the moment the response is known to be one
+/// this command will write, and NOT before — see [`LazyTruncate`].
+trait ResponseSink: Write {
+    fn commit(&mut self) -> CliResult<()>;
+}
+
+impl ResponseSink for std::io::StdoutLock<'_> {
+    fn commit(&mut self) -> CliResult<()> {
+        Ok(())
+    }
+}
+
+/// An `--output` file that empties itself at the first byte written rather
+/// than when it is opened.
+///
+/// The file is OPENED before the approval, because "cannot open /nope/out.json"
+/// reported after a POST has committed upstream invites a retry that repeats
+/// the side effect. But opening is not emptying, and the two were run together:
+/// under `--fail` the destination was truncated and then, on a 4xx, deliberately
+/// never written — so `keychute curl -f -o cache.json …` against a failing
+/// upstream destroyed the last good copy of `cache.json`. curl preserves it, and
+/// so does this now: the truncate rides on the first write, which under `--fail`
+/// never happens.
+///
+/// The same deferral covers the whole approval wait, which may end in a denial,
+/// and it moves the truncate to AFTER `cfg.bearer()` is read — one less way for
+/// `-o` at an unlucky path to strand a grant it just spent.
+struct LazyTruncate {
+    file: std::fs::File,
+    path: PathBuf,
+    truncated: bool,
+}
+
+impl LazyTruncate {
+    fn empty_once(&mut self) -> std::io::Result<()> {
+        if self.truncated {
+            return Ok(());
+        }
+        self.truncated = true;
+        // Regular files ONLY. `ftruncate` on a character device is EINVAL, so
+        // `-o /dev/null` — which curl's own manual recommends for discarding a
+        // body — failed here, after the approval was given. There is also
+        // nothing to empty: a device or a pipe carries no leftover bytes from a
+        // previous run. `unwrap_or(true)` keeps the truncation when the kind
+        // cannot be determined, rather than silently skipping one a regular
+        // file needed.
+        if self.file.metadata().map(|m| m.is_file()).unwrap_or(true) {
+            self.file.set_len(0)?;
+        }
+        Ok(())
+    }
+}
+
+impl Write for LazyTruncate {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.empty_once()?;
+        self.file.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+impl ResponseSink for LazyTruncate {
+    /// Emptied even when the body turns out to be zero bytes: a successful call
+    /// that returns nothing still REPLACES the file, exactly as curl does, and
+    /// leaving yesterday's contents behind would read as today's answer.
+    fn commit(&mut self) -> CliResult<()> {
+        self.empty_once().map_err(|e| {
+            fail(
+                EXIT_OTHER,
+                format!("cannot write --output {}: {e}", self.path.display()),
+            )
+        })
+    }
 }
 
 #[cfg(test)]
@@ -3194,6 +3276,33 @@ mod tests {
             "b=2",
         ])
         .is_err());
+    }
+
+    #[test]
+    fn a_data_value_may_begin_with_a_hyphen() {
+        use clap::Parser as _;
+        // curl sends `-d -1` as the two bytes `-1`. Reading them as a flag
+        // would drop the payload out of a command copied from a working curl
+        // line — and the body is the one argument whose contents this command
+        // has no business second-guessing.
+        for flag in ["-d", "--data-raw", "--data-binary"] {
+            let cli = crate::Cli::parse_from([
+                "keychute",
+                "curl",
+                "https://api.example.com/x",
+                "--secret",
+                "s",
+                flag,
+                "-1",
+            ]);
+            match cli.cmd {
+                crate::Cmd::Curl(args) => {
+                    let pieces = [args.data, args.data_raw, args.data_binary].concat();
+                    assert_eq!(pieces, vec!["-1"], "{flag}");
+                }
+                _ => panic!("expected curl subcommand"),
+            }
+        }
     }
 
     #[test]

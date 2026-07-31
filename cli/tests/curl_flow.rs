@@ -803,6 +803,74 @@ async fn output_to_a_device_is_not_truncated() {
     );
 }
 
+/// `--fail` withholds the body, so it must also withhold the truncation. A
+/// refresh that finds the upstream down would otherwise leave the caller's last
+/// good copy empty — the destination emptied for a response that never arrives.
+/// curl preserves the file; so does this.
+#[tokio::test(flavor = "multi_thread")]
+async fn fail_leaves_an_existing_output_file_intact() {
+    let (base, _st) = spawn_mock(ProxyMode::UpstreamError(StatusCode::NOT_FOUND)).await;
+    let path = std::env::temp_dir().join(format!("keychute-keep-{}.json", Uuid::new_v4()));
+    std::fs::write(&path, b"{\"last\": \"good\"}").unwrap();
+    let p = path.clone();
+    let (code, _stdout, stderr) = tokio::task::spawn_blocking(move || {
+        run_cli(
+            &base,
+            &[
+                "curl",
+                "https://api.example.com/v1/x",
+                "--grant-id",
+                GRANT_ID,
+                "--fail",
+                "-o",
+                p.to_str().unwrap(),
+            ],
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(code, 1, "{stderr}");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"{\"last\": \"good\"}",
+        "a suppressed body must not have emptied the destination"
+    );
+    std::fs::remove_file(&path).unwrap();
+}
+
+/// The other half of the deferral: a call that DOES answer replaces the file,
+/// including when what it answers with is nothing at all. Leaving yesterday's
+/// bytes in place would read as today's response.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_successful_call_replaces_the_output_file() {
+    let (base, _st) = spawn_mock(ProxyMode::Upstream).await;
+    let path = std::env::temp_dir().join(format!("keychute-replace-{}.json", Uuid::new_v4()));
+    std::fs::write(&path, vec![b'x'; 4096]).unwrap();
+    let p = path.clone();
+    let (code, _stdout, stderr) = tokio::task::spawn_blocking(move || {
+        run_cli(
+            &base,
+            &[
+                "curl",
+                "https://api.example.com/v1/things",
+                "--grant-id",
+                GRANT_ID,
+                "-o",
+                p.to_str().unwrap(),
+            ],
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        UPSTREAM_BODY,
+        "the old contents must not survive under the new ones"
+    );
+    std::fs::remove_file(&path).unwrap();
+}
+
 /// `-H 'User-Agent:'` is curl's spelling for *remove the header*. It is the one
 /// removal with something to remove: this CLI sets a default `User-Agent`, and
 /// the broker forwards `User-Agent` upstream unchanged. Removing it therefore

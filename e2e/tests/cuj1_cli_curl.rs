@@ -206,10 +206,16 @@ async fn a_malformed_grant_id_is_marked_as_keychutes_own_error() {
     // The contract is every route's, not the proxy's alone: the grant and
     // access-request routes took the same id through a `Path<Uuid>` extractor,
     // which rejects before the handler and answers an unmarked 400.
+    // `%FF` covers the extractor's OTHER rejection: `Path<String>`
+    // percent-decodes the segment first, so an id that is not valid UTF-8 once
+    // decoded never reaches the handler that would mark the answer.
     for path in [
         "/v1/grants/not-a-uuid",
+        "/v1/grants/%FF",
         "/v1/access-requests/not-a-uuid",
+        "/v1/access-requests/%FF",
         "/v1/access-requests/not-a-uuid/wait",
+        "/v1/access-requests/%FF/wait",
     ] {
         let resp = env.k8s().get(path).send().await.unwrap();
         assert_eq!(resp.status(), 404, "{path}");
@@ -221,20 +227,23 @@ async fn a_malformed_grant_id_is_marked_as_keychutes_own_error() {
             "{path} must carry the marker like every other Keychute error"
         );
     }
-    let resp = env
-        .k8s()
-        .post("/v1/grants/not-a-uuid/read")
-        .json(&serde_json::json!({"idempotency_key": "k"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 404);
-    assert_eq!(
-        resp.headers()
-            .get("x-keychute-error")
-            .map(|v| v.to_str().unwrap()),
-        Some("not-found")
-    );
+    for id in ["not-a-uuid", "%FF"] {
+        let resp = env
+            .k8s()
+            .post(&format!("/v1/grants/{id}/read"))
+            .json(&serde_json::json!({"idempotency_key": "k"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404, "{id}");
+        assert_eq!(
+            resp.headers()
+                .get("x-keychute-error")
+                .map(|v| v.to_str().unwrap()),
+            Some("not-found"),
+            "{id}"
+        );
+    }
 }
 
 /// The rest of the contract: the errors axum generates BEFORE a handler runs.
