@@ -450,6 +450,10 @@ pub async fn create(
             Some(db::GrantParams {
                 client_name: client.name().to_owned(),
                 secret_name: secret.name.clone(),
+                // The row policy just evaluated. The insert transaction
+                // re-checks this exact row still exists before minting the
+                // grant (see `GrantParams::secret_id`).
+                secret_id: Some(secret.id),
                 mechanism: req.mechanism.as_str().to_owned(),
                 constraints: serde_json::to_value(&constraints)
                     .map_err(|e| ApiFailure::Internal(e.into()))?,

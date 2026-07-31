@@ -75,9 +75,23 @@ pub async fn approve_request(
     let stored_backed = grant.passthrough.is_none();
     if stored_backed {
         crate::db::take_secret_shared_lock(&mut tx, &grant.secret_name).await?;
-        if store.is_none() && !crate::db::secret_name_exists(&mut tx, &grant.secret_name).await? {
-            tx.rollback().await?;
-            return Ok(ApproveOutcome::SecretGone);
+        // The row the operator decided about, by id — not merely "something
+        // called that": a delete plus a re-create under the same name would
+        // otherwise release bytes nobody reviewed ([`GrantParams::secret_id`]).
+        // Skipped only when this transaction creates the row itself.
+        if store.is_none() {
+            let same_row = match grant.secret_id {
+                Some(id) => {
+                    crate::db::secret_incarnation_exists(&mut tx, id, &grant.secret_name).await?
+                }
+                // Fail closed: a payload-less grant with no identity cannot be
+                // shown to release what was decided about.
+                None => false,
+            };
+            if !same_row {
+                tx.rollback().await?;
+                return Ok(ApproveOutcome::SecretGone);
+            }
         }
     }
     // Only the stored-secret path inserts a KEYSET-wrapped DEK. A passthrough
@@ -678,15 +692,24 @@ mod tests {
     /// A bare `secrets` row (no version). A payload-less grant releases the
     /// STORED secret, and the approve paths refuse to mint one when that row is
     /// absent — so fixtures approving such a grant have to create it.
-    async fn seed_secret_row(db: &PgPool, name: &str) -> anyhow::Result<()> {
-        crate::db::create_secret(db, name, "", 2, "bearer", None).await?;
-        Ok(())
+    async fn seed_secret_row(db: &PgPool, name: &str) -> anyhow::Result<Uuid> {
+        Ok(crate::db::create_secret(db, name, "", 2, "bearer", None)
+            .await?
+            .id)
     }
 
-    fn grant_params(passthrough: Option<PassthroughPayload>) -> GrantParams {
+    /// `secret_id` is the stored row the grant releases — required for a
+    /// payload-less grant, since approval verifies that exact incarnation
+    /// ([`GrantParams::secret_id`]). `None` alongside a passthrough payload,
+    /// or when the approval creates the row itself.
+    fn grant_params(
+        secret_id: Option<Uuid>,
+        passthrough: Option<PassthroughPayload>,
+    ) -> GrantParams {
         GrantParams {
             client_name: "test-client".into(),
             secret_name: "s1".into(),
+            secret_id,
             mechanism: "cli-read".into(),
             constraints: serde_json::json!({"ttl_seconds": 600}),
             not_after: Utc::now() + Duration::seconds(600),
@@ -704,10 +727,10 @@ mod tests {
         // The handler computed the deadline before the transaction; if it has
         // already passed (short TTL, expired policy cap), approving would mint
         // a grant that can only ever return grant-expired.
-        seed_secret_row(db, "s1").await?;
+        let s1_id = Some(seed_secret_row(db, "s1").await?);
         let row =
             insert_pending(db, "s-late", "late-1", Utc::now() + Duration::seconds(600)).await?;
-        let mut params = grant_params(None);
+        let mut params = grant_params(s1_id, None);
         params.not_after = Utc::now() - Duration::seconds(1);
         let got = approve_request(db, row.id, "andrew", Uuid::new_v4(), &params, None).await?;
         assert_eq!(got, ApproveOutcome::NotApprovable);
@@ -753,7 +776,7 @@ mod tests {
             row.id,
             "andrew",
             grant_id,
-            &grant_params(None),
+            &grant_params(Some(secret_id), None),
             Some(store),
         )
         .await?;
@@ -774,7 +797,7 @@ mod tests {
                 row.id,
                 "andrew",
                 Uuid::new_v4(),
-                &grant_params(None),
+                &grant_params(Some(secret_id), None),
                 None
             )
             .await?,
@@ -787,7 +810,15 @@ mod tests {
         let pt =
             PassthroughPayload::seal(&ephemeral, g2, &SecretBox::new(b"once".as_slice().into()))
                 .unwrap();
-        let got = approve_request(db, row2.id, "andrew", g2, &grant_params(Some(pt)), None).await?;
+        let got = approve_request(
+            db,
+            row2.id,
+            "andrew",
+            g2,
+            &grant_params(None, Some(pt)),
+            None,
+        )
+        .await?;
         assert_eq!(got, ApproveOutcome::Approved(g2));
         let grant = crate::db::get_grant(db, g2).await?.unwrap();
         assert!(grant.passthrough_ephemeral);
@@ -810,7 +841,7 @@ mod tests {
                 row3.id,
                 "andrew",
                 Uuid::new_v4(),
-                &grant_params(None),
+                &grant_params(Some(secret_id), None),
                 None
             )
             .await?,
@@ -878,7 +909,7 @@ mod tests {
             row.id,
             "andrew",
             Uuid::new_v4(),
-            &grant_params(None),
+            &grant_params(Some(secret_id), None),
             Some(StoreSecretParams {
                 secret_id,
                 name: "contested".into(),
@@ -958,11 +989,11 @@ mod tests {
 
         // Active-grant listing excludes revoked/expired. The grants below carry
         // no payload of their own, so the stored secret they name has to exist.
-        seed_secret_row(db, "s1").await?;
+        let s1_id = Some(seed_secret_row(db, "s1").await?);
         let g_live = Uuid::new_v4();
-        approve_request(db, a.id, "andrew", g_live, &grant_params(None), None).await?;
+        approve_request(db, a.id, "andrew", g_live, &grant_params(s1_id, None), None).await?;
         let g_dead = Uuid::new_v4();
-        approve_request(db, b.id, "andrew", g_dead, &grant_params(None), None).await?;
+        approve_request(db, b.id, "andrew", g_dead, &grant_params(s1_id, None), None).await?;
         crate::db::revoke_grant(db, g_dead, "andrew").await?;
         let active: Vec<Uuid> = list_active_grants(db, 60)
             .await?
@@ -1245,7 +1276,7 @@ mod tests {
             stored_req.id,
             "andrew",
             stored_grant,
-            &grant_params(None),
+            &grant_params(Some(secret_id), None),
             None,
         )
         .await?;
@@ -1262,7 +1293,7 @@ mod tests {
             pt_req.id,
             "andrew",
             pt_grant,
-            &grant_params(Some(pt)),
+            &grant_params(None, Some(pt)),
             None,
         )
         .await?;
@@ -1387,7 +1418,7 @@ mod tests {
                 row.id,
                 "andrew",
                 Uuid::new_v4(),
-                &grant_params(None),
+                &grant_params(Some(secret_id), None),
                 None
             )
             .await?,
@@ -1396,6 +1427,61 @@ mod tests {
         assert_eq!(
             crate::db::get_request(db, row.id).await?.unwrap().state,
             "pending"
+        );
+
+        // A REPLACEMENT under the same name does not resurrect the approval:
+        // the decision was taken about bytes that no longer exist, and a client
+        // deposit can claim a freed name (unvetted, at that). The check is on
+        // the row's identity, not on "something called s1 exists".
+        let replacement_id = Uuid::new_v4();
+        assert!(
+            create_secret_with_version(
+                db,
+                StoreSecretParams {
+                    secret_id: replacement_id,
+                    name: "s1".into(),
+                    description: String::new(),
+                    max_tier: 2,
+                    injection_kind: "bearer".into(),
+                    injection_header: None,
+                    injection_username: None,
+                    seal: Box::new(|| keyset.seal(
+                        &SecretBox::new(b"someone-elses".as_slice().into()),
+                        AadContext::SecretVersion {
+                            secret_id: replacement_id,
+                            version: 1,
+                        },
+                    )),
+                },
+                "someone-else",
+            )
+            .await?
+        );
+        assert_eq!(
+            approve_request(
+                db,
+                row.id,
+                "andrew",
+                Uuid::new_v4(),
+                &grant_params(Some(secret_id), None),
+                None
+            )
+            .await?,
+            ApproveOutcome::SecretGone
+        );
+        // A grant with no identity at all is refused too, rather than falling
+        // back to "the name exists" — which the replacement now satisfies.
+        assert_eq!(
+            approve_request(
+                db,
+                row.id,
+                "andrew",
+                Uuid::new_v4(),
+                &grant_params(None, None),
+                None
+            )
+            .await?,
+            ApproveOutcome::SecretGone
         );
 
         // Passthrough for the same name still works: it carries its own bytes.
@@ -1407,7 +1493,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            approve_request(db, row.id, "andrew", g, &grant_params(Some(pt)), None).await?,
+            approve_request(db, row.id, "andrew", g, &grant_params(None, Some(pt)), None).await?,
             ApproveOutcome::Approved(g)
         );
 

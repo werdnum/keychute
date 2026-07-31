@@ -337,7 +337,10 @@ k8s-agent image).
   grants backed by them in the same transaction, so no grant is left promising
   a replay of bytes that no longer exist. Grant creation serializes against it
   on a per-secret advisory lock, so a concurrent approval either precedes the
-  deletion (and is revoked by it) or fails. Deletion is not erasure: backups
+  deletion (and is revoked by it) or fails. A grant is minted against a secret
+  ROW, not a name: deletion frees the name for reuse, and an approval whose
+  decision was taken about deleted bytes must not release whatever was created
+  under that name afterwards. Deletion is not erasure: backups
   taken beforehand still contain the ciphertext, and the KEK recovery chain
   still unwraps it — only rotating the credential at the provider does that.
 - Plaintext exists only transiently in Keychute memory during a release or proxy

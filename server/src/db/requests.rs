@@ -221,6 +221,22 @@ impl PassthroughPayload {
 pub struct GrantParams {
     pub client_name: String,
     pub secret_name: String,
+    /// The exact stored-secret ROW the decision was made against.
+    ///
+    /// Required for a payload-less grant, and verified — id AND name together —
+    /// inside the approving transaction: names are reusable now that an
+    /// operator can delete a secret ([`crate::db::ui_ext::delete_secret_audited`]),
+    /// so "a secret called X exists" is not the same question as "the secret
+    /// this decision was made against still exists". Without the id, a delete
+    /// plus a fresh deposit under the same name between policy evaluation and
+    /// approval would release the replacement — a value nobody reviewed —
+    /// under a decision taken about different bytes. Approval refuses a
+    /// payload-less grant that does not carry it.
+    ///
+    /// `None` for passthrough grants (they carry their own payload) and for
+    /// the approval that CREATES the secret, whose row is inserted in the same
+    /// transaction.
+    pub secret_id: Option<Uuid>,
     pub mechanism: String,
     pub constraints: serde_json::Value,
     pub not_after: DateTime<Utc>,
@@ -247,7 +263,13 @@ pub async fn resolve_approve(
     // ([`crate::db::take_secret_shared_lock`]).
     if grant.passthrough.is_none() {
         crate::db::take_secret_shared_lock(&mut tx, &grant.secret_name).await?;
-        if !crate::db::secret_name_exists(&mut tx, &grant.secret_name).await? {
+        let same_row = match grant.secret_id {
+            Some(id) => {
+                crate::db::secret_incarnation_exists(&mut tx, id, &grant.secret_name).await?
+            }
+            None => false,
+        };
+        if !same_row {
             tx.rollback().await?;
             return Ok(None);
         }

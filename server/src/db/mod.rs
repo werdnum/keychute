@@ -77,14 +77,23 @@ pub(crate) async fn take_secret_exclusive_lock(
     Ok(())
 }
 
-/// True when a secret of this name exists — read inside a transaction that
-/// already holds the secret lock, by grant creators checking that a deletion
-/// did not just win the race.
-pub(crate) async fn secret_name_exists(
+/// True when THIS secret row — this id under this name — still exists. Read
+/// inside a transaction that already holds the secret lock, by grant creators
+/// checking that a deletion did not just win the race.
+///
+/// Both columns, deliberately. Since deletion exists a name can be reused, so
+/// a name-only check would also be satisfied by a DIFFERENT secret created (or
+/// client-deposited, unvetted) under the name after the decision was taken;
+/// minting the grant then releases bytes nobody evaluated. The id pins the
+/// incarnation, and the name is checked with it because the name is what the
+/// grant carries and what the release path looks the secret up by.
+pub(crate) async fn secret_incarnation_exists(
     tx: &mut sqlx::PgConnection,
+    secret_id: uuid::Uuid,
     secret_name: &str,
 ) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM secrets WHERE name = $1)")
+    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM secrets WHERE id = $1 AND name = $2)")
+        .bind(secret_id)
         .bind(secret_name)
         .fetch_one(tx)
         .await

@@ -1855,6 +1855,11 @@ async fn approve(
     // name except on the substitution path below, where the operator chose a
     // stored secret to answer a request that named something else.
     let mut released_name = row.secret_name.clone();
+    // ...and WHICH stored row that name meant when the operator decided. Names
+    // are reusable since deletion exists, so the approval transaction verifies
+    // this id, not just the name (see `db::GrantParams::secret_id`). Stays
+    // `None` on the passthrough path, whose payload is not a stored row.
+    let mut released_secret_id: Option<Uuid> = None;
     // Extra grant cap from the policy row that governs the SUBSTITUTED secret
     // (the request's own `policy_not_after` was computed against the name the
     // client asked for, which by definition matched no stored secret).
@@ -1928,6 +1933,7 @@ async fn approve(
                 ));
             }
             substitute_cap = evaluation.policy_not_after;
+            released_secret_id = Some(chosen.id);
             released_name = chosen.name;
         }
         (Some(s), _) => {
@@ -1939,6 +1945,7 @@ async fn approve(
                     "requested mechanism exceeds the secret's max tier",
                 ));
             }
+            released_secret_id = Some(s.id);
         }
         (None, None) => {
             let value = secret_value.ok_or_else(|| {
@@ -1971,6 +1978,9 @@ async fn approve(
                 let (injection_kind, injection_header, injection_username) =
                     validate_injection(kind, non_empty(&form.injection_header))?;
                 let secret_id = Uuid::new_v4();
+                // Created by the approval transaction itself, so there is no
+                // earlier incarnation for it to verify against.
+                released_secret_id = Some(secret_id);
                 let keyset = &state.keyset;
                 store = Some(StoreSecretParams {
                     secret_id,
@@ -2029,6 +2039,7 @@ async fn approve(
     let grant = GrantParams {
         client_name: row.client_name.clone(),
         secret_name: released_name,
+        secret_id: released_secret_id,
         mechanism: row.mechanism.clone(),
         constraints: row.constraints.clone(),
         not_after,

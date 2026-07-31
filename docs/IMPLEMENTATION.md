@@ -298,7 +298,16 @@ or Envoy-forwarded JWT in oidc mode):
   own — a grant creator that finds the deletion already committed refuses
   (409 in the UI; rollback-and-retry on the auto-approve path) instead of
   minting a grant that can only return `payload-lost`. Lock order everywhere:
-  this one BEFORE the KEK lock and any per-client lock. A rotation that loses
+  this one BEFORE the KEK lock and any per-client lock.
+  That refusal checks the secret's IDENTITY, not its name: `GrantParams` carries
+  `secret_id` — the row the decision was actually taken about — and the approving
+  transaction verifies id AND name together. Deletion makes names reusable, so a
+  name-only check would also be satisfied by a different secret created (or
+  client-deposited, hence unvetted) under the freed name between policy
+  evaluation and approval, releasing bytes nobody evaluated; grant revalidation
+  at read time does not re-check `operator_vetted` or re-run policy, so this is
+  the point where it has to be caught. A payload-less grant without a
+  `secret_id` is refused rather than falling back to the name. A rotation that loses
   the same race returns "no such secret" as a 409 rather than a 500.
   The confirmation page states plainly that deletion is not erasure: pre-existing
   database backups still hold the ciphertext and the KEK still unwraps it, so
