@@ -87,6 +87,12 @@ pub fn router(state: AppState) -> Router {
         // relayed upstream responses are untouched by either — they come back
         // through a handler, which is exactly why this is done here and not as
         // a blanket response middleware that could not tell the two apart.
+        //
+        // Two routes, not one: axum's `{*rest}` requires a non-empty suffix,
+        // so `/v1` itself matches neither the real routes nor the catch-all
+        // and would fall through to the default 404 — unmarked, and without
+        // the envelope — which is precisely the hole this closes.
+        .route("/v1", any(|| async { ApiFailure::NotFound }))
         .route("/v1/{*rest}", any(|| async { ApiFailure::NotFound }))
         .method_not_allowed_fallback(|| async { ApiFailure::MethodNotAllowed })
         .with_state(state)

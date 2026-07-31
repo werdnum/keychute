@@ -84,6 +84,11 @@ const MAX_REASON_BYTES: usize = 4 * 1024;
 /// The cap the server applies to each constraint list — origins, methods and
 /// path prefixes alike.
 const MAX_CONSTRAINT_ENTRIES: usize = 32;
+/// The server's cap on a single method token (`policy::is_valid_http_method`).
+/// `reqwest::Method::from_bytes` has no such bound, so without this a
+/// syntactically valid 100-byte method would pass every local check, read
+/// stdin, and only then be refused.
+const MAX_METHOD_BYTES: usize = 64;
 
 /// Ceiling on `--timeout`. Waiting longer than the longest grant can live is
 /// meaningless, and the deadline is an `Instant` — a value near `u64::MAX`
@@ -448,6 +453,12 @@ pub(crate) fn normalize_method(m: &str) -> Result<String, String> {
     let upper = m.trim().to_ascii_uppercase();
     reqwest::Method::from_bytes(upper.as_bytes())
         .map_err(|_| format!("invalid HTTP method {m:?}"))?;
+    if upper.len() > MAX_METHOD_BYTES {
+        return Err(format!(
+            "HTTP method too long ({} bytes; the server accepts at most {MAX_METHOD_BYTES})",
+            upper.len()
+        ));
+    }
     if upper == "TRACE" {
         // The server refuses this unconditionally (a TRACE-capable upstream
         // echoes the request back, credential header included). Say why here
@@ -964,7 +975,49 @@ fn credential_selector(args: &CurlArgs) -> CliResult<Selector> {
 /// invocation blocked on a producer, or swallow a finite one's input and only
 /// then report the error. `constraints_for` re-runs the same rules rather than
 /// trusting this to have happened.
+///
+/// Split in two by whether a grant is being ASKED for. `--grant-id` reuses one
+/// that already exists, so `--ttl`, `--max-uses`, `--timeout`, `--reason`,
+/// `--idempotency-key`, `--allow-method` and `--path-prefix` describe a request
+/// that will never be made; judging them there would refuse calls — a wrapper
+/// passing the same flag set in both modes, say — over values with no effect,
+/// while the ones that DO apply to the reused call still get checked.
 fn validate_grant_options(args: &CurlArgs, target: &Target, method: &str) -> CliResult<()> {
+    // A path with no canonical form is one the proxy refuses outright, so the
+    // call cannot succeed however it is approved. Refusing it here rather than
+    // deferring matters when an explicit `--path-prefix` is valid on its own:
+    // the request would be accepted, a human would approve it, and only then
+    // would the proxy reject the path. Saying so now costs nobody an approval.
+    if canonical_path(&target.path).is_none() {
+        return Err(fail(
+            EXIT_CONFIG,
+            format!(
+                "the path {:?} is one the broker refuses: it must percent-decode once to valid \
+                 UTF-8, with no encoded '/' or '\\', no '.' or '..' segment (judged before any \
+                 ';'), no control characters and no '//'",
+                target.path
+            ),
+        ));
+    }
+    // `Duration::from_secs_f64` PANICS on a negative, NaN or overflowing
+    // value, so the range is checked rather than trusted to clap, which only
+    // knows the argument parses as a float. This one bounds the proxied call
+    // itself, so it applies to a reused grant exactly as it does to a fresh
+    // one.
+    if !(args.max_time.is_finite()
+        && args.max_time >= 0.0
+        && args.max_time <= MAX_APPROVAL_WAIT_SECONDS as f64)
+    {
+        return Err(fail(
+            EXIT_CONFIG,
+            format!(
+                "--max-time must be between 0 (no limit) and {MAX_APPROVAL_WAIT_SECONDS} seconds"
+            ),
+        ));
+    }
+    if args.grant_id.is_some() {
+        return Ok(());
+    }
     if let Some(key) = &args.idempotency_key {
         // `--idempotency-key ''` is an unset variable that expanded, not a
         // choice. It cannot reach the shared validator that would refuse it,
@@ -989,22 +1042,6 @@ fn validate_grant_options(args: &CurlArgs, target: &Target, method: &str) -> Cli
             ));
         }
     }
-    // A path with no canonical form is one the proxy refuses outright, so the
-    // call cannot succeed however it is approved. Refusing it here rather than
-    // deferring matters when an explicit `--path-prefix` is valid on its own:
-    // the request would be accepted, a human would approve it, and only then
-    // would the proxy reject the path. Saying so now costs nobody an approval.
-    if canonical_path(&target.path).is_none() {
-        return Err(fail(
-            EXIT_CONFIG,
-            format!(
-                "the path {:?} is one the broker refuses: it must percent-decode once to valid \
-                 UTF-8, with no encoded '/' or '\\', no '.' or '..' segment (judged before any \
-                 ';'), no control characters and no '//'",
-                target.path
-            ),
-        ));
-    }
     // The server's own bounds (`requests.rs`), applied unconditionally there.
     // Mirrored rather than deferred for the same reason as everything else in
     // this function: each of these is decidable from the arguments, so a
@@ -1022,20 +1059,6 @@ fn validate_grant_options(args: &CurlArgs, target: &Target, method: &str) -> Cli
             format!("--max-uses must be at most {MAX_SERVER_USES} (0 means no cap)"),
         ));
     }
-    // `Duration::from_secs_f64` PANICS on a negative, NaN or overflowing
-    // value, so the range is checked rather than trusted to clap, which only
-    // knows the argument parses as a float.
-    if !(args.max_time.is_finite()
-        && args.max_time >= 0.0
-        && args.max_time <= MAX_APPROVAL_WAIT_SECONDS as f64)
-    {
-        return Err(fail(
-            EXIT_CONFIG,
-            format!(
-                "--max-time must be between 0 (no limit) and {MAX_APPROVAL_WAIT_SECONDS} seconds"
-            ),
-        ));
-    }
     if args.timeout > MAX_APPROVAL_WAIT_SECONDS {
         return Err(fail(
             EXIT_CONFIG,
@@ -1045,11 +1068,11 @@ fn validate_grant_options(args: &CurlArgs, target: &Target, method: &str) -> Cli
             ),
         ));
     }
-    // Only when the name is going to be USED. `--grant-id` reuses a grant that
-    // already names the credential, and `credential_selector` says so plainly;
-    // rejecting the call over the length of an argument just reported to have
-    // no effect would contradict that message for no gain.
-    if let Some(name) = args.secret.as_ref().filter(|_| args.grant_id.is_none()) {
+    // Only reached when the name is going to be USED: with `--grant-id` the
+    // grant already names the credential, and `credential_selector` says so
+    // plainly — rejecting the call over the length of an argument just
+    // reported to have no effect would contradict that message for no gain.
+    if let Some(name) = args.secret.as_ref() {
         if name.is_empty() || name.len() > MAX_SECRET_NAME_BYTES {
             return Err(fail(
                 EXIT_CONFIG,
@@ -1499,13 +1522,20 @@ async fn check_grant_covers(
     // ones that decide, and a grant that passes here can still be refused
     // there. This only declines to read a body for a grant that cannot
     // possibly work.
+    //
+    // Which is why expiry is judged against the SERVER's clock, reported with
+    // the grant, and not this host's: a container running fast would otherwise
+    // declare a freshly approved short grant expired and refuse a call the
+    // server would have run. Falling back to the local clock covers a server
+    // that predates the field; there the old skew risk is the only option.
+    let now = info.server_time.unwrap_or_else(chrono::Utc::now);
     if info.revoked {
         return Err(fail(
             crate::EXIT_TIMEOUT,
             format!("grant {grant_id} has been revoked; request a new one"),
         ));
     }
-    if info.not_after <= chrono::Utc::now() {
+    if info.not_after <= now {
         return Err(fail(
             crate::EXIT_TIMEOUT,
             format!(
@@ -1741,7 +1771,10 @@ async fn report_reuse_budget(
             // APPROVAL, not from now. Printing "good for 4 more calls, no
             // second approval" for either would send someone after a grant
             // that answers `grant-expired`.
-            let spent = info.revoked || info.not_after <= chrono::Utc::now();
+            // Against the server's clock for the same reason `check_grant_covers`
+            // uses it: a fast host would report a live grant as expired.
+            let spent =
+                info.revoked || info.not_after <= info.server_time.unwrap_or_else(chrono::Utc::now);
             if remaining > 0 && !spent {
                 let budget = match info.max_uses {
                     Some(_) => format!("{remaining} more call(s)"),
@@ -2544,6 +2577,46 @@ mod tests {
 
         args.ttl = MAX_TTL_SECONDS;
         assert!(validate_grant_options(&args, &target, "GET").is_ok());
+    }
+
+    #[test]
+    fn grant_creation_options_are_not_judged_when_a_grant_is_reused() {
+        let target = parse_target("https://api.example.com/v1/things").unwrap();
+        let mut args = body_args(None, None, None);
+        args.url = "https://api.example.com/v1/things".into();
+        args.grant_id = Some(Uuid::new_v4().to_string());
+
+        // None of these describe anything the reused call will ask for, so a
+        // wrapper that passes the same flags in both modes is not refused for
+        // values with no effect here.
+        args.ttl = 0;
+        args.timeout = MAX_APPROVAL_WAIT_SECONDS + 1;
+        args.max_uses = MAX_SERVER_USES;
+        args.reason = "r".repeat(MAX_REASON_BYTES + 1);
+        args.idempotency_key = Some(String::new());
+        args.path_prefixes = vec!["/".into(); MAX_CONSTRAINT_ENTRIES + 1];
+        args.allow_methods = vec!["not a method".into()];
+        assert!(validate_grant_options(&args, &target, "GET").is_ok());
+
+        // What still applies to the proxied call is still applied: the path
+        // the proxy would refuse, and the timeout that would panic the
+        // `Duration` conversion.
+        let bad_path = parse_target("https://api.example.com/v1/../admin").unwrap();
+        assert!(validate_grant_options(&args, &bad_path, "GET").is_err());
+        args.max_time = -1.0;
+        let err = validate_grant_options(&args, &target, "GET").unwrap_err();
+        assert!(err.message.contains("--max-time"), "{}", err.message);
+    }
+
+    #[test]
+    fn a_method_past_the_servers_length_cap_is_refused() {
+        // `reqwest::Method::from_bytes` accepts this; the server's
+        // `is_valid_http_method` does not, so without the mirrored bound a
+        // `-d @-` invocation would read stdin for a call certain to fail.
+        let long = "A".repeat(MAX_METHOD_BYTES + 1);
+        let err = normalize_method(&long).unwrap_err();
+        assert!(err.contains("too long"), "{err}");
+        assert!(normalize_method(&"A".repeat(MAX_METHOD_BYTES)).is_ok());
     }
 
     #[test]

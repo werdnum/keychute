@@ -329,6 +329,13 @@ pub struct GrantInfo {
     pub max_uses: Option<u32>,
     pub use_count: u32,
     pub revoked: bool,
+    /// The server's clock at the moment this was answered. Expiry is decided
+    /// against the database clock, so a client comparing `not_after` has to
+    /// compare against this and not its own — a host running two minutes fast
+    /// would otherwise declare a freshly approved 60-second grant expired.
+    /// Optional only for a client talking to a server that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_time: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -261,6 +261,10 @@ async fn framework_rejections_are_marked_too() {
             404,
             "not-found",
         ),
+        // The subtree root itself. Axum's `{*rest}` wants a non-empty suffix,
+        // so this matches neither a real route nor the catch-all wildcard and
+        // fell through to the default unmarked 404.
+        (reqwest::Method::GET, "/v1".to_string(), 404, "not-found"),
         // The route exists; the method does not.
         (
             reqwest::Method::DELETE,

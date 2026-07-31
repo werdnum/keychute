@@ -78,6 +78,9 @@ pub async fn info(
         max_uses: grant.max_uses.map(|v| v.max(0) as u32),
         use_count: grant.use_count.max(0) as u32,
         revoked: grant.revoked,
+        // The clock `not_after` is judged against, so that a client deciding
+        // "expired" locally decides it the same way `begin_grant_use` will.
+        server_time: Some(db::db_now(&state.db).await?),
     }))
 }
 

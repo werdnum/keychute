@@ -240,7 +240,9 @@ Client authn: `Authorization: Bearer <api-token>` or
   retry it.
 - `GET /v1/grants/{id}` — non-secret grant metadata for the OWNING client
   (another client's grant is 404, like every grant route): mechanism,
-  constraints AS GRANTED, `not_after`, `max_uses`, `use_count`, `revoked`. No
+  constraints AS GRANTED, `not_after`, `max_uses`, `use_count`, `revoked`, and
+  `server_time` — the DB clock the expiry is judged against, so a client with a
+  skewed host does not decide "expired" differently from `begin_grant_use`. No
   credential material and no secret name. Read-only: it neither revalidates nor
   touches use accounting, and it reports revoked/expired grants rather than
   hiding them. Exists because the proxy takes the upstream origin from the

@@ -457,6 +457,20 @@ async fn grant_info_is_owner_scoped_and_reports_the_granted_limits() {
     // confusion this endpoint exists to remove.
     assert_eq!(info["constraints"]["ttl_seconds"], 600);
     assert!(info["constraints"]["max_uses"].is_null());
+    // The clock expiry is judged against, so a client with a skewed host does
+    // not have to guess whether `not_after` has passed as the DATABASE
+    // measures it — and lands between the two timestamps of a live grant.
+    let server_time = info["server_time"]
+        .as_str()
+        .expect("server_time is reported")
+        .parse::<chrono::DateTime<chrono::Utc>>()
+        .unwrap();
+    let not_after = info["not_after"]
+        .as_str()
+        .unwrap()
+        .parse::<chrono::DateTime<chrono::Utc>>()
+        .unwrap();
+    assert!(server_time < not_after, "{server_time} < {not_after}");
     // Never any credential material, and not even the secret's name.
     assert!(info.get("secret").is_none());
     assert!(info.get("secret_name").is_none());
