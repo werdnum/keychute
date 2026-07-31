@@ -71,6 +71,15 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/grants/{id}", get(grants::info))
         .route("/v1/grants/{id}/read", post(grants::read))
         .route("/v1/grants/{id}/proxy", any(crate::proxy::proxy_root))
+        // The upstream root spelled with its slash. `{*path}` below requires a
+        // non-empty suffix — the same axum rule that left `/v1` itself
+        // unrouted — so `…/proxy/` matched neither route and fell through to
+        // the catch-all 404. A target of `https://api.example.com` is an
+        // ordinary thing to call, and the CLI renders it exactly this way, so
+        // the grant was spent on an approval whose first use could not reach
+        // the upstream at all. `proxy_suffix` already normalizes both
+        // spellings to `/`; only the routing was missing.
+        .route("/v1/grants/{id}/proxy/", any(crate::proxy::proxy_root))
         .route(
             "/v1/grants/{id}/proxy/{*path}",
             any(crate::proxy::proxy_path),

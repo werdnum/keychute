@@ -535,6 +535,38 @@ pub(crate) fn parse_header(line: &str) -> Result<Option<(String, String)>, Strin
     Ok(Some((name.to_ascii_lowercase(), value.to_string())))
 }
 
+/// Why a `Name:` removal cannot be honoured here, or `None` if it can.
+///
+/// curl's removal form suppresses a header curl would otherwise generate, and
+/// most names reach this CLI with nothing to suppress — those are the no-ops
+/// curl also treats them as, and staying silent is right. But two names are
+/// generated further down the pipeline no matter what the caller asks, and
+/// accepting a removal of those silently sends a materially different header
+/// block than the curl line it was copied from.
+///
+/// Refused rather than ignored, at parse time, before an approval is spent or
+/// stdin is read: the caller learns the request they described cannot be made,
+/// instead of one they did not describe being made for them.
+///
+/// The credential header is deliberately NOT here. Injecting it is the entire
+/// purpose of the call, it is announced rather than silent, and its name comes
+/// from the grant's mechanism — which this side does not get to enumerate.
+fn unremovable_header(name: &str, has_body: bool) -> Option<&'static str> {
+    match name {
+        "host" => Some(
+            "the broker sets Host from the grant's approved origin — a proxied request \
+             must reach the origin a human approved, and cannot be sent without naming it",
+        ),
+        // Without a body nothing generates it, so the removal IS honoured and
+        // there is nothing to report.
+        "content-length" if has_body => Some(
+            "Content-Length is generated from the body — by this CLI on the hop to \
+             Keychute, and by the broker on the hop upstream",
+        ),
+        _ => None,
+    }
+}
+
 /// HTTP's optional whitespace: ASCII space and tab, and nothing else. Used
 /// instead of `str::trim`, whose Unicode whitespace class includes bytes that
 /// are legitimate header content.
@@ -1335,8 +1367,10 @@ pub(crate) async fn run_curl(
     // `Name:` removals. Most name a header nothing here would have sent, and
     // curl treats those as the no-ops they are — but `User-Agent` is one this
     // CLI sets itself, so a removal of it has to survive as an instruction
-    // rather than just an absence.
+    // rather than just an absence, and a couple of others are generated
+    // downstream regardless and so cannot be honoured at all.
     let mut suppress_user_agent = false;
+    let has_body = body_is_supplied(&args);
     for line in &args.headers {
         match parse_header(line).map_err(|e| fail(EXIT_CONFIG, e))? {
             Some(h) => parsed.push(h),
@@ -1347,6 +1381,16 @@ pub(crate) async fn run_curl(
                     .unwrap_or("")
                     .trim()
                     .to_ascii_lowercase();
+                if let Some(why) = unremovable_header(&name, has_body) {
+                    return Err(fail(
+                        EXIT_CONFIG,
+                        format!(
+                            "cannot honour the header removal {line:?}: {why}. The request \
+                             would go out carrying {name:?} anyway, so it is refused here \
+                             rather than sent looking like the curl line it is not."
+                        ),
+                    ));
+                }
                 if name == "user-agent" {
                     suppress_user_agent = true;
                 }
@@ -3276,6 +3320,21 @@ mod tests {
             "b=2",
         ])
         .is_err());
+    }
+
+    #[test]
+    fn removals_that_cannot_be_honoured_are_refused_not_ignored() {
+        // Nothing here generates these, so the removal is a real no-op and
+        // curl's own treatment — silence — is right.
+        assert!(unremovable_header("x-feature", true).is_none());
+        assert!(unremovable_header("user-agent", true).is_none());
+        // Host is set by the broker from the approved origin; the request
+        // cannot be sent without one.
+        assert!(unremovable_header("host", false).is_some());
+        // Content-Length only when there is a body to measure. Without one
+        // nothing generates it, so the removal IS honoured.
+        assert!(unremovable_header("content-length", true).is_some());
+        assert!(unremovable_header("content-length", false).is_none());
     }
 
     #[test]

@@ -803,6 +803,66 @@ async fn output_to_a_device_is_not_truncated() {
     );
 }
 
+/// A removal the pipeline cannot honour must fail loudly. `-H 'Content-Length:'`
+/// on a body-bearing call reads as "send no Content-Length", but the broker
+/// generates one from the body regardless — so accepting it silently would send
+/// a materially different header block than the curl line it was copied from.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unhonourable_header_removal_is_refused_before_anything_is_spent() {
+    let (base, st) = spawn_mock(ProxyMode::Upstream).await;
+    for (flags, name) in [
+        (vec!["-H", "Content-Length:", "-d", "a=1"], "content-length"),
+        (vec!["-H", "Host:"], "host"),
+    ] {
+        let b = base.clone();
+        let (code, _stdout, stderr) = tokio::task::spawn_blocking(move || {
+            let mut argv = vec![
+                "curl",
+                "https://api.example.com/v1/things",
+                "--grant-id",
+                GRANT_ID,
+            ];
+            argv.extend(flags);
+            run_cli(&b, &argv)
+        })
+        .await
+        .unwrap();
+        assert_eq!(code, 2, "{stderr}");
+        assert!(
+            stderr.contains(name),
+            "the error names the header: {stderr}"
+        );
+        assert!(
+            st.proxied.lock().unwrap().is_empty(),
+            "a refusal is a preflight: nothing may be sent"
+        );
+    }
+}
+
+/// The same removal with nothing to remove stays the no-op curl treats it as:
+/// no body means nothing generates Content-Length, so the removal is honoured.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_removal_with_nothing_to_remove_is_still_a_no_op() {
+    let (base, st) = spawn_mock(ProxyMode::Upstream).await;
+    let (code, _stdout, stderr) = tokio::task::spawn_blocking(move || {
+        run_cli(
+            &base,
+            &[
+                "curl",
+                "https://api.example.com/v1/things",
+                "--grant-id",
+                GRANT_ID,
+                "-H",
+                "Content-Length:",
+            ],
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(st.proxied.lock().unwrap().len(), 1);
+}
+
 /// `--fail` withholds the body, so it must also withhold the truncation. A
 /// refresh that finds the upstream down would otherwise leave the caller's last
 /// good copy empty — the destination emptied for a response that never arrives.

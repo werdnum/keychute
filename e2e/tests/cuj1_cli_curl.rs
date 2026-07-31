@@ -109,6 +109,47 @@ async fn cli_curl_proxies_with_the_credential_the_agent_never_sees() {
     assert_ne!(r.header("authorization"), Some(K8S_TOKEN));
 }
 
+/// A bare origin is an ordinary target, and the CLI renders its `/` path as
+/// `…/proxy/`. The wildcard proxy route requires a non-empty suffix, so that
+/// spelling matched no route and answered a 404 — after a human had approved
+/// the grant it was about to spend. The upstream root has to be reachable.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bare_origin_reaches_the_upstream_root() {
+    let env = TestEnv::spawn(SpawnOpts::default()).await.unwrap();
+    env.seed_secret("example-api-token", "tok-abc", "brokered", "bearer", "")
+        .await
+        .unwrap();
+
+    // No path at all, and a query with no path — both parse to `/`.
+    let url = format!("https://localhost:{}?probe=1", env.upstream_port);
+    let cli = spawn_curl(
+        &env,
+        &[
+            "curl",
+            &url,
+            "--secret",
+            "example-api-token",
+            "--reason",
+            "read the service root",
+            "--timeout",
+            "30",
+        ],
+    );
+    let request_id = pending_request_id(&env).await;
+    env.approve(&request_id, &[]).await.unwrap();
+
+    let (code, stdout, stderr) = wait_cli(cli);
+    assert_eq!(code, 0, "cli failed: {stderr}");
+    let body = String::from_utf8_lossy(&stdout);
+    assert!(body.contains("\"path\":\"/\""), "upstream root: {body}");
+
+    let recs = env.upstream_requests.lock().unwrap().clone();
+    assert_eq!(recs.len(), 1, "the call must actually reach the upstream");
+    assert_eq!(recs[0].path, "/");
+    assert_eq!(recs[0].query.as_deref(), Some("probe=1"));
+    assert_eq!(recs[0].header("authorization"), Some("Bearer tok-abc"));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn cli_curl_reports_a_denial_as_a_denial_and_sends_nothing() {
     let env = TestEnv::spawn(SpawnOpts::default()).await.unwrap();
