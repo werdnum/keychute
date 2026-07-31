@@ -70,6 +70,9 @@ struct Cli {
 enum Cmd {
     /// Make an authenticated HTTP request through Keychute's broker. The
     /// credential is attached server-side and never enters this container.
+    ///
+    /// Curl-SHAPED, not a curl: the flags listed here are the whole surface,
+    /// they behave as curl's do, and anything absent is absent on purpose.
     Curl(curl::CurlArgs),
     /// Request a secret; once approved, print it to stdout.
     Request(RequestArgs),

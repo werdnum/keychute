@@ -18,6 +18,28 @@
 //! approved origin, its method the single approved method, and its path the
 //! path prefix. Approving one `keychute curl` therefore approves exactly that
 //! call — not the host.
+//!
+//! # Scope: curl-SHAPED, not a curl
+//!
+//! This is a brokered-access client that borrows curl's spelling so an agent
+//! reaching for `curl` does not have to learn a second vocabulary. It is not a
+//! curl implementation and is not on a path to becoming one. The flags below
+//! are the whole surface; the ones that exist behave as curl does, and
+//! anything absent is absent on purpose.
+//!
+//! That boundary is the useful property, not a gap to close. Every additional
+//! curl behaviour is either irrelevant here (`-L`: redirects are never
+//! followed, by design), incompatible with a brokered grant (`-u`, `--proxy`:
+//! the credential and the route are the server's to choose), or an
+//! open-ended surface with no natural stopping point (`--form`, cookie jars,
+//! `@` globbing, `--compressed`, `--retry`). Adding them would trade a small
+//! auditable command for a large one whose behaviour an operator can no
+//! longer predict from the approval page.
+//!
+//! Unknown flags therefore fail at the parser rather than being silently
+//! ignored or approximated — an agent that needs something outside this
+//! surface should find out immediately, not discover it from a request that
+//! went out differently than it read.
 
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
