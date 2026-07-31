@@ -573,3 +573,59 @@ async fn output_dash_means_stdout() {
     assert!(!dir.join("-").exists(), "no file named `-` may be created");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// `-H 'User-Agent:'` is curl's spelling for *remove the header*. It is the one
+/// removal with something to remove: this CLI sets a default `User-Agent`, and
+/// the broker forwards `User-Agent` upstream unchanged. Removing it therefore
+/// has to mean the header is absent from the proxied request — not present and
+/// empty, which is a different request to an upstream that inspects it.
+#[tokio::test]
+async fn removing_the_user_agent_sends_no_user_agent() {
+    let (base, st) = spawn_mock(ProxyMode::Upstream).await;
+
+    // First, the default: absent the flag, the CLI identifies itself.
+    let b = base.clone();
+    let (code, _, stderr) = tokio::task::spawn_blocking(move || {
+        run_cli(
+            &b,
+            &[
+                "curl",
+                "https://api.example.com/v1/things",
+                "--grant-id",
+                GRANT_ID,
+            ],
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(code, 0, "{stderr}");
+
+    let (code, _, stderr) = tokio::task::spawn_blocking(move || {
+        run_cli(
+            &base,
+            &[
+                "curl",
+                "https://api.example.com/v1/things",
+                "--grant-id",
+                GRANT_ID,
+                "-H",
+                "User-Agent:",
+            ],
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(code, 0, "{stderr}");
+
+    let recs = st.proxied.lock().unwrap().clone();
+    assert_eq!(recs.len(), 2);
+    assert!(
+        recs[0]
+            .header("user-agent")
+            .is_some_and(|v| v.starts_with("keychute-cli/")),
+        "the default identifies this CLI: {:?}",
+        recs[0].header("user-agent")
+    );
+    // Absent, not empty.
+    assert_eq!(recs[1].header("user-agent"), None);
+}

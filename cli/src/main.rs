@@ -236,16 +236,35 @@ impl Config {
     }
 }
 
+/// The only header this CLI sets on its own behalf.
+pub(crate) const DEFAULT_USER_AGENT: &str = concat!("keychute-cli/", env!("CARGO_PKG_VERSION"));
+
 fn build_http_client(cfg: &Config) -> CliResult<reqwest::Client> {
+    build_http_client_with(cfg, Some(DEFAULT_USER_AGENT))
+}
+
+/// `user_agent: None` builds a client that sends no `User-Agent` at all.
+///
+/// That is not a stylistic option: `curl -H 'User-Agent:'` means *remove* the
+/// header, the broker forwards `User-Agent` upstream unchanged, and reqwest
+/// fills a default into any request that lacks one — so the removal can only
+/// be honoured by a client that has no default to fill in. Sending an empty
+/// value instead would be a present-but-empty header, which is the thing the
+/// removal spelling exists to avoid.
+pub(crate) fn build_http_client_with(
+    cfg: &Config,
+    user_agent: Option<&str>,
+) -> CliResult<reqwest::Client> {
     // Never follow redirects. Every call here carries the bearer token, `read`
     // carries a released secret back, and `store` carries the credential in
     // the request BODY — which a 307/308 replays verbatim at the new origin
     // even where reqwest would strip a cross-origin `Authorization` header. A
     // redirect from a secrets API is a misconfiguration or an attack, not a
     // route to follow; it surfaces as a 3xx error instead.
-    let mut builder = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .user_agent(concat!("keychute-cli/", env!("CARGO_PKG_VERSION")));
+    let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+    if let Some(ua) = user_agent {
+        builder = builder.user_agent(ua);
+    }
     if let Some(path) = &cfg.ca_bundle {
         let pem = std::fs::read(path).map_err(|e| {
             fail(
@@ -376,6 +395,27 @@ fn clip_command(mut cmd: String) -> String {
     cmd
 }
 
+/// Drop whole capture sections until the map fits the server's cap. Clipping
+/// bounds each entry, not their number, so this is the backstop; peers go
+/// first, being the less load-bearing of the two.
+///
+/// Public because a caller may add its own MANDATORY fields after the capture
+/// is built — `curl` adds the target the operator reads — and those fields
+/// have to be in the map before the shedding decides what fits. Running it
+/// only at build time would let a capture that fits on its own push a later,
+/// more important field over the line. Idempotent, so calling it again after
+/// an insertion is always safe.
+pub(crate) fn shed_structured_to_fit(map: &mut serde_json::Map<String, serde_json::Value>) {
+    for section in ["pipeline_siblings", "pipeline"] {
+        if json_len(map) <= MAX_STRUCTURED_BYTES {
+            return;
+        }
+        if map.remove(section).is_some() {
+            map.insert(format!("{section}_omitted"), serde_json::json!(true));
+        }
+    }
+}
+
 /// Assemble agent-asserted structured context: best-effort pipeline capture
 /// plus $KEYCHUTE_CONTEXT verbatim under `extra`.
 pub(crate) fn build_structured_context() -> Option<serde_json::Value> {
@@ -388,17 +428,7 @@ pub(crate) fn build_structured_context() -> Option<serde_json::Value> {
             let siblings: Vec<String> = captured.siblings.into_iter().map(clip_command).collect();
             map.insert("pipeline_siblings".to_string(), serde_json::json!(siblings));
         }
-        // Clipping bounds each entry, not their number. Shed whole sections
-        // rather than let the courtesy capture sink the request; the peers are
-        // the less load-bearing of the two, so they go first.
-        for section in ["pipeline_siblings", "pipeline"] {
-            if json_len(&map) <= MAX_STRUCTURED_BYTES {
-                break;
-            }
-            if map.remove(section).is_some() {
-                map.insert(format!("{section}_omitted"), serde_json::json!(true));
-            }
-        }
+        shed_structured_to_fit(&mut map);
     }
     // `extra` is the caller's own text. If they blow the budget with it, that
     // is a choice they made and can undo, so it is theirs to keep — unlike the
@@ -1308,6 +1338,43 @@ mod tests {
             clip_command(wide).chars().count(),
             MAX_STRUCTURED_COMMAND_CHARS + 1
         );
+    }
+
+    #[test]
+    fn shedding_runs_again_once_a_mandatory_field_is_added() {
+        // A capture sized to land EXACTLY on the cap, so it fits on its own
+        // and has not one byte to spare.
+        let mut map = serde_json::Map::new();
+        map.insert("pipeline".to_string(), serde_json::json!([""]));
+        let filler = "x".repeat(MAX_STRUCTURED_BYTES - json_len(&map));
+        map.insert("pipeline".to_string(), serde_json::json!([filler]));
+        assert_eq!(json_len(&map), MAX_STRUCTURED_BYTES);
+        shed_structured_to_fit(&mut map);
+        assert!(map.contains_key("pipeline"), "it fits, so it stays");
+
+        // The target is mandatory and the capture is a courtesy, so adding the
+        // target must shed the capture rather than push the request over the
+        // server's cap and have it refused before anyone sees it.
+        map.insert("target".to_string(), serde_json::json!("GET https://x/y"));
+        map.insert("extra".to_string(), serde_json::json!("caller text"));
+        shed_structured_to_fit(&mut map);
+        assert!(json_len(&map) <= MAX_STRUCTURED_BYTES);
+        assert!(!map.contains_key("pipeline"));
+        assert_eq!(map["pipeline_omitted"], serde_json::json!(true));
+        // What the operator actually needs survives; so does the caller's own.
+        assert_eq!(map["target"], serde_json::json!("GET https://x/y"));
+        assert_eq!(map["extra"], serde_json::json!("caller text"));
+
+        // Peers go first: when dropping them alone gets under the cap, the
+        // ancestor chain stays.
+        let mut map = serde_json::Map::new();
+        map.insert("pipeline".to_string(), serde_json::json!(["sh -c x"]));
+        map.insert("pipeline_siblings".to_string(), serde_json::json!([""]));
+        let filler = "y".repeat(MAX_STRUCTURED_BYTES - json_len(&map) + 1);
+        map.insert("pipeline_siblings".to_string(), serde_json::json!([filler]));
+        shed_structured_to_fit(&mut map);
+        assert!(map.contains_key("pipeline"));
+        assert_eq!(map["pipeline_siblings_omitted"], serde_json::json!(true));
     }
 
     #[test]

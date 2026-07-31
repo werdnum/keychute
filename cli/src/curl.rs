@@ -300,8 +300,15 @@ pub(crate) fn parse_target(raw: &str) -> Result<Target, String> {
     let host = url
         .host_str()
         .ok_or_else(|| format!("URL {raw:?} has no host"))?;
-    let mut origin = Origin::parse(host)?;
-    origin.port = url.port();
+    // Assembled and handed to `Origin::parse` whole rather than parsed for the
+    // host and then patched: assigning `origin.port` directly walks around
+    // that function's own port checks, and `:0` is a port a URL parser accepts
+    // and `Origin` rejects. One validator, no second path past it.
+    let authority = match url.port() {
+        Some(p) => format!("{host}:{p}"),
+        None => host.to_string(),
+    };
+    let origin = Origin::parse(&authority)?;
     // Path and query come from the ORIGINAL string, not from `url`: the URL
     // parser resolves dot segments at parse time, including ENCODED ones, so
     // `url.path()` for `/a/%2e%2e/admin` is already `/admin`. Taking it from
@@ -763,9 +770,25 @@ pub(crate) async fn run_curl(
         None => None,
     };
     let mut parsed = Vec::new();
+    // `Name:` removals. Most name a header nothing here would have sent, and
+    // curl treats those as the no-ops they are — but `User-Agent` is one this
+    // CLI sets itself, so a removal of it has to survive as an instruction
+    // rather than just an absence.
+    let mut suppress_user_agent = false;
     for line in &args.headers {
-        if let Some(h) = parse_header(line).map_err(|e| fail(EXIT_CONFIG, e))? {
-            parsed.push(h);
+        match parse_header(line).map_err(|e| fail(EXIT_CONFIG, e))? {
+            Some(h) => parsed.push(h),
+            None => {
+                let name = line
+                    .split(':')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_ascii_lowercase();
+                if name == "user-agent" {
+                    suppress_user_agent = true;
+                }
+            }
         }
     }
     validate_grant_options(&args, &target)?;
@@ -814,7 +837,20 @@ pub(crate) async fn run_curl(
         }
     };
 
-    proxy_call(cfg, http, &args, &target, &method, headers, body, grant_id).await
+    // A `User-Agent:` removal cannot be expressed on a client that has a
+    // default one — reqwest fills the default into any request without the
+    // header — so the removal is honoured by using a client that has none.
+    let ua_free;
+    let proxy_http = if suppress_user_agent {
+        ua_free = crate::build_http_client_with(cfg, None)?;
+        &ua_free
+    } else {
+        http
+    };
+    proxy_call(
+        cfg, proxy_http, &args, &target, &method, headers, body, grant_id,
+    )
+    .await
 }
 
 /// Fetch a grant's metadata (never any credential material).
@@ -1082,6 +1118,10 @@ async fn acquire_grant(
             "target".to_string(),
             serde_json::Value::String(format!("{method} {}", target.display())),
         );
+        // Re-run after the insertion, not just at build time: the target is
+        // mandatory and the capture is a courtesy, so a capture that fitted on
+        // its own must not be what pushes the target past the server's cap.
+        crate::shed_structured_to_fit(map);
     }
 
     let body = CreateAccessRequest {
@@ -1379,6 +1419,21 @@ mod tests {
         assert!(parse_target("not a url").is_err());
         // Hosts Origin::parse refuses, for its own reasons.
         assert!(parse_target("https://*.example.com/v1").is_err());
+        // And ports it refuses: a URL parser accepts `:0`, `Origin` does not,
+        // so the authority goes through that one validator rather than being
+        // patched in around it.
+        assert!(parse_target("https://api.example.com:0/v1").is_err());
+        // An ordinary explicit port still survives the round trip.
+        let t = parse_target("https://api.example.com:8443/v1").unwrap();
+        assert_eq!(t.origin.port, Some(8443));
+        // As does the default, which the URL parser reports as absent.
+        assert_eq!(
+            parse_target("https://api.example.com:443/v1")
+                .unwrap()
+                .origin
+                .port,
+            None
+        );
     }
 
     #[test]
@@ -1410,6 +1465,10 @@ mod tests {
             ("x-feature".to_string(), String::new())
         );
         assert!(parse_header(";").is_err());
+        // `User-Agent:` is the one removal with something to remove — this CLI
+        // sets a default one and the broker forwards it upstream. The parser
+        // reports the removal; honouring it is `run_curl`'s job.
+        assert!(parse_header("User-Agent:").unwrap().is_none());
         assert!(parse_header("nocolon").is_err());
         assert!(parse_header(": v").is_err());
         assert!(parse_header("Bad Name: v").is_err());
