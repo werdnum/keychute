@@ -327,6 +327,19 @@ pub(crate) fn constraints_for(
                 return Err(format!("path prefix {p:?} must start with '/'"));
             }
         }
+        // A prefix set that excludes the call itself would spend an operator's
+        // approval on a grant whose very first use is a guaranteed 403. The
+        // server checks the canonical path against these prefixes; check the
+        // same thing here, before a human is asked anything.
+        if let Some(canonical) = canonical_path(&target.path) {
+            if !path_prefixes.iter().any(|p| path_covered(p, &canonical)) {
+                return Err(format!(
+                    "--path-prefix {} does not cover {canonical}, so the approved grant \
+                     could not serve this call",
+                    path_prefixes.join(", ")
+                ));
+            }
+        }
         path_prefixes.to_vec()
     };
     Ok(Constraints {
@@ -423,6 +436,44 @@ fn classify_proxy_error(status: reqwest::StatusCode, body: &str) -> Failure {
     )
 }
 
+/// Derive the request idempotency key from the caller's key AND the exact call
+/// this invocation would make.
+///
+/// The server's idempotency MAC deliberately excludes `context.structured`
+/// (`api/canonical.rs`), and the query string is in no constraint — so with a
+/// bare caller key, a rerun that changes only the query returns the ORIGINAL
+/// approved request, and this command then proxies the NEW query under it. An
+/// operator who approved `POST /transfer?to=trusted` would have that one
+/// approval exercised as `POST /transfer?to=attacker`, with no second push and
+/// nothing on any page showing the substitution.
+///
+/// Binding the call into the key makes "same key" mean "same call": an
+/// identical rerun still resumes its original request (which is what
+/// `--idempotency-key` is for — a command that died after approval but before
+/// the proxy call), while a changed target mints a fresh request and a fresh
+/// push carrying the new target.
+pub(crate) fn call_bound_idempotency_key(user_key: &str, method: &str, target: &Target) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    // Length-prefixed so no two different calls can produce the same preimage
+    // by shifting a delimiter across fields.
+    for field in [
+        method,
+        &target.origin.to_display(),
+        &target.path,
+        target.query.as_deref().unwrap_or(""),
+    ] {
+        hasher.update((field.len() as u64).to_be_bytes());
+        hasher.update(field.as_bytes());
+    }
+    let digest = hex::encode(hasher.finalize());
+    format!("{user_key}-{}", &digest[..16])
+}
+
+/// The caller-key budget: the derived key appends `-` plus 16 hex characters,
+/// and the whole thing still has to fit the shared cap.
+pub(crate) const MAX_CURL_USER_KEY_BYTES: usize = 124 - 17;
+
 /// Which credential this call authenticates with: a grant already approved,
 /// or a secret to request one for.
 enum Selector {
@@ -462,24 +513,28 @@ pub(crate) async fn run_curl(
 ) -> CliResult<()> {
     let target = parse_target(&args.url).map_err(|e| fail(EXIT_CONFIG, e))?;
 
-    // Settle every usage question BEFORE reading the body. `-d @-` consumes
-    // stdin, and doing that first means an invocation missing --secret blocks
-    // on a slow producer instead of reporting the error — or, with a finite
-    // producer, swallows the input and only then fails.
+    // Settle EVERY body-independent usage question before reading the body.
+    // `-d @-` consumes stdin, so anything checked afterwards means an
+    // invocation already known to be invalid still blocks on a producer that
+    // may never close — or, with a finite one, swallows its input and only
+    // then reports the error. Selector, method and headers all qualify.
     let selector = credential_selector(&args)?;
-
-    let body = read_body(&args)?;
-    let method = match &args.method {
-        Some(m) => normalize_method(m).map_err(|e| fail(EXIT_CONFIG, e))?,
-        // curl's default: a body implies POST.
-        None if body.is_some() => "POST".to_string(),
-        None => "GET".to_string(),
+    let explicit_method = match &args.method {
+        Some(m) => Some(normalize_method(m).map_err(|e| fail(EXIT_CONFIG, e))?),
+        None => None,
     };
-
     let mut parsed = Vec::new();
     for line in &args.headers {
         parsed.push(parse_header(line).map_err(|e| fail(EXIT_CONFIG, e))?);
     }
+
+    let body = read_body(&args)?;
+    let method = match explicit_method {
+        Some(m) => m,
+        // curl's default: a body implies POST.
+        None if body.is_some() => "POST".to_string(),
+        None => "GET".to_string(),
+    };
     // A `Connection: X-Internal` header nominates X-Internal as hop-by-hop,
     // and the broker honours that — but only if it can still SEE the
     // Connection header. Since `Connection` is itself on the strip list, a
@@ -725,10 +780,21 @@ async fn acquire_grant(
     method: &str,
     secret_name: String,
 ) -> CliResult<Uuid> {
-    let idem_key = args
+    let user_key = args
         .idempotency_key
         .clone()
         .unwrap_or_else(|| Uuid::new_v4().to_string());
+    if user_key.len() > MAX_CURL_USER_KEY_BYTES {
+        return Err(fail(
+            EXIT_CONFIG,
+            format!(
+                "--idempotency-key too long ({} bytes; max {MAX_CURL_USER_KEY_BYTES} here, \
+                 because the call is bound into the key sent to the server)",
+                user_key.len()
+            ),
+        ));
+    }
+    let idem_key = call_bound_idempotency_key(&user_key, method, target);
     validate_idempotency_key(&idem_key).map_err(|e| fail(EXIT_CONFIG, e))?;
     let constraints = constraints_for(
         target,
@@ -1298,6 +1364,61 @@ mod tests {
         assert!(path_covered("/v1/account/", "/v1/account/x"));
         // Root covers everything.
         assert!(path_covered("/", "/anything"));
+    }
+
+    #[test]
+    fn the_idempotency_key_is_bound_to_the_exact_call() {
+        let base = parse_target("https://api.example.com/transfer?to=trusted").unwrap();
+        let key = call_bound_idempotency_key("k1", "POST", &base);
+        // Same command, same key: a rerun resumes its original request, which
+        // is the whole point of --idempotency-key.
+        assert_eq!(key, call_bound_idempotency_key("k1", "POST", &base));
+
+        // Change ONLY the query and the key changes — otherwise the server
+        // would hand back the original approval (the MAC excludes
+        // context.structured) and this command would proxy the new target
+        // under a grant the operator approved for the old one.
+        let swapped = parse_target("https://api.example.com/transfer?to=attacker").unwrap();
+        assert_ne!(key, call_bound_idempotency_key("k1", "POST", &swapped));
+        // Same for the other components of "which call is this".
+        let other_path = parse_target("https://api.example.com/refund?to=trusted").unwrap();
+        assert_ne!(key, call_bound_idempotency_key("k1", "POST", &other_path));
+        let other_host = parse_target("https://other.example/transfer?to=trusted").unwrap();
+        assert_ne!(key, call_bound_idempotency_key("k1", "POST", &other_host));
+        assert_ne!(key, call_bound_idempotency_key("k1", "GET", &base));
+        // A different caller key is still a different request.
+        assert_ne!(key, call_bound_idempotency_key("k2", "POST", &base));
+        // Length-prefixing: no field boundary can be shifted to collide.
+        let a = parse_target("https://api.example.com/ab").unwrap();
+        let b = parse_target("https://api.example.com/a?b").unwrap();
+        assert_ne!(
+            call_bound_idempotency_key("k", "GET", &a),
+            call_bound_idempotency_key("k", "GET", &b)
+        );
+        // The derived key fits the server's cap.
+        assert!(validate_idempotency_key(&call_bound_idempotency_key(
+            &"k".repeat(MAX_CURL_USER_KEY_BYTES),
+            "POST",
+            &base
+        ))
+        .is_ok());
+    }
+
+    #[test]
+    fn a_path_prefix_that_excludes_the_call_is_refused() {
+        let t = parse_target("https://api.example.com/admin").unwrap();
+        // Approving this would mint a grant whose very first use is a certain
+        // 403 — an operator's attention spent on a call that cannot work.
+        let err = constraints_for(&t, "GET", &[], &["/v1".into()], 300, 1).unwrap_err();
+        assert!(err.contains("does not cover"), "{err}");
+        // A covering prefix is fine, at either granularity.
+        assert!(constraints_for(&t, "GET", &[], &["/admin".into()], 300, 1).is_ok());
+        assert!(constraints_for(&t, "GET", &[], &["/".into()], 300, 1).is_ok());
+        // And one of several covering is enough.
+        assert!(constraints_for(&t, "GET", &[], &["/v1".into(), "/admin".into()], 300, 1).is_ok());
+        // Encoded paths compare canonically, like the server does.
+        let enc = parse_target("https://api.example.com/files/a%20b").unwrap();
+        assert!(constraints_for(&enc, "GET", &[], &["/files/a b".into()], 300, 1).is_ok());
     }
 
     fn err_body(code: &str) -> String {

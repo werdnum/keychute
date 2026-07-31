@@ -250,6 +250,11 @@ Client authn: `Authorization: Bearer <api-token>` or
   followed. Strip-list + header synthesis per DESIGN §4.
 - Every error response Keychute generates itself carries
   `X-Keychute-Error: <code>` — the same server-vocabulary code as the body.
+  The proxy routes parse the grant id from the raw path inside the handler
+  rather than via a `Path<Uuid>` extractor, because an extractor rejection is
+  produced by axum before any handler runs and would therefore go out
+  unmarked — a Keychute 400 that a client reads as an upstream answer, on a
+  call that never reached an upstream.
   On the proxy path a caller otherwise cannot tell a Keychute `403
   policy-denied` from an upstream's own `403`: same status, and an upstream may
   well answer with the same `{"error": …}` shape. The CLI keys its exit codes
