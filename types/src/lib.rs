@@ -3,6 +3,8 @@
 //! This crate is IO-free. Semantics are specified in `docs/DESIGN.md` and
 //! pinned in `docs/IMPLEMENTATION.md`.
 
+pub mod paths;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;

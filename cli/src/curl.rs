@@ -336,7 +336,7 @@ pub(crate) fn parse_target(raw: &str) -> Result<Target, String> {
         // `https://api.example\admin` the parser reads the path as `/admin`
         // while the raw scanner reads `/` — the URL means two different things
         // depending on who reads it, which is exactly the ambiguity approval
-        // cannot survive. The server's `policy::paths::canonicalize` refuses
+        // cannot survive. The shared `keychute_types::paths::canonicalize` refuses
         // raw backslashes too; refuse here so the human is never asked to
         // approve a target whose meaning is disputed.
         return Err(format!(
@@ -367,7 +367,7 @@ pub(crate) fn parse_target(raw: &str) -> Result<Target, String> {
     // parser resolves dot segments at parse time, including ENCODED ones, so
     // `url.path()` for `/a/%2e%2e/admin` is already `/admin`. Taking it from
     // there would send a request to a resource the caller did not name and
-    // launder past `policy::paths::canonicalize`, which exists to reject that
+    // launder past `keychute_types::paths::canonicalize`, which exists to reject that
     // exact input. The authority is still the parser's answer — that is what
     // it is good for, and `Origin::parse` re-checks it.
     let (path, query) = raw_path_and_query(raw);
@@ -396,105 +396,11 @@ pub(crate) fn parse_target(raw: &str) -> Result<Target, String> {
     {
         return Err(respelled_error(bad, raw));
     }
-    check_path_escapes(&path, raw)?;
     Ok(Target {
         origin,
         path,
         query,
     })
-}
-
-/// The same divergence from the other end: escapes the BROKER unwinds.
-///
-/// `policy::paths::canonicalize` percent-decodes the path once, and
-/// `proxy::outbound_url` then re-serializes it — so `/users/%7Ealice` is
-/// approved and hashed as `%7E` and arrives upstream as `/users/~alice`.
-/// Verified against the server: `%2B`, `%2C`, `%3A` and every other escape of
-/// a character a URL parser leaves literal change spelling the same way, while
-/// `%20`, `%22`, `%3F` and non-ASCII escapes survive untouched.
-///
-/// The query is not decoded by the broker, so this is a path-only rule.
-fn check_path_escapes(path: &str, raw: &str) -> Result<(), String> {
-    let bytes = path.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != b'%' {
-            i += 1;
-            continue;
-        }
-        // Malformed escapes never reach an upstream at all: the broker refuses
-        // the request. Refusing here costs the caller nothing and lands before
-        // stdin is read and before an operator is asked.
-        let (hi, lo) = match (bytes.get(i + 1), bytes.get(i + 2)) {
-            (Some(h), Some(l)) => (*h, *l),
-            _ => {
-                return Err(format!(
-                    "refusing URL {raw:?}: truncated percent escape in path"
-                ))
-            }
-        };
-        let decoded = match (hex_nibble(hi), hex_nibble(lo)) {
-            (Some(h), Some(l)) => (h << 4) | l,
-            _ => {
-                return Err(format!(
-                    "refusing URL {raw:?}: invalid percent escape in path"
-                ))
-            }
-        };
-        match decoded {
-            // The broker rejects both outright rather than sending anything.
-            b'/' => {
-                return Err(format!(
-                    "refusing URL {raw:?}: an encoded '/' in a path is refused by the broker \
-                     (it would hide a segment boundary from the path check)"
-                ))
-            }
-            b'\\' => {
-                return Err(format!(
-                    "refusing URL {raw:?}: an encoded '\\' in a path is refused by the broker"
-                ))
-            }
-            // `%` is the one escape the broker preserves: `outbound_url`
-            // re-escapes it before serializing, so `%25` arrives as `%25`.
-            b'%' => {}
-            b if sent_literally_in_path(b) => {
-                return Err(format!(
-                    "refusing URL {raw:?}: the broker percent-DECODES the path, so `%{:02X}` \
-                     would be approved and hashed as written and arrive upstream as {:?} — \
-                     the same target in a different spelling, which an upstream that signs or \
-                     logs the raw request target can tell apart. Write it literally.",
-                    decoded, decoded as char
-                ))
-            }
-            _ => {}
-        }
-        i += 3;
-    }
-    Ok(())
-}
-
-/// Whether a decoded byte would be re-serialized literally in a path — i.e.
-/// whether unwinding its escape changes the request target that is sent.
-///
-/// The probe is `Url::set_path`, which is what `proxy::outbound_url` calls,
-/// NOT whole-URL parsing: `#` and `?` are structural in a URL string but
-/// ordinary content to `set_path`, which re-encodes them. Pinned by
-/// `every_escape_the_broker_unwinds_is_refused`.
-fn sent_literally_in_path(b: u8) -> bool {
-    b.is_ascii_graphic() && !ESCAPE_SURVIVES.contains(b as char)
-}
-
-/// Bytes `set_path` percent-encodes on the way out, so their escaped spelling
-/// is the one that arrives and nothing changes.
-const ESCAPE_SURVIVES: &str = "\"#<>?`{}\\";
-
-fn hex_nibble(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
 }
 
 /// Characters `Url::parse` percent-encodes rather than passing through, per
@@ -1001,12 +907,15 @@ pub(crate) fn call_bound_idempotency_key(
 
 /// Hex characters of SHA-256 kept in the derived key — 128 bits.
 ///
-/// This is a collision bound, not a preimage one, and the party searching for
-/// the collision is the same party choosing both queries: find two that hash
-/// alike, get the benign one approved, then run the other under that approval.
-/// At 64 bits that search is about 2^32 attempts — cheap enough for the exact
-/// substitution this binding exists to prevent. 128 bits puts it at 2^64,
-/// which is not.
+/// The binding exists so that "same idempotency key" means "same call", which
+/// keeps an honest caller from resuming an earlier approval for a request it
+/// has since edited. It is not an adversarial control: an agent that wants a
+/// different call under this key calls the broker's API and sends whichever
+/// key it likes.
+///
+/// 128 bits rather than 64 because the digest is already computed and the
+/// width costs nothing within [`MAX_CURL_USER_KEY_BYTES`] — no more accidental
+/// collisions to reason about, at no price.
 const CALL_BINDING_HEX_CHARS: usize = 32;
 
 /// The caller-key budget: the derived key appends `-` plus the hex above, and
@@ -1678,88 +1587,28 @@ async fn check_grant_covers(
     Ok(())
 }
 
-/// Percent-decode a path once, the way the server canonicalizes before it
-/// stores a prefix or matches a request (`policy::paths::canonicalize`).
+/// Percent-decode a path once, the way the broker canonicalizes before it
+/// stores a prefix or matches a request. Thin wrapper over the shared
+/// [`keychute_types::paths::canonicalize`] — the SAME code the proxy runs, so
+/// a preflight here cannot drift from the answer that decides the call.
 ///
-/// Returns None when the server would reject the path outright (encoded `/`
-/// or `\\`, a truncated or invalid escape, non-UTF-8) — the caller then skips
-/// the local check rather than guessing, and lets the server give its own
-/// answer.
+/// `None` means the broker rejects the path outright (encoded `/` or `\\`, a
+/// truncated or invalid escape, a dot segment, non-UTF-8).
 ///
-/// This matters because the two sides hold different spellings: a grant made
-/// for `/files/a%20b` stores the canonical `/files/a b`, while the URL a
-/// reuse is given still reads `/files/a%20b`. Comparing those raw would refuse
-/// the identical call the grant was made for.
+/// The decoding matters because the two sides hold different spellings: a
+/// grant made for `/files/a%20b` stores the canonical `/files/a b`, while the
+/// URL a reuse is given still reads `/files/a%20b`. Comparing those raw would
+/// refuse the identical call the grant was made for.
 pub(crate) fn canonical_path(raw: &str) -> Option<String> {
-    let bytes = raw.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'%' => {
-                if i + 3 > bytes.len() {
-                    return None;
-                }
-                let hex = |b: u8| match b {
-                    b'0'..=b'9' => Some(b - b'0'),
-                    b'a'..=b'f' => Some(b - b'a' + 10),
-                    b'A'..=b'F' => Some(b - b'A' + 10),
-                    _ => None,
-                };
-                let v = (hex(bytes[i + 1])? << 4) | hex(bytes[i + 2])?;
-                // The server rejects these rather than decoding them.
-                if v == b'/' || v == b'\\' {
-                    return None;
-                }
-                out.push(v);
-                i += 3;
-            }
-            b'\\' => return None,
-            b => {
-                out.push(b);
-                i += 1;
-            }
-        }
-    }
-    let decoded = String::from_utf8(out).ok()?;
-    // Everything below mirrors `server/src/policy/paths.rs::canonicalize`, which
-    // rejects rather than resolves. A path it refuses has no canonical form
-    // here either, so the local checks skip it and the server gives the answer.
-    // Getting this wrong is not merely a missed diagnostic: judging such a path
-    // "covered" spends a human approval on a call the proxy then refuses.
-    if decoded.chars().any(|c| c.is_control()) {
-        return None;
-    }
-    // Dot segments are judged by the portion BEFORE any `;`, because
-    // servlet-family upstreams strip `;params` and only then normalize — so
-    // `..;x` lands on `..` upstream and escapes the approved prefix.
-    if decoded.split('/').any(|seg| {
-        let base = seg.split(';').next().unwrap_or(seg);
-        base == "." || base == ".."
-    }) {
-        return None;
-    }
-    if decoded.contains("//") {
-        return None;
-    }
-    Some(decoded)
+    keychute_types::paths::canonicalize(raw).ok()
 }
 
-/// Prefix match at `/` segment boundaries, mirroring the server's rule:
-/// `/v1/account` covers `/v1/account` and `/v1/account/…`, never
-/// `/v1/account-delete`.
+/// Prefix match at `/` segment boundaries: `/v1/account` covers
+/// `/v1/account` and `/v1/account/…`, never `/v1/account-delete`.
 ///
 /// Both arguments must already be canonical — see [`canonical_path`].
 pub(crate) fn path_covered(prefix: &str, path: &str) -> bool {
-    let prefix = prefix.trim_end_matches('/');
-    if prefix.is_empty() {
-        return true;
-    }
-    match path.strip_prefix(prefix) {
-        Some("") => true,
-        Some(rest) => rest.starts_with('/'),
-        None => false,
-    }
+    keychute_types::paths::prefix_matches(prefix, path)
 }
 
 /// Ask for — and wait on — a grant that permits exactly this call.
@@ -2138,10 +1987,12 @@ mod tests {
         assert_eq!(t.origin.port, None);
         assert_eq!(t.path, "/v1/things");
         assert_eq!(t.query.as_deref(), Some("limit=10&q=a%20b"));
-        // An encoded separator is refused here now: the broker rejects it
-        // outright, so deferring only bought a stdin read and an approval ask
-        // before a certain failure.
-        assert!(parse_target("https://api.example.com/v1%2Fthings").is_err());
+        // An encoded separator survives parsing verbatim — `parse_target` does
+        // not judge escapes — and the preflight refuses it through the shared
+        // canonicalizer, still before stdin and before any approval.
+        let t = parse_target("https://api.example.com/v1%2Fthings").unwrap();
+        assert_eq!(t.path, "/v1%2Fthings");
+        assert!(canonical_path(&t.path).is_none());
         // A bare origin still yields a path.
         assert_eq!(parse_target("https://api.example.com").unwrap().path, "/");
         // Non-default port becomes part of the origin.
@@ -2269,40 +2120,35 @@ mod tests {
         assert_eq!(u.query(), Some("a=%C3%A9"));
     }
 
-    /// The other half of the same property, pinned the same way: an escape is
-    /// refused exactly when unwinding it would change what is sent. The broker
-    /// decodes the path once and re-serializes, so a byte the parser writes
-    /// literally arrives in a spelling the approval never showed — while one
-    /// the parser re-encodes (`%20`, `%22`) round-trips and must stay allowed.
+    /// Percent-escapes in the target are the CALLER's spelling and stay that
+    /// way here. The broker decodes the path once, so `/x%7Ey` is approved as
+    /// written and arrives upstream as `/x~y`; this client used to refuse that
+    /// class outright, which cost legal, RFC-equivalent URLs to close a gap it
+    /// structurally could not close — an agent that wanted to mislead the
+    /// approval page would call the broker's API and skip this code entirely.
+    /// The approval page names the canonical path itself now, which is where
+    /// the fix belongs and where it covers every client.
+    ///
+    /// What remains refused is what the broker REJECTS rather than transforms,
+    /// and it is refused by the shared canonicalizer via the `--path-prefix`
+    /// and target preflights, not by a second implementation here.
     #[test]
-    fn every_escape_the_broker_unwinds_is_refused() {
-        for b in 0x21u8..=0x7e {
-            // Refused for their own reasons, with their own messages.
-            if matches!(b, b'/' | b'\\' | b'%') {
-                continue;
-            }
-            let c = b as char;
-            let mut u = reqwest::Url::parse("https://h/").unwrap();
-            u.set_path(&format!("/x{c}y"));
-            let round_trips = u.path() == format!("/x{c}y");
-            let refused = parse_target(&format!("https://h/x%{:02X}y", b)).is_err();
-            assert_eq!(
-                refused, round_trips,
-                "%{b:02X} ({c:?}): parser sends it literally = {round_trips}"
-            );
+    fn escapes_the_broker_unwinds_are_the_callers_spelling() {
+        for spelling in [
+            "https://h/x%7Ey",
+            "https://h/x%2By",
+            "https://h/x%3Ay",
+            "https://h/a%25b",
+            "https://h/caf%C3%A9",
+            "https://h/a?q=%7Ealice",
+        ] {
+            assert!(parse_target(spelling).is_ok(), "{spelling}");
         }
-        // `%25` is the exception the broker itself creates: `outbound_url`
-        // re-escapes `%` before serializing, so this spelling survives.
-        assert!(parse_target("https://h/a%25b").is_ok());
-        // Non-ASCII escapes are re-encoded byte for byte, so they survive too.
-        assert!(parse_target("https://h/caf%C3%A9").is_ok());
-        // Encoded separators and malformed escapes never reach an upstream.
-        assert!(parse_target("https://h/a%2Fb").is_err());
-        assert!(parse_target("https://h/a%5Cb").is_err());
-        assert!(parse_target("https://h/a%zzb").is_err());
-        assert!(parse_target("https://h/a%2").is_err());
-        // The query is NOT decoded by the broker, so its escapes are its own.
-        assert!(parse_target("https://h/a?q=%7Ealice").is_ok());
+        // Encoded separators and malformed escapes are still refused, by the
+        // shared canonicalizer the proxy itself runs.
+        for bad in ["/a%2Fb", "/a%5Cb", "/a%zzb", "/a%2"] {
+            assert!(canonical_path(bad).is_none(), "{bad}");
+        }
     }
 
     #[test]
@@ -3045,11 +2891,12 @@ mod tests {
         // /admin — a resource the caller never named — and launder past the
         // server check that exists to reject it.
         // What must never happen is RESOLVING it locally: the parser's own
-        // answer for this is `/admin`. Refusing is not resolving — the call is
-        // rejected, not quietly redirected — and the broker would reject the
-        // decoded `..` anyway.
-        assert!(parse_target("https://api.example.com/a/%2e%2e/admin").is_err());
-        assert!(canonical_path("/a/%2e%2e/admin").is_none());
+        // answer for this is `/admin`. The raw scanner keeps it encoded, and
+        // the shared canonicalizer — the same code the proxy runs — is what
+        // rejects it, so the call is refused rather than quietly redirected.
+        let t = parse_target("https://api.example.com/a/%2e%2e/admin").unwrap();
+        assert_eq!(t.path, "/a/%2e%2e/admin");
+        assert!(canonical_path(&t.path).is_none());
         // A literal `/../` is equally preserved.
         let t = parse_target("https://api.example.com/a/../admin").unwrap();
         assert_eq!(t.path, "/a/../admin");
@@ -3074,12 +2921,13 @@ mod tests {
             let err = parse_target(raw).unwrap_err();
             assert!(err.contains("backslash"), "{raw}: {err}");
         }
-        // Encoded, and refused here too: the broker rejects an encoded
-        // backslash in a path exactly as it rejects a raw one, so there is no
-        // server answer worth deferring to.
-        let err = parse_target("https://api.example.com/a%5Cb").unwrap_err();
-        assert!(err.contains("encoded '\\'"), "{err}");
-        assert!(canonical_path("/a%5Cb").is_none());
+        // A RAW backslash is refused above because the two readers disagree
+        // about what the URL says. The encoded spelling is unambiguous, so it
+        // parses; the shared canonicalizer refuses it in the preflight, the
+        // same way the proxy would.
+        let t = parse_target("https://api.example.com/a%5Cb").unwrap();
+        assert_eq!(t.path, "/a%5Cb");
+        assert!(canonical_path(&t.path).is_none());
         // A port in the authority is not mistaken for the path.
         let t = parse_target("https://api.example.com:8443/v1").unwrap();
         assert_eq!(t.path, "/v1");

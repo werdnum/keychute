@@ -171,6 +171,12 @@ Path canonicalization: percent-decode once; reject if the decoded path contains
 `..` segments, or non-UTF8. Match prefixes at `/` boundaries only. The proxy
 forwards exactly the validated canonical path (re-encoded conservatively).
 
+This lives in `types/src/paths.rs`, not in the server, so clients share the
+one definition: a client that must decide *before* it wakes an operator —
+"does this grant cover this call?" — runs the same code the proxy will. A
+client-side reimplementation kept in step by comment is the failure mode this
+placement exists to prevent.
+
 ## HTTP API (all under `/v1`, JSON)
 
 Client authn: `Authorization: Bearer <api-token>` or
@@ -347,6 +353,12 @@ or Envoy-forwarded JWT in oidc mode):
 - All client-supplied context rendered via maud text nodes (auto-escaped) — never
   `PreEscaped` for anything client-derived. The approval page must render the
   server-parsed grant block separately from client context, labelled.
+- The grant block states that its path prefixes are the *canonical* (once-decoded)
+  forms the proxy matches and forwards, and a `target` string in the client's
+  structured context is promoted into its own labelled line marked as a claim.
+  A client may legitimately display `/users/%7Ealice` for a call the server
+  sends as `/users/~alice`; the page resolves that for the operator rather than
+  leaving each client to police its own spelling.
 
 ## DB schema (migrations)
 
