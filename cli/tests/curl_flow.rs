@@ -33,6 +33,16 @@ enum ProxyMode {
     UpstreamError(StatusCode),
 }
 
+/// The three states `begin_grant_use` refuses a grant in, plus the usable one.
+/// All are visible in the metadata the CLI already fetches, so all are
+/// decidable before a body is read.
+#[derive(Clone, Copy, PartialEq)]
+enum GrantShape {
+    Usable,
+    Expired,
+    Exhausted,
+}
+
 /// One proxied request, as the mock saw it.
 #[derive(Clone, Debug)]
 struct ProxyRecord {
@@ -57,6 +67,9 @@ struct MockState {
     mode: ProxyMode,
     /// Origin the mock's grant is approved for.
     grant_host: &'static str,
+    /// Usability of the grant `grant_info` serves, so the reuse preflight can
+    /// be tested against each way the server would refuse it.
+    grant: GrantShape,
     wait_calls: Arc<AtomicUsize>,
     create_bodies: Arc<Mutex<Vec<serde_json::Value>>>,
     proxied: Arc<Mutex<Vec<ProxyRecord>>>,
@@ -92,6 +105,11 @@ async fn wait_request(
 /// GET /v1/grants/{id} — the metadata the CLI checks a reused grant against.
 async fn grant_info(State(st): State<MockState>, Path(id): Path<Uuid>) -> Json<serde_json::Value> {
     assert_eq!(id.to_string(), GRANT_ID);
+    let (not_after, use_count) = match st.grant {
+        GrantShape::Usable => ("2099-01-01T00:00:00Z", 1),
+        GrantShape::Expired => ("2020-01-01T00:00:00Z", 1),
+        GrantShape::Exhausted => ("2099-01-01T00:00:00Z", 5),
+    };
     Json(serde_json::json!({
         "grant_id": GRANT_ID,
         "mechanism": "brokered",
@@ -102,9 +120,9 @@ async fn grant_info(State(st): State<MockState>, Path(id): Path<Uuid>) -> Json<s
             "ttl_seconds": 300,
             "max_uses": 5,
         },
-        "not_after": "2099-01-01T00:00:00Z",
+        "not_after": not_after,
         "max_uses": 5,
-        "use_count": 1,
+        "use_count": use_count,
         "revoked": false,
     }))
 }
@@ -167,9 +185,18 @@ async fn spawn_mock(mode: ProxyMode) -> (String, MockState) {
 }
 
 async fn spawn_mock_for(mode: ProxyMode, grant_host: &'static str) -> (String, MockState) {
+    spawn_mock_full(mode, grant_host, GrantShape::Usable).await
+}
+
+async fn spawn_mock_full(
+    mode: ProxyMode,
+    grant_host: &'static str,
+    grant: GrantShape,
+) -> (String, MockState) {
     let st = MockState {
         mode,
         grant_host,
+        grant,
         wait_calls: Arc::new(AtomicUsize::new(0)),
         create_bodies: Arc::new(Mutex::new(Vec::new())),
         proxied: Arc::new(Mutex::new(Vec::new())),
@@ -628,4 +655,82 @@ async fn removing_the_user_agent_sends_no_user_agent() {
     );
     // Absent, not empty.
     assert_eq!(recs[1].header("user-agent"), None);
+}
+
+/// Run the CLI with stdin an OPEN PIPE that nobody ever writes to or closes,
+/// and give it a deadline.
+///
+/// This is the whole point of the preflight ordering: with `-d @-`, a check
+/// that runs after the body is read leaves the process blocked on a producer
+/// that may never produce, for a call already certain to be refused. A test
+/// that closed stdin, or handed it `/dev/null`, would pass either way — the
+/// read would just return empty. Holding the write end open is what makes the
+/// wrong order a timeout instead of a pass.
+fn run_cli_with_open_stdin(base: &str, args: &[&str]) -> Option<(i32, String)> {
+    use std::process::Stdio;
+    let mut child = Command::new(cli_bin())
+        .args(args)
+        .env("KEYCHUTE_URL", base)
+        .env("KEYCHUTE_TOKEN", "client-token")
+        .env_remove("KEYCHUTE_TOKEN_FILE")
+        .env_remove("KEYCHUTE_CONTEXT")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("running keychute CLI");
+    // Held, deliberately: dropping it would close the pipe and let a read
+    // succeed, which is exactly the failure this is trying to catch.
+    let _stdin = child.stdin.take().expect("piped stdin");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait().expect("waiting on CLI") {
+            let out = child.wait_with_output().expect("collecting CLI output");
+            return Some((
+                status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+            ));
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unusable_grant_is_refused_before_stdin_is_read() {
+    // Expired and exhausted are as decidable from the metadata as revoked is,
+    // and `begin_grant_use` would refuse both. Neither depends on the body.
+    for (shape, want_code, want) in [
+        (GrantShape::Expired, 4, "expired"),
+        (GrantShape::Exhausted, 1, "exhausted"),
+    ] {
+        let (base, st) = spawn_mock_full(ProxyMode::Upstream, "api.example.com", shape).await;
+        let (code, stderr) = tokio::task::spawn_blocking(move || {
+            run_cli_with_open_stdin(
+                &base,
+                &[
+                    "curl",
+                    "https://api.example.com/v1/things",
+                    "--grant-id",
+                    GRANT_ID,
+                    "-X",
+                    "POST",
+                    "-d",
+                    "@-",
+                ],
+            )
+        })
+        .await
+        .unwrap()
+        .expect("the CLI must not block on stdin for a grant it has already refused");
+        assert_eq!(code, want_code, "{stderr}");
+        assert!(stderr.contains(want), "{stderr}");
+        // And nothing was proxied: the refusal was local.
+        assert!(st.proxied.lock().unwrap().is_empty());
+    }
 }

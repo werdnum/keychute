@@ -653,7 +653,7 @@ fn read_body_with(
                 .map_err(|e| fail(EXIT_CONFIG, format!("cannot read the body from stdin: {e}")))?,
         }
         if strip_newlines {
-            buf.retain(|b| *b != b'\r' && *b != b'\n');
+            buf = strip_like_curl(&buf);
         }
         out.extend_from_slice(&buf);
     }
@@ -676,6 +676,36 @@ fn read_body_with(
         ));
     }
     Ok(Some(out))
+}
+
+/// Apply curl's `-d @file` stripping, which is not the "drop every CR and LF"
+/// it is usually described as.
+///
+/// curl reads the file a line at a time and appends each line as a C STRING,
+/// truncating it at the first `\r` it finds — so the bytes dropped are
+/// everything from that point to the end of the line, not the one byte. A NUL
+/// truncates for the same reason: the append never sees past it. Verified
+/// against curl 8.5.0 through a recording server:
+///
+/// ```text
+/// a\0b\r\nc  -> ac        a\rb\nc  -> ac       \0abc -> (empty)
+/// a\nb\nc    -> abc       a\r\nb\r\nc -> abc   ab\0  -> ab
+/// ```
+///
+/// Dropping the bytes individually instead would send `abc` where curl sends
+/// `ac` — a different form body, and for a signed payload a different meaning.
+/// `--data-binary` is curl's answer for input that must survive byte-exact,
+/// and it is this function's absence rather than a variant of it.
+fn strip_like_curl(buf: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(buf.len());
+    for line in buf.split(|b| *b == b'\n') {
+        let end = line
+            .iter()
+            .position(|b| *b == b'\r' || *b == b'\0')
+            .unwrap_or(line.len());
+        out.extend_from_slice(&line[..end]);
+    }
+    out
 }
 
 /// Read at most `limit` bytes, then stop: an unbounded read of a stuck producer
@@ -823,6 +853,18 @@ fn credential_selector(args: &CurlArgs) -> CliResult<Selector> {
 /// trusting this to have happened.
 fn validate_grant_options(args: &CurlArgs, target: &Target, method: &str) -> CliResult<()> {
     if let Some(key) = &args.idempotency_key {
+        // `--idempotency-key ''` is an unset variable that expanded, not a
+        // choice. It cannot reach the shared validator that would refuse it,
+        // because `acquire_grant` appends the call hash first — so the key is
+        // never empty by the time anything checks, and every identical call
+        // derives the SAME key from the target alone. That silently resumes an
+        // earlier approved request instead of pushing a new one.
+        if key.is_empty() {
+            return Err(fail(
+                EXIT_CONFIG,
+                "--idempotency-key is empty; omit it for a random key, or pass a real one",
+            ));
+        }
         if key.len() > MAX_CURL_USER_KEY_BYTES {
             return Err(fail(
                 EXIT_CONFIG,
@@ -1249,11 +1291,40 @@ async fn check_grant_covers(
             ),
         ));
     }
+    // Revoked, expired, exhausted: three ways for `begin_grant_use` to refuse
+    // this grant on facts already in hand. Checking only the first left the
+    // other two to be discovered after `-d @-` had consumed stdin, for a call
+    // whose outcome was never in doubt.
+    //
+    // The server remains the authority — its clock and its use count are the
+    // ones that decide, and a grant that passes here can still be refused
+    // there. This only declines to read a body for a grant that cannot
+    // possibly work.
     if info.revoked {
         return Err(fail(
             crate::EXIT_TIMEOUT,
             format!("grant {grant_id} has been revoked; request a new one"),
         ));
+    }
+    if info.not_after <= chrono::Utc::now() {
+        return Err(fail(
+            crate::EXIT_TIMEOUT,
+            format!(
+                "grant {grant_id} expired at {}; request a new one",
+                info.not_after.to_rfc3339()
+            ),
+        ));
+    }
+    if let Some(max) = info.max_uses {
+        if info.use_count >= max {
+            return Err(fail(
+                EXIT_OTHER,
+                format!(
+                    "grant {grant_id} is exhausted ({}/{max} uses); request a new one",
+                    info.use_count
+                ),
+            ));
+        }
     }
     match info.constraints.origins.as_slice() {
         [approved] if approved.same_target(&target.origin) => {}
@@ -1950,6 +2021,52 @@ mod tests {
         );
         std::fs::remove_file(&dir).unwrap();
         assert!(read_body(&body_args(Some("@/nonexistent/keychute-test"), None, None)).is_err());
+    }
+
+    #[test]
+    fn file_bodies_are_stripped_the_way_curl_strips_them() {
+        // Every case verified against curl 8.5.0 through a recording server:
+        // curl truncates each line at its first CR or NUL rather than dropping
+        // those bytes individually, so `a\0b\r\nc` is `ac`, not `abc`.
+        for (input, want) in [
+            (&b"a\x00b\r\nc"[..], &b"ac"[..]),
+            (b"a\rb\nc", b"ac"),
+            (b"a\nb\nc", b"abc"),
+            (b"a\r\nb\r\nc", b"abc"),
+            (b"a\x00b", b"a"),
+            (b"\x00abc", b""),
+            (b"ab\x00", b"ab"),
+            (b"a\n\x00b\nc", b"ac"),
+            // The ordinary case, unchanged: a text file's line endings go.
+            (b"one\ntwo\n", b"onetwo"),
+        ] {
+            assert_eq!(
+                strip_like_curl(input),
+                want,
+                "stripping {input:?} should give {want:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_idempotency_key_is_refused() {
+        let target = parse_target("https://api.example.com/v1/things").unwrap();
+        let mut args = body_args(None, None, None);
+        args.url = "https://api.example.com/v1/things".into();
+        args.secret = Some("s".into());
+
+        // An unset variable that expanded, not a choice — and one that would
+        // otherwise derive the same key on every call and resume an earlier
+        // approval instead of pushing a new one.
+        args.idempotency_key = Some(String::new());
+        let err = validate_grant_options(&args, &target, "GET").unwrap_err();
+        assert_eq!(err.code, EXIT_CONFIG);
+        assert!(err.message.contains("empty"), "{}", err.message);
+
+        args.idempotency_key = Some("deliberate-key".into());
+        assert!(validate_grant_options(&args, &target, "GET").is_ok());
+        args.idempotency_key = None;
+        assert!(validate_grant_options(&args, &target, "GET").is_ok());
     }
 
     #[test]
