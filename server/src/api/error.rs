@@ -163,6 +163,20 @@ impl ApiFailure {
     }
 }
 
+/// Marks a response as KEYCHUTE's own, not a proxied upstream's.
+///
+/// On the brokered proxy path the two are otherwise indistinguishable: a
+/// Keychute `403 policy-denied` and an upstream's own `403` arrive with the
+/// same status and both may carry an `{"error": {...}}` body. A client that
+/// cannot tell them apart either treats an upstream refusal as a policy denial
+/// (and stops asking a human who never said no) or the reverse. Only the
+/// server-vocabulary error code goes in the header — the same string already
+/// in the body — never client context or credential material.
+///
+/// `proxy.rs` strips this header from every upstream response, so an upstream
+/// cannot forge one.
+pub const KEYCHUTE_ERROR_HEADER: &str = "x-keychute-error";
+
 impl IntoResponse for ApiFailure {
     fn into_response(self) -> Response {
         if let ApiFailure::Internal(err) = &self {
@@ -170,7 +184,13 @@ impl IntoResponse for ApiFailure {
             tracing::error!(error = %err, "internal API error");
         }
         let (status, code, message) = self.status_code_message();
-        (status, Json(ApiError::new(code, message))).into_response()
+        let mut resp = (status, Json(ApiError::new(code, message))).into_response();
+        // `code` is a fixed server-vocabulary token, so this can never fail to
+        // encode; skip the header rather than panic if that ever changes.
+        if let Ok(value) = axum::http::HeaderValue::from_str(code) {
+            resp.headers_mut().insert(KEYCHUTE_ERROR_HEADER, value);
+        }
+        resp
     }
 }
 

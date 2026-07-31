@@ -1,5 +1,12 @@
-//! keychute CLI: request secrets from a Keychute server (CUJ 2, tier-2 cli-read),
-//! and deposit new ones (`keychute store`, reading the value from stdin).
+//! keychute CLI: make authenticated HTTP calls without ever holding the
+//! credential (`keychute curl`, CUJ 1, tier-0 brokered), request secrets from
+//! a Keychute server (CUJ 2, tier-2 cli-read), and deposit new ones
+//! (`keychute store`, reading the value from stdin).
+//!
+//! `curl` is the one to reach for first: it needs no staging file and no
+//! discipline about what stdout touches, because the secret stays server-side
+//! and only the upstream's response comes back. `request` is for when a
+//! consumer genuinely needs the bytes.
 //!
 //! The secret goes to STDOUT and nowhere else; all diagnostics go to stderr.
 //! Nothing ever puts a secret value in argv — `store` reads stdin or a file.
@@ -8,6 +15,7 @@
 //! (including an expired grant), 5 payload lost, 1 anything else (including a
 //! grant whose uses are already exhausted).
 
+mod curl;
 mod pipeline;
 
 use std::io::{IsTerminal, Read, Write};
@@ -24,11 +32,11 @@ use serde::Deserialize;
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
-const EXIT_OTHER: i32 = 1;
-const EXIT_CONFIG: i32 = 2;
-const EXIT_DENIED: i32 = 3;
-const EXIT_TIMEOUT: i32 = 4;
-const EXIT_PAYLOAD_LOST: i32 = 5;
+pub(crate) const EXIT_OTHER: i32 = 1;
+pub(crate) const EXIT_CONFIG: i32 = 2;
+pub(crate) const EXIT_DENIED: i32 = 3;
+pub(crate) const EXIT_TIMEOUT: i32 = 4;
+pub(crate) const EXIT_PAYLOAD_LOST: i32 = 5;
 
 /// How long a single long-poll on the wait endpoint asks the server to hold.
 const WAIT_POLL_SECONDS: u64 = 60;
@@ -60,6 +68,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Make an authenticated HTTP request through Keychute's broker. The
+    /// credential is attached server-side and never enters this container.
+    Curl(curl::CurlArgs),
     /// Request a secret; once approved, print it to stdout.
     Request(RequestArgs),
     /// Store a NEW secret, read from stdin (never printed, never in argv).
@@ -127,25 +138,26 @@ struct StoreArgs {
 }
 
 /// A terminal failure: message for stderr plus the process exit code.
-struct Failure {
-    code: i32,
-    message: String,
+#[derive(Debug)]
+pub(crate) struct Failure {
+    pub(crate) code: i32,
+    pub(crate) message: String,
 }
 
-fn fail(code: i32, message: impl Into<String>) -> Failure {
+pub(crate) fn fail(code: i32, message: impl Into<String>) -> Failure {
     Failure {
         code,
         message: message.into(),
     }
 }
 
-type CliResult<T> = Result<T, Failure>;
+pub(crate) type CliResult<T> = Result<T, Failure>;
 
-struct Config {
+pub(crate) struct Config {
     /// Base URL of the Keychute API (KEYCHUTE_URL).
-    url: String,
+    pub(crate) url: String,
     /// External/UI base URL used only for the approval hint printed to stderr.
-    external_url: String,
+    pub(crate) external_url: String,
     token: Option<String>,
     token_file: Option<PathBuf>,
     ca_bundle: Option<PathBuf>,
@@ -199,7 +211,7 @@ impl Config {
 
     /// Bearer token for one request. The token file is re-read on every call
     /// because projected service-account tokens rotate.
-    fn bearer(&self) -> CliResult<String> {
+    pub(crate) fn bearer(&self) -> CliResult<String> {
         if let Some(t) = &self.token {
             return Ok(t.clone());
         }
@@ -256,13 +268,13 @@ fn build_http_client(cfg: &Config) -> CliResult<reqwest::Client> {
 /// Lenient view of the server's access-request status responses: the create
 /// response may omit fields (`expires_at`) that the full status object carries.
 #[derive(Debug, Deserialize)]
-struct StatusResponse {
-    request_id: Uuid,
-    state: RequestState,
+pub(crate) struct StatusResponse {
+    pub(crate) request_id: Uuid,
+    pub(crate) state: RequestState,
     #[serde(default)]
-    grant_id: Option<Uuid>,
+    pub(crate) grant_id: Option<Uuid>,
     #[serde(default)]
-    deny_reason: Option<String>,
+    pub(crate) deny_reason: Option<String>,
 }
 
 /// Derive the grant-read idempotency key from the request's idempotency key.
@@ -276,7 +288,7 @@ fn read_idempotency_key(request_key: &str) -> String {
 /// safely under both. Checked up front so the failure is a clear usage error.
 const MAX_REQUEST_IDEM_KEY_BYTES: usize = 124;
 
-fn validate_idempotency_key(key: &str) -> Result<(), String> {
+pub(crate) fn validate_idempotency_key(key: &str) -> Result<(), String> {
     if key.is_empty() {
         return Err("idempotency key must not be empty".into());
     }
@@ -330,7 +342,7 @@ fn validate_api_url(url: &str, allow_insecure: bool) -> Result<(), String> {
 
 /// Assemble agent-asserted structured context: best-effort pipeline capture
 /// plus $KEYCHUTE_CONTEXT verbatim under `extra`.
-fn build_structured_context() -> Option<serde_json::Value> {
+pub(crate) fn build_structured_context() -> Option<serde_json::Value> {
     let mut map = serde_json::Map::new();
     if let Some(captured) = pipeline::capture() {
         // Agent-asserted: ancestor chain plus same-shell pipeline peers.
@@ -356,7 +368,7 @@ fn build_structured_context() -> Option<serde_json::Value> {
 }
 
 /// Extract a human-readable message from an error response body.
-fn api_error_message(status: reqwest::StatusCode, body: &str) -> String {
+pub(crate) fn api_error_message(status: reqwest::StatusCode, body: &str) -> String {
     match serde_json::from_str::<ApiError>(body) {
         Ok(err) => format!("{} ({})", err.error.message, err.error.code),
         Err(_) => format!("server returned {status}"),
@@ -377,7 +389,7 @@ fn api_error_message(status: reqwest::StatusCode, body: &str) -> String {
 ///   callers surface it instead of treating it as "just ask again". Exit 1.
 ///
 /// An unknown or unparseable 410 body also gets the generic code.
-fn classify_gone(body: &str) -> Failure {
+pub(crate) fn classify_gone(body: &str) -> Failure {
     let code = serde_json::from_str::<ApiError>(body)
         .ok()
         .map(|e| e.error.code);
@@ -423,7 +435,9 @@ async fn run_request(cfg: &Config, http: &reqwest::Client, args: RequestArgs) ->
         return Err(fail(
             EXIT_CONFIG,
             format!(
-                "mechanism {} is not readable via the CLI (no plaintext release)",
+                "mechanism {} releases no plaintext, so `request` has nothing to print. \
+                 Brokered access is made through `keychute curl`, which sends the request \
+                 for you with the credential attached server-side",
                 mechanism.as_str()
             ),
         ));
@@ -502,7 +516,7 @@ async fn run_request(cfg: &Config, http: &reqwest::Client, args: RequestArgs) ->
 ///
 /// Retry discipline mirrors `read_grant`: transport errors, unreadable bodies
 /// and 5xx retry; a fully parsed 4xx is definitive.
-async fn create_access_request(
+pub(crate) async fn create_access_request(
     cfg: &Config,
     http: &reqwest::Client,
     body: &CreateAccessRequest,
@@ -573,7 +587,7 @@ async fn create_access_request(
 }
 
 /// Long-poll the wait endpoint until the request resolves or `deadline` passes.
-async fn wait_for_resolution(
+pub(crate) async fn wait_for_resolution(
     cfg: &Config,
     http: &reqwest::Client,
     request_id: Uuid,
@@ -1060,6 +1074,7 @@ async fn run(cli: Cli) -> CliResult<()> {
     let cfg = Config::from_env()?;
     let http = build_http_client(&cfg)?;
     match cli.cmd {
+        Cmd::Curl(args) => curl::run_curl(&cfg, &http, args).await,
         Cmd::Request(args) => run_request(&cfg, &http, args).await,
         Cmd::Store(args) => run_store(&cfg, &http, args).await,
         Cmd::Status { request_id } => run_status(&cfg, &http, &request_id).await,

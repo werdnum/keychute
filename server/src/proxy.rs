@@ -6,7 +6,7 @@
 //! [`outbound_url`]), and redirects are never followed (3xx passes through to
 //! the caller).
 
-use crate::api::error::ApiFailure;
+use crate::api::error::{ApiFailure, KEYCHUTE_ERROR_HEADER};
 use crate::api::{owned_grant, revalidate_grant};
 use crate::audit::{insert_audit, kinds, AuditEvent};
 use crate::authn::client::authenticate_client;
@@ -53,8 +53,13 @@ const STRIP_LIST: &[&str] = &[
 /// Hop-by-hop headers stripped from the upstream response — the full RFC set,
 /// including the two `Proxy-*` ones the request side also strips. An upstream
 /// 407 challenges *its* own proxy hop, not our caller, so `Proxy-Authenticate`
-/// must not be forwarded either.
+/// must not be forwarded either. Also stripped:
+/// [`KEYCHUTE_ERROR_HEADER`] — a client uses that header to tell a Keychute
+/// refusal from an upstream one, so an upstream must not be able to set it
+/// and impersonate a policy denial (or, worse, a `payload-lost` that invites
+/// the client to burn another approval).
 const RESPONSE_STRIP: &[&str] = &[
+    KEYCHUTE_ERROR_HEADER,
     "connection",
     "keep-alive",
     "proxy-authenticate",

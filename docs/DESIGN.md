@@ -84,6 +84,29 @@ and is agent-influenceable. The approval UI therefore renders tier-2 context as
    through the proxy and it passes constraint validation itself. Every proxied call
    is audit-logged. The grant expires by TTL and/or request count.
 
+### CUJ 1b — k8s-agent makes an authenticated call (tier 0)
+
+The same brokered path, driven from a container rather than from FA's backend,
+and the reason the k8s-agent is registered for `brokered` as well as `cli-read`:
+
+1. The agent runs `keychute curl --secret example-api-token
+   https://api.example.com/v1/things` — the mnemonic is *replace `curl` with
+   `keychute curl`*. Anywhere it would otherwise have had to obtain a token and
+   put it in an `Authorization` header, the token stays server-side.
+2. The CLI derives the grant from the URL: its origin, its method, and its path
+   as the path prefix. One approval therefore covers one call, not the host —
+   widening it (`--path-prefix`, `--allow-method`, `--max-uses`) is an explicit
+   argument the operator sees on the approval page.
+3. On approval the CLI exercises the grant against the proxy and streams the
+   upstream's response to stdout. Nothing secret passes through the container,
+   so none of the tier-2 handling discipline applies: the output is ordinary
+   data an agent may read, log and reason about.
+
+Tier 2 remains for the case a consumer genuinely needs the bytes (sealing a
+credential into a SealedSecret, writing a config file). When the task is "call
+this API", tier 0 does it with strictly less exposure, and the CLI offers both
+so the agent can choose the weaker one by default.
+
 ### CUJ 2 — k8s-agent needs a secret for a SealedSecret (tier 2)
 
 1. Inside its container, the agent runs

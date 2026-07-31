@@ -25,7 +25,8 @@ Milestones M0–M3 server-side, minus cluster wiring:
 - Human authn: pluggable — `static` mode (bearer token hash + subject, for
   dev/e2e) or `oidc` mode (JWT validation: issuer, audience, signature via JWKS,
   exp/nbf with skew, group/subject allowlist).
-- `keychute` CLI (request → wait → read → stdout; `store` for deposits).
+- `keychute` CLI (`curl` → wait → proxy → stdout for brokered HTTP;
+  `request` → wait → read → stdout for releasing tiers; `store` for deposits).
 - TLS: rustls listener when cert/key paths configured; plain HTTP otherwise
   (dev/e2e). Production charts always configure TLS.
 - Abuse guards: per-client pending-request cap, per-client concurrent wait cap,
@@ -236,6 +237,14 @@ Client authn: `Authorization: Bearer <api-token>` or
   request must name exactly one origin). Method+path validated against grant.
   Body streamed up to limit. Response streamed back verbatim, redirects NOT
   followed. Strip-list + header synthesis per DESIGN §4.
+- Every error response Keychute generates itself carries
+  `X-Keychute-Error: <code>` — the same server-vocabulary code as the body.
+  On the proxy path a caller otherwise cannot tell a Keychute `403
+  policy-denied` from an upstream's own `403`: same status, and an upstream may
+  well answer with the same `{"error": …}` shape. The CLI keys its exit codes
+  off this header (a Keychute refusal is exit 3; an upstream 4xx is a
+  successful call that returned an error document). The proxy strips the header
+  from every upstream response, so an upstream cannot forge one.
 - Grant access (read/proxy/wait) always revalidates: client enabled, mechanisms,
   max tiers, not revoked/expired, policy row still live (grant carries
   `not_after` already capped at approval time; revalidation re-checks client and
