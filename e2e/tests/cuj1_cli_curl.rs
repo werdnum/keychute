@@ -315,6 +315,9 @@ async fn framework_rejections_are_marked_too() {
         // so this matches neither a real route nor the catch-all wildcard and
         // fell through to the default unmarked 404.
         (reqwest::Method::GET, "/v1".to_string(), 404, "not-found"),
+        // And its trailing-slash spelling, which the exact `/v1` route does
+        // not match either — axum does no trailing-slash redirect.
+        (reqwest::Method::GET, "/v1/".to_string(), 404, "not-found"),
         // The route exists; the method does not.
         (
             reqwest::Method::DELETE,

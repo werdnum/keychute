@@ -1436,6 +1436,14 @@ pub(crate) async fn run_curl(
     // at the proxy would do. So the nomination is resolved here, before its
     // evidence is discarded.
     let nominated = connection_nominated(&parsed);
+    // Nominating `User-Agent` is a removal by another spelling, and it lands
+    // on the one header this CLI regenerates when it is merely absent. Dropped
+    // from the list alone, the default would be filled back in below and the
+    // upstream would see the very header the nomination asked to withhold —
+    // so the nomination has to become the same instruction `User-Agent:` is.
+    if nominated.iter().any(|n| n == "user-agent") {
+        suppress_user_agent = true;
+    }
     let mut headers = Vec::new();
     for (name, value) in parsed {
         if is_stripped_header(&name) {

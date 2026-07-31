@@ -1034,6 +1034,42 @@ async fn removing_the_user_agent_sends_no_user_agent() {
     assert_eq!(recs[1].header("user-agent"), None);
 }
 
+/// `Connection: User-Agent` is the other way to say "do not forward my
+/// User-Agent" — and the only one where dropping the header is not enough,
+/// since a request without one gets the CLI's default filled back in. The
+/// nomination has to reach the same suppression the explicit removal does,
+/// or the upstream reads a `keychute-cli/…` the caller asked to withhold.
+#[tokio::test]
+async fn a_user_agent_nominated_by_connection_is_not_regenerated() {
+    let (base, st) = spawn_mock(ProxyMode::Upstream).await;
+
+    let (code, _, stderr) = tokio::task::spawn_blocking(move || {
+        run_cli(
+            &base,
+            &[
+                "curl",
+                "https://api.example.com/v1/things",
+                "--grant-id",
+                GRANT_ID,
+                "-H",
+                "User-Agent: custom/1.0",
+                "-H",
+                "Connection: User-Agent",
+            ],
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(code, 0, "{stderr}");
+
+    let recs = st.proxied.lock().unwrap().clone();
+    assert_eq!(recs.len(), 1);
+    // Neither the caller's nominated header nor the default that would have
+    // taken its place.
+    assert_eq!(recs[0].header("user-agent"), None);
+    assert_eq!(recs[0].header("connection"), None);
+}
+
 /// `--idempotency-key` means "this is the same call, resumed". The server's
 /// MAC covers `CreateAccessRequest`, which carries neither the body nor the
 /// forwarded headers — so if the derived key doesn't cover them either, a
