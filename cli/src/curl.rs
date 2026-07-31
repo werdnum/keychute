@@ -74,6 +74,14 @@ const DEFAULT_MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 /// nothing and saves an invocation that would be rejected on arrival.
 const MAX_TTL_SECONDS: u64 = 30 * 24 * 3600;
 
+/// The server's remaining fixed bounds (`requests.rs`), mirrored for the same
+/// reason as [`MAX_TTL_SECONDS`]: none are deployment-configurable, so a value
+/// past them is certain to be refused and there is nothing to gain by making
+/// the round trip — or by reading stdin first.
+const MAX_SERVER_USES: u32 = i32::MAX as u32;
+const MAX_SECRET_NAME_BYTES: usize = 256;
+const MAX_REASON_BYTES: usize = 4 * 1024;
+
 /// Overrides [`DEFAULT_MAX_BODY_BYTES`], for a deployment whose
 /// `limits.proxy_max_body_bytes` is not the default.
 const MAX_BODY_ENV: &str = "KEYCHUTE_MAX_BODY_BYTES";
@@ -274,6 +282,20 @@ pub(crate) fn parse_target(raw: &str) -> Result<Target, String> {
         return Err(format!(
             "refusing URL with embedded credentials {raw:?}: the host a human would read \
              is not the host it targets, and Keychute supplies the credential anyway"
+        ));
+    }
+    // Tab, CR and LF are DELETED by the WHATWG parser rather than rejected, so
+    // they are the backslash problem in a quieter form: `raw_path_and_query`
+    // keeps them, the approval page and the call-binding hash cover the
+    // spelling with them in, and then `proxy_call` re-parses the assembled URL
+    // and sends it without them. A query displayed as `amount=1\n000` would
+    // arrive upstream as `amount=1000` — a different call than the one that
+    // was approved, with no diagnostic anywhere.
+    if let Some(bad) = raw.chars().find(|c| matches!(c, '\t' | '\r' | '\n')) {
+        return Err(format!(
+            "refusing URL containing {bad:?} {raw:?}: URL parsers silently DELETE tab, \
+             CR and LF, so the target an operator would approve is not the target that \
+             would be sent. Percent-encode it (%09, %0D, %0A) if it is really meant."
         ));
     }
     if raw.contains('\\') {
@@ -648,12 +670,22 @@ pub(crate) fn call_bound_idempotency_key(user_key: &str, method: &str, target: &
         }
     }
     let digest = hex::encode(hasher.finalize());
-    format!("{user_key}-{}", &digest[..16])
+    format!("{user_key}-{}", &digest[..CALL_BINDING_HEX_CHARS])
 }
 
-/// The caller-key budget: the derived key appends `-` plus 16 hex characters,
-/// and the whole thing still has to fit the shared cap.
-pub(crate) const MAX_CURL_USER_KEY_BYTES: usize = 124 - 17;
+/// Hex characters of SHA-256 kept in the derived key — 128 bits.
+///
+/// This is a collision bound, not a preimage one, and the party searching for
+/// the collision is the same party choosing both queries: find two that hash
+/// alike, get the benign one approved, then run the other under that approval.
+/// At 64 bits that search is about 2^32 attempts — cheap enough for the exact
+/// substitution this binding exists to prevent. 128 bits puts it at 2^64,
+/// which is not.
+const CALL_BINDING_HEX_CHARS: usize = 32;
+
+/// The caller-key budget: the derived key appends `-` plus the hex above, and
+/// the whole thing still has to fit the shared cap.
+pub(crate) const MAX_CURL_USER_KEY_BYTES: usize = 124 - (CALL_BINDING_HEX_CHARS + 1);
 
 /// Which credential this call authenticates with: a grant already approved,
 /// or a secret to request one for.
@@ -726,12 +758,65 @@ fn validate_grant_options(args: &CurlArgs, target: &Target) -> CliResult<()> {
             ),
         ));
     }
-    // The server's own bound (`requests.rs`), applied unconditionally there.
+    // The server's own bounds (`requests.rs`), applied unconditionally there.
+    // Mirrored rather than deferred for the same reason as everything else in
+    // this function: each of these is decidable from the arguments, so a
+    // `-d @-` invocation that is already certain to be rejected should not
+    // first block on a producer that may never close.
     if args.ttl < 1 || args.ttl > MAX_TTL_SECONDS {
         return Err(fail(
             EXIT_CONFIG,
             format!("--ttl must be between 1 second and 30 days ({MAX_TTL_SECONDS} seconds)"),
         ));
+    }
+    if args.max_uses > MAX_SERVER_USES {
+        return Err(fail(
+            EXIT_CONFIG,
+            format!("--max-uses must be at most {MAX_SERVER_USES} (0 means no cap)"),
+        ));
+    }
+    if let Some(name) = &args.secret {
+        if name.is_empty() || name.len() > MAX_SECRET_NAME_BYTES {
+            return Err(fail(
+                EXIT_CONFIG,
+                format!("--secret must be 1 to {MAX_SECRET_NAME_BYTES} bytes"),
+            ));
+        }
+    }
+    if args.reason.len() > MAX_REASON_BYTES {
+        return Err(fail(
+            EXIT_CONFIG,
+            format!(
+                "--reason too long ({} bytes; max {MAX_REASON_BYTES})",
+                args.reason.len()
+            ),
+        ));
+    }
+    // A destination that cannot be opened is a local failure the operator
+    // should never be woken for: the approval would be spent and the grant
+    // stranded — with the default `--max-uses 1` there is not even a grant id
+    // printed to retry with. Checked, not created: truncating an existing file
+    // now would destroy it during an approval wait that may end in a denial.
+    // `proxy_call` still opens it before sending, which is what guarantees no
+    // request goes out that cannot be written down.
+    if let Some(path) = &args.output {
+        if path.as_os_str() != "-" {
+            let dir = match path.parent() {
+                Some(p) if p.as_os_str().is_empty() => std::path::Path::new("."),
+                Some(p) => p,
+                None => std::path::Path::new("/"),
+            };
+            if !dir.is_dir() {
+                return Err(fail(
+                    EXIT_CONFIG,
+                    format!(
+                        "cannot write --output {}: {} is not a directory",
+                        path.display(),
+                        dir.display()
+                    ),
+                ));
+            }
+        }
     }
     for m in &args.allow_methods {
         normalize_method(m).map_err(|e| fail(EXIT_CONFIG, e))?;
@@ -1419,6 +1504,19 @@ mod tests {
         assert!(parse_target("not a url").is_err());
         // Hosts Origin::parse refuses, for its own reasons.
         assert!(parse_target("https://*.example.com/v1").is_err());
+        // Tab, CR and LF are DELETED by the URL parser, not rejected — so the
+        // target displayed to the operator would not be the target sent.
+        assert!(parse_target("https://api.example.com/v1?amount=1\n000").is_err());
+        assert!(parse_target("https://api.example.com/v1\t/x").is_err());
+        assert!(parse_target("https://api.example.com/v1?a=1\r").is_err());
+        // Percent-encoded, they are ordinary bytes and survive verbatim.
+        assert_eq!(
+            parse_target("https://api.example.com/v1?amount=1%0A000")
+                .unwrap()
+                .query
+                .as_deref(),
+            Some("amount=1%0A000")
+        );
         // And ports it refuses: a URL parser accepts `:0`, `Origin` does not,
         // so the authority goes through that one validator rather than being
         // patched in around it.
@@ -1797,6 +1895,14 @@ mod tests {
             &base
         ))
         .is_ok());
+        // …and keeps 128 bits of the digest. This is a COLLISION bound, and
+        // the party searching is the one choosing both queries: find two that
+        // hash alike, get the benign one approved, run the other under it. At
+        // 64 bits that is a ~2^32 search, which is the substitution this
+        // binding exists to prevent.
+        let suffix = key.rsplit('-').next().unwrap();
+        assert_eq!(suffix.len(), 32, "128 bits of digest, hex-encoded");
+        assert!(suffix.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
@@ -1919,6 +2025,45 @@ mod tests {
         let err = validate_grant_options(&args, &doomed).unwrap_err();
         assert_eq!(err.code, EXIT_CONFIG);
         assert!(err.message.contains("refuses"), "{}", err.message);
+        args.path_prefixes = vec!["/admin".into()];
+
+        // The server's remaining fixed bounds, each certain to be refused on
+        // arrival and each decidable here.
+        args.max_uses = MAX_SERVER_USES + 1;
+        assert!(validate_grant_options(&args, &t).is_err());
+        args.max_uses = MAX_SERVER_USES;
+        assert!(validate_grant_options(&args, &t).is_ok());
+        args.max_uses = 1;
+
+        args.secret = Some(String::new());
+        assert!(validate_grant_options(&args, &t).is_err(), "empty name");
+        args.secret = Some("s".repeat(MAX_SECRET_NAME_BYTES + 1));
+        assert!(validate_grant_options(&args, &t).is_err(), "name too long");
+        args.secret = Some("s".into());
+
+        args.reason = "r".repeat(MAX_REASON_BYTES + 1);
+        assert!(validate_grant_options(&args, &t).is_err());
+        args.reason = String::new();
+
+        // A destination that cannot be written is a local failure, so it must
+        // not cost an approval. Checked here, without truncating anything: the
+        // real open still happens before the request is sent.
+        let dir = std::env::temp_dir().join(format!("keychute-out-{}", Uuid::new_v4()));
+        args.output = Some(dir.join("nope").join("out.json"));
+        let err = validate_grant_options(&args, &t).unwrap_err();
+        assert_eq!(err.code, EXIT_CONFIG);
+        assert!(err.message.contains("not a directory"), "{}", err.message);
+        // A writable destination passes, and stdout needs no directory at all.
+        std::fs::create_dir_all(&dir).unwrap();
+        args.output = Some(dir.join("out.json"));
+        assert!(validate_grant_options(&args, &t).is_ok());
+        assert!(!dir.join("out.json").exists(), "nothing is created yet");
+        args.output = Some("-".into());
+        assert!(validate_grant_options(&args, &t).is_ok());
+        // A bare filename means the working directory, not a missing parent.
+        args.output = Some("out.json".into());
+        assert!(validate_grant_options(&args, &t).is_ok());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
