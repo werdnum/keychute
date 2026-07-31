@@ -781,6 +781,38 @@ impl TestEnv {
         .expect("audit query")
     }
 
+    /// Audit kinds for a request, waited for until every `wanted` kind is
+    /// present.
+    ///
+    /// The completion rows — `release-completed`, `proxy-completed` — are
+    /// written by a DETACHED task on purpose (`api/grants.rs`): holding the
+    /// response for them could keep a secret alive past its replay window.
+    /// So a client that has its answer is no evidence the row has landed, and
+    /// reading once races the insert — rarely on an idle machine, readily on a
+    /// loaded CI runner. Polling asserts what the server actually promises:
+    /// the row arrives, not that it arrives before the response does.
+    ///
+    /// Only for kinds that are expected to appear. An assertion that a kind is
+    /// ABSENT cannot be made this way — waiting proves nothing about a row
+    /// that was never going to be written — so those keep reading once.
+    pub async fn wait_for_audit_kinds(
+        &self,
+        request_id: uuid::Uuid,
+        wanted: &[&str],
+    ) -> Vec<String> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let kinds = self.audit_kinds_for_request(request_id).await;
+            if wanted.iter().all(|w| kinds.iter().any(|k| k == w)) {
+                return kinds;
+            }
+            if std::time::Instant::now() >= deadline {
+                return kinds;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     /// Send a raw HTTP/1.1 request (for request-targets reqwest would
     /// normalize away, e.g. literal `..` segments). Returns the raw response
     /// head + whatever body arrived promptly.

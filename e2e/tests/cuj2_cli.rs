@@ -111,13 +111,14 @@ async fn cli_request_approved_with_passthrough_secret() {
 
     // Audit trail: created → approved → release-attempt → release-completed.
     let rid: uuid::Uuid = request_id.parse().unwrap();
-    let kinds = env.audit_kinds_for_request(rid).await;
-    for want in [
+    let want = [
         "request-created",
         "request-approved",
         "release-attempt",
         "release-completed",
-    ] {
+    ];
+    let kinds = env.wait_for_audit_kinds(rid, &want).await;
+    for want in want {
         assert!(
             kinds.contains(&want.to_owned()),
             "missing audit {want}: {kinds:?}"

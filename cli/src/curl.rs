@@ -85,6 +85,12 @@ const MAX_REASON_BYTES: usize = 4 * 1024;
 /// path prefixes alike.
 const MAX_CONSTRAINT_ENTRIES: usize = 32;
 
+/// Ceiling on `--timeout`. Waiting longer than the longest grant can live is
+/// meaningless, and the deadline is an `Instant` — a value near `u64::MAX`
+/// seconds overflows the addition and panics, which is no way to report a bad
+/// argument (least of all after `-d @-` has already eaten its input).
+const MAX_APPROVAL_WAIT_SECONDS: u64 = MAX_TTL_SECONDS;
+
 /// Overrides [`DEFAULT_MAX_BODY_BYTES`], for a deployment whose
 /// `limits.proxy_max_body_bytes` is not the default.
 const MAX_BODY_ENV: &str = "KEYCHUTE_MAX_BODY_BYTES";
@@ -732,7 +738,7 @@ fn credential_selector(args: &CurlArgs) -> CliResult<Selector> {
 /// invocation blocked on a producer, or swallow a finite one's input and only
 /// then report the error. `constraints_for` re-runs the same rules rather than
 /// trusting this to have happened.
-fn validate_grant_options(args: &CurlArgs, target: &Target) -> CliResult<()> {
+fn validate_grant_options(args: &CurlArgs, target: &Target, method: &str) -> CliResult<()> {
     if let Some(key) = &args.idempotency_key {
         if key.len() > MAX_CURL_USER_KEY_BYTES {
             return Err(fail(
@@ -778,6 +784,15 @@ fn validate_grant_options(args: &CurlArgs, target: &Target) -> CliResult<()> {
             format!("--max-uses must be at most {MAX_SERVER_USES} (0 means no cap)"),
         ));
     }
+    if args.timeout > MAX_APPROVAL_WAIT_SECONDS {
+        return Err(fail(
+            EXIT_CONFIG,
+            format!(
+                "--timeout must be at most {MAX_APPROVAL_WAIT_SECONDS} seconds (30 days), \
+                 which already outlives the longest grant"
+            ),
+        ));
+    }
     // Only when the name is going to be USED. `--grant-id` reuses a grant that
     // already names the credential, and `credential_selector` says so plainly;
     // rejecting the call over the length of an argument just reported to have
@@ -799,53 +814,14 @@ fn validate_grant_options(args: &CurlArgs, target: &Target) -> CliResult<()> {
             ),
         ));
     }
-    // A destination that cannot be opened is a local failure the operator
-    // should never be woken for: the approval would be spent and the grant
-    // stranded — with the default `--max-uses 1` there is not even a grant id
-    // printed to retry with. Checked, not created: truncating an existing file
-    // now would destroy it during an approval wait that may end in a denial.
-    // `proxy_call` still opens it before sending, which is what guarantees no
-    // request goes out that cannot be written down.
-    if let Some(path) = &args.output {
-        if path.as_os_str() != "-" {
-            let dir = match path.parent() {
-                Some(p) if p.as_os_str().is_empty() => std::path::Path::new("."),
-                Some(p) => p,
-                None => std::path::Path::new("/"),
-            };
-            if !dir.is_dir() {
-                return Err(fail(
-                    EXIT_CONFIG,
-                    format!(
-                        "cannot write --output {}: {} is not a directory",
-                        path.display(),
-                        dir.display()
-                    ),
-                ));
-            }
-            // A target that IS a directory has a perfectly good parent, so the
-            // check above passes it — and `File::create` then fails on it just
-            // as surely as on a missing parent. Same cost either way: an
-            // approval spent on a call whose response could never be written.
-            if path.is_dir() {
-                return Err(fail(
-                    EXIT_CONFIG,
-                    format!(
-                        "cannot write --output {}: it is a directory",
-                        path.display()
-                    ),
-                ));
-            }
-        }
-    }
     // Each list the server bounds. Methods are counted the way
-    // `constraints_for` builds them — normalized and deduplicated — but
-    // WITHOUT the call's own method, which is not known until the body has
-    // been read (a body means POST, its absence GET). That leaves the true
-    // count at `distinct` or `distinct + 1`, so only `distinct` past the cap
-    // is a certain rejection; a set that lands exactly on the cap is left to
-    // the server, which alone knows whether the method was already in it.
-    let mut distinct: Vec<String> = Vec::new();
+    // `constraints_for` builds them: normalized, deduplicated, and led by the
+    // call's OWN method — which is why that method is passed in rather than
+    // guessed. It is decidable without reading anything: `-X` names it, and
+    // failing that the mere PRESENCE of a data argument makes it POST. A count
+    // that omitted it would accept exactly the case the server then rejects,
+    // 32 `--allow-method` values that do not include the inferred one.
+    let mut distinct: Vec<String> = vec![method.to_string()];
     for m in &args.allow_methods {
         let m = normalize_method(m).map_err(|e| fail(EXIT_CONFIG, e))?;
         if !distinct.contains(&m) {
@@ -856,8 +832,8 @@ fn validate_grant_options(args: &CurlArgs, target: &Target) -> CliResult<()> {
         return Err(fail(
             EXIT_CONFIG,
             format!(
-                "too many distinct --allow-method values ({}; the server accepts at most \
-                 {MAX_CONSTRAINT_ENTRIES} per constraint list, including the call's own method)",
+                "too many distinct methods ({}, counting {method} for the call itself; the \
+                 server accepts at most {MAX_CONSTRAINT_ENTRIES} per constraint list)",
                 distinct.len()
             ),
         ));
@@ -872,12 +848,11 @@ fn validate_grant_options(args: &CurlArgs, target: &Target) -> CliResult<()> {
             ),
         ));
     }
-    // Reuses the real rule so the two cannot drift; the method is irrelevant
-    // to every check it performs on the prefixes.
+    // Reuses the real rule so the two cannot drift.
     if !args.path_prefixes.is_empty() {
         constraints_for(
             target,
-            "GET",
+            method,
             &[],
             &args.path_prefixes,
             args.ttl,
@@ -886,6 +861,45 @@ fn validate_grant_options(args: &CurlArgs, target: &Target) -> CliResult<()> {
         .map_err(|e| fail(EXIT_CONFIG, e))?;
     }
     Ok(())
+}
+
+/// Open `--output` before any approval is asked for, and KEEP the handle.
+///
+/// A destination that cannot be opened is a local failure the operator should
+/// never be woken for: the approval would be spent and the grant stranded —
+/// with the default `--max-uses 1` there is not even a grant id printed to
+/// retry with. Inspecting the path cannot establish this. A directory, a
+/// missing parent, a dangling symlink and a file the caller may not write all
+/// look different to `is_dir`/`exists` and identical to `open`, so the only
+/// honest test is the open itself.
+///
+/// `create` without `truncate`: an existing file must survive an approval wait
+/// that may end in a denial, so it is emptied in `proxy_call` at the moment
+/// there is a response to put there. A destination that did not exist is
+/// created empty now, as curl also does.
+///
+/// `None` means stdout — either no `--output` or curl's `-o -` spelling for
+/// it. Treating `-` as a filename would create a file literally called `-` and
+/// leave stdout empty on a call that succeeded.
+fn open_output(args: &CurlArgs) -> CliResult<Option<std::fs::File>> {
+    let Some(path) = &args.output else {
+        return Ok(None);
+    };
+    if path.as_os_str() == "-" {
+        return Ok(None);
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .map(Some)
+        .map_err(|e| {
+            fail(
+                EXIT_CONFIG,
+                format!("cannot write --output {}: {e}", path.display()),
+            )
+        })
 }
 
 pub(crate) async fn run_curl(
@@ -901,9 +915,14 @@ pub(crate) async fn run_curl(
     // may never close — or, with a finite one, swallows its input and only
     // then reports the error. Selector, method and headers all qualify.
     let selector = credential_selector(&args)?;
-    let explicit_method = match &args.method {
-        Some(m) => Some(normalize_method(m).map_err(|e| fail(EXIT_CONFIG, e))?),
-        None => None,
+    // Decidable without reading a byte of it: curl's rule is that a body
+    // implies POST, and whether there will BE a body is settled by the mere
+    // presence of a data argument. Inferring it here rather than after
+    // `read_body` is what lets the method take part in the checks below.
+    let method = match &args.method {
+        Some(m) => normalize_method(m).map_err(|e| fail(EXIT_CONFIG, e))?,
+        None if body_is_supplied(&args) => "POST".to_string(),
+        None => "GET".to_string(),
     };
     let mut parsed = Vec::new();
     // `Name:` removals. Most name a header nothing here would have sent, and
@@ -927,15 +946,10 @@ pub(crate) async fn run_curl(
             }
         }
     }
-    validate_grant_options(&args, &target)?;
+    validate_grant_options(&args, &target, &method)?;
+    let output = open_output(&args)?;
 
     let body = read_body(&args)?;
-    let method = match explicit_method {
-        Some(m) => m,
-        // curl's default: a body implies POST.
-        None if body.is_some() => "POST".to_string(),
-        None => "GET".to_string(),
-    };
     // A `Connection: X-Internal` header nominates X-Internal as hop-by-hop,
     // and the broker honours that — but only if it can still SEE the
     // Connection header. Since `Connection` is itself on the strip list, a
@@ -963,14 +977,15 @@ pub(crate) async fn run_curl(
         headers.push((name, value));
     }
 
-    let grant_id = match selector {
+    let (grant_id, freshly_approved) = match selector {
         Selector::Grant(id) => {
             check_grant_covers(cfg, http, id, &target, &method).await?;
-            id
+            (id, false)
         }
-        Selector::Secret(secret_name) => {
-            acquire_grant(cfg, http, &args, &target, &method, secret_name).await?
-        }
+        Selector::Secret(secret_name) => (
+            acquire_grant(cfg, http, &args, &target, &method, secret_name).await?,
+            true,
+        ),
     };
 
     // A `User-Agent:` removal cannot be expressed on a client that has a
@@ -983,10 +998,27 @@ pub(crate) async fn run_curl(
     } else {
         http
     };
-    proxy_call(
-        cfg, proxy_http, &args, &target, &method, headers, body, grant_id,
+    let result = proxy_call(
+        cfg, proxy_http, &args, &target, &method, headers, body, grant_id, output,
     )
-    .await
+    .await;
+    // AFTER the call, deliberately. The grant's clock starts at approval, and
+    // this lookup is a diagnostic: letting it run first means a slow or lost
+    // response can spend a short TTL before the call it was approved for ever
+    // goes out, turning a best-effort courtesy into an expired grant. Still
+    // printed when the call failed — a grant with uses left is exactly what
+    // someone retrying wants to know about.
+    if freshly_approved && args.max_uses != 1 {
+        report_reuse_budget(cfg, http, &args, grant_id).await;
+    }
+    result
+}
+
+/// Whether a body will be read, decidable from the arguments alone. Only the
+/// presence of a data argument matters, not what it says: `-d @-` supplies a
+/// body whatever ends up on stdin, empty included.
+fn body_is_supplied(args: &CurlArgs) -> bool {
+    !args.data.is_empty() || !args.data_raw.is_empty() || !args.data_binary.is_empty()
 }
 
 /// Fetch a grant's metadata (never any credential material).
@@ -1306,48 +1338,55 @@ async fn acquire_grant(
             "server reported approval but returned no grant id",
         )
     })?;
-    // Whether the grant can serve a SECOND call is a property of what was
-    // granted, not of what was asked for: the approval form lets the operator
-    // narrow `max_uses` and `ttl_seconds`, so a request for 5 uses may well
-    // have been approved for 1 — and promising reuse then would send the
-    // caller after a grant the very next line exhausts. Ask the server.
-    //
-    // Best-effort: this hint is a convenience, and failing to print it must
-    // not fail a call that is otherwise ready to go.
-    if args.max_uses != 1 {
-        match fetch_grant(cfg, http, grant_id).await {
-            Ok(info) => {
-                let remaining = info
-                    .max_uses
-                    .map(|max| max.saturating_sub(info.use_count))
-                    // No cap: bounded by the TTL alone.
-                    .unwrap_or(u32::MAX);
-                // This call spends one of them.
-                if remaining > 1 {
-                    let budget = match info.max_uses {
-                        Some(_) => format!("{} more call(s)", remaining - 1),
-                        None => "further calls".to_string(),
-                    };
-                    eprintln!(
-                        "keychute: grant {grant_id} approved until {} — good for {budget}; \
-                         reuse it with `--grant-id {grant_id}` (no second approval)",
-                        info.not_after.to_rfc3339()
-                    );
-                } else {
-                    eprintln!(
-                        "keychute: grant {grant_id} was approved for a single use \
-                         (narrowed from the {} requested); this call spends it",
-                        args.max_uses
-                    );
-                }
-            }
-            Err(e) => eprintln!(
-                "keychute: could not read back the granted limits: {}",
-                e.message
-            ),
-        }
-    }
     Ok(grant_id)
+}
+
+/// Say whether a freshly approved grant can serve a SECOND call.
+///
+/// That is a property of what was GRANTED, not of what was asked for: the
+/// approval form lets the operator narrow `max_uses` and `ttl_seconds`, so a
+/// request for 5 uses may well have been approved for 1 — and promising reuse
+/// then would send the caller after a grant that is already spent. Only the
+/// server knows, hence the lookup.
+///
+/// Best-effort in both directions: it prints, it never fails, and it runs
+/// after the call it describes so it cannot delay one.
+async fn report_reuse_budget(
+    cfg: &Config,
+    http: &reqwest::Client,
+    args: &CurlArgs,
+    grant_id: Uuid,
+) {
+    match fetch_grant(cfg, http, grant_id).await {
+        Ok(info) => {
+            let remaining = info
+                .max_uses
+                .map(|max| max.saturating_sub(info.use_count))
+                // No cap: bounded by the TTL alone.
+                .unwrap_or(u32::MAX);
+            if remaining > 0 {
+                let budget = match info.max_uses {
+                    Some(_) => format!("{remaining} more call(s)"),
+                    None => "further calls".to_string(),
+                };
+                eprintln!(
+                    "keychute: grant {grant_id} approved until {} — good for {budget}; \
+                     reuse it with `--grant-id {grant_id}` (no second approval)",
+                    info.not_after.to_rfc3339()
+                );
+            } else {
+                eprintln!(
+                    "keychute: grant {grant_id} was approved for a single use \
+                     (narrowed from the {} requested), and this call spent it",
+                    args.max_uses
+                );
+            }
+        }
+        Err(e) => eprintln!(
+            "keychute: could not read back the granted limits: {}",
+            e.message
+        ),
+    }
 }
 
 /// Make the proxied call and stream the upstream's answer out.
@@ -1365,29 +1404,34 @@ async fn proxy_call(
     headers: Vec<(String, String)>,
     body: Option<Vec<u8>>,
     grant_id: Uuid,
+    output: Option<std::fs::File>,
 ) -> CliResult<()> {
-    // Open the destination BEFORE anything leaves: a request that has already
-    // been delivered cannot be un-delivered, and reporting only "cannot open
-    // /nope/out.json" after a POST has committed upstream invites a retry that
-    // repeats the side effect. Truncating a file we then fail to fill is the
-    // lesser harm, and is what curl does too.
-    // `-o -` is curl's spelling for stdout. Treating it as a filename would
-    // create a file literally called `-` and leave stdout empty, on a call
-    // that succeeded — the output silently going somewhere nobody looks.
-    let to_stdout = match &args.output {
-        None => true,
-        Some(path) => path.as_os_str() == "-",
-    };
-    let mut sink: Box<dyn Write> = if to_stdout {
-        Box::new(std::io::stdout().lock())
-    } else {
-        let path = args.output.as_ref().expect("checked above");
-        Box::new(std::fs::File::create(path).map_err(|e| {
-            fail(
-                EXIT_CONFIG,
-                format!("cannot open --output {}: {e}", path.display()),
-            )
-        })?)
+    // The destination was OPENED by `open_output`, before the approval — a
+    // request that has already been delivered cannot be un-delivered, and
+    // reporting "cannot open /nope/out.json" after a POST has committed
+    // upstream invites a retry that repeats the side effect.
+    //
+    // Emptying it is deferred to here, the last moment before anything leaves:
+    // an existing file must survive an approval wait that ends in a denial.
+    // Truncating one we then fail to fill is the lesser harm, and is what curl
+    // does too.
+    // `open_output` returns no file for stdout — either no `--output` or
+    // curl's `-o -` spelling for it.
+    let to_stdout = output.is_none();
+    let mut sink: Box<dyn Write> = match output {
+        None => Box::new(std::io::stdout().lock()),
+        Some(file) => {
+            file.set_len(0).map_err(|e| {
+                fail(
+                    EXIT_CONFIG,
+                    format!(
+                        "cannot write --output {}: {e}",
+                        args.output.as_ref().expect("a file means a path").display()
+                    ),
+                )
+            })?;
+            Box::new(file)
+        }
     };
 
     // The path goes on RAW: the server canonicalizes it and rejects ambiguous
@@ -1431,7 +1475,11 @@ async fn proxy_call(
 
     // Everything from here is the UPSTREAM's answer: its status is data, not a
     // failure of ours. `--fail` is the opt-in that turns it into one.
-    if args.fail && (status.is_client_error() || status.is_server_error()) {
+    // `>= 400`, not "4xx or 5xx". curl's rule is the numeric one, and an
+    // upstream is free to answer 600: `is_client_error`/`is_server_error` are
+    // both false there, so class-based checks would quietly hand a documented
+    // failure back as a success with its body printed.
+    if args.fail && status.as_u16() >= 400 {
         return Err(fail(
             EXIT_OTHER,
             format!(
@@ -1820,15 +1868,15 @@ mod tests {
         args.secret = Some("s".into());
 
         args.ttl = 0;
-        let err = validate_grant_options(&args, &target).unwrap_err();
+        let err = validate_grant_options(&args, &target, "GET").unwrap_err();
         assert_eq!(err.code, EXIT_CONFIG);
         assert!(err.message.contains("--ttl"), "{}", err.message);
 
         args.ttl = MAX_TTL_SECONDS + 1;
-        assert!(validate_grant_options(&args, &target).is_err());
+        assert!(validate_grant_options(&args, &target, "GET").is_err());
 
         args.ttl = MAX_TTL_SECONDS;
-        assert!(validate_grant_options(&args, &target).is_ok());
+        assert!(validate_grant_options(&args, &target, "GET").is_ok());
     }
 
     #[test]
@@ -1839,24 +1887,33 @@ mod tests {
         args.secret = Some("s".into());
 
         args.path_prefixes = vec!["/".into(); MAX_CONSTRAINT_ENTRIES + 1];
-        let err = validate_grant_options(&args, &target).unwrap_err();
+        let err = validate_grant_options(&args, &target, "GET").unwrap_err();
         assert_eq!(err.code, EXIT_CONFIG);
         assert!(err.message.contains("--path-prefix"), "{}", err.message);
 
         args.path_prefixes = vec!["/".into(); MAX_CONSTRAINT_ENTRIES];
-        assert!(validate_grant_options(&args, &target).is_ok());
+        assert!(validate_grant_options(&args, &target, "GET").is_ok());
 
         // Methods are deduplicated first, so repetition alone is not a
         // rejection however often it is spelled.
         args.allow_methods = vec!["get".into(); MAX_CONSTRAINT_ENTRIES + 1];
-        assert!(validate_grant_options(&args, &target).is_ok());
+        assert!(validate_grant_options(&args, &target, "GET").is_ok());
 
-        args.allow_methods = (0..=MAX_CONSTRAINT_ENTRIES)
+        // The call's own method is one of the entries. A set that fills the
+        // cap on its own therefore fits only if the method is already in it —
+        // which is the whole reason the method is inferred before this runs.
+        args.allow_methods = (0..MAX_CONSTRAINT_ENTRIES)
             .map(|i| format!("M{i}"))
             .collect();
-        let err = validate_grant_options(&args, &target).unwrap_err();
+        let err = validate_grant_options(&args, &target, "GET").unwrap_err();
         assert_eq!(err.code, EXIT_CONFIG);
-        assert!(err.message.contains("--allow-method"), "{}", err.message);
+        assert!(err.message.contains("counting GET"), "{}", err.message);
+
+        args.allow_methods[0] = "GET".into();
+        assert!(validate_grant_options(&args, &target, "GET").is_ok());
+        // The same 32 with a POST body: now nothing covers the call's method,
+        // and the server would have rejected 33 entries after stdin was read.
+        assert!(validate_grant_options(&args, &target, "POST").is_err());
     }
 
     #[test]
@@ -1866,35 +1923,59 @@ mod tests {
         args.url = "https://api.example.com/v1/things".into();
         args.secret = Some(String::new());
 
-        let err = validate_grant_options(&args, &target).unwrap_err();
+        let err = validate_grant_options(&args, &target, "GET").unwrap_err();
         assert_eq!(err.code, EXIT_CONFIG);
         assert!(err.message.contains("--secret"), "{}", err.message);
 
         // With `--grant-id` the name is ignored, and saying so then rejecting
         // the call over it would be the same argument answered two ways.
         args.grant_id = Some(Uuid::nil().to_string());
-        assert!(validate_grant_options(&args, &target).is_ok());
+        assert!(validate_grant_options(&args, &target, "GET").is_ok());
         args.secret = Some("x".repeat(MAX_SECRET_NAME_BYTES + 1));
-        assert!(validate_grant_options(&args, &target).is_ok());
+        assert!(validate_grant_options(&args, &target, "GET").is_ok());
     }
 
     #[test]
-    fn a_directory_output_target_is_refused_before_the_body_is_read() {
-        let target = parse_target("https://api.example.com/v1/things").unwrap();
+    fn an_unopenable_output_target_is_refused_before_the_body_is_read() {
         let mut args = body_args(None, None, None);
-        args.url = "https://api.example.com/v1/things".into();
-        args.secret = Some("s".into());
+        let dir = std::env::temp_dir().join(format!("keychute-out-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
 
-        let dir = std::env::temp_dir();
-        args.output = Some(dir.clone());
-        let err = validate_grant_options(&args, &target).unwrap_err();
-        assert_eq!(err.code, EXIT_CONFIG);
-        assert!(err.message.contains("is a directory"), "{}", err.message);
+        // Each of these looks different to `exists`/`is_dir` and identical to
+        // `open`, which is why the check IS the open.
+        for unopenable in [
+            // A directory.
+            dir.clone(),
+            // A missing parent.
+            dir.join("nope").join("out.json"),
+        ] {
+            args.output = Some(unopenable.clone());
+            let err = open_output(&args).unwrap_err();
+            assert_eq!(err.code, EXIT_CONFIG, "{}", unopenable.display());
+        }
 
-        // A file that does not exist yet inside that same directory is the
-        // ordinary case and stays acceptable.
-        args.output = Some(dir.join("keychute-nonexistent-output"));
-        assert!(validate_grant_options(&args, &target).is_ok());
+        // A symlink to nowhere: its parent is a directory and it is not one
+        // itself, so nothing short of opening it tells the truth.
+        let dangling = dir.join("dangling");
+        std::os::unix::fs::symlink(dir.join("nope").join("target"), &dangling).unwrap();
+        args.output = Some(dangling);
+        assert_eq!(open_output(&args).unwrap_err().code, EXIT_CONFIG);
+
+        // An existing file is opened WITHOUT truncation: an approval that ends
+        // in a denial must not have destroyed it.
+        let existing = dir.join("existing");
+        std::fs::write(&existing, b"keep me").unwrap();
+        args.output = Some(existing.clone());
+        assert!(open_output(&args).unwrap().is_some());
+        assert_eq!(std::fs::read(&existing).unwrap(), b"keep me");
+
+        // Stdout, spelled either way, needs no file at all.
+        args.output = None;
+        assert!(open_output(&args).unwrap().is_none());
+        args.output = Some("-".into());
+        assert!(open_output(&args).unwrap().is_none());
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -2111,27 +2192,27 @@ mod tests {
         let mut args = body_args(None, None, None);
         args.url = "https://api.example.com/admin".into();
         args.secret = Some("s".into());
-        assert!(validate_grant_options(&args, &t).is_ok());
+        assert!(validate_grant_options(&args, &t, "GET").is_ok());
 
         args.allow_methods = vec!["TRACE".into()];
-        assert!(validate_grant_options(&args, &t).is_err());
+        assert!(validate_grant_options(&args, &t, "GET").is_err());
         args.allow_methods = vec![];
 
         args.path_prefixes = vec!["v1".into()];
         assert!(
-            validate_grant_options(&args, &t).is_err(),
+            validate_grant_options(&args, &t, "GET").is_err(),
             "relative prefix"
         );
         args.path_prefixes = vec!["/v1".into()];
         assert!(
-            validate_grant_options(&args, &t).is_err(),
+            validate_grant_options(&args, &t, "GET").is_err(),
             "prefix that cannot cover the call"
         );
         args.path_prefixes = vec!["/admin".into()];
-        assert!(validate_grant_options(&args, &t).is_ok());
+        assert!(validate_grant_options(&args, &t, "GET").is_ok());
 
         args.idempotency_key = Some("k".repeat(MAX_CURL_USER_KEY_BYTES + 1));
-        assert!(validate_grant_options(&args, &t).is_err());
+        assert!(validate_grant_options(&args, &t, "GET").is_err());
         args.idempotency_key = None;
 
         // A path the proxy will refuse is refused here, even when the prefix
@@ -2139,7 +2220,7 @@ mod tests {
         // approves `/v1` and the call dies at the proxy anyway.
         let doomed = parse_target("https://api.example.com/v1/..;jsessionid=1").unwrap();
         args.path_prefixes = vec!["/v1".into()];
-        let err = validate_grant_options(&args, &doomed).unwrap_err();
+        let err = validate_grant_options(&args, &doomed, "GET").unwrap_err();
         assert_eq!(err.code, EXIT_CONFIG);
         assert!(err.message.contains("refuses"), "{}", err.message);
         args.path_prefixes = vec!["/admin".into()];
@@ -2147,40 +2228,37 @@ mod tests {
         // The server's remaining fixed bounds, each certain to be refused on
         // arrival and each decidable here.
         args.max_uses = MAX_SERVER_USES + 1;
-        assert!(validate_grant_options(&args, &t).is_err());
+        assert!(validate_grant_options(&args, &t, "GET").is_err());
         args.max_uses = MAX_SERVER_USES;
-        assert!(validate_grant_options(&args, &t).is_ok());
+        assert!(validate_grant_options(&args, &t, "GET").is_ok());
         args.max_uses = 1;
 
         args.secret = Some(String::new());
-        assert!(validate_grant_options(&args, &t).is_err(), "empty name");
+        assert!(
+            validate_grant_options(&args, &t, "GET").is_err(),
+            "empty name"
+        );
         args.secret = Some("s".repeat(MAX_SECRET_NAME_BYTES + 1));
-        assert!(validate_grant_options(&args, &t).is_err(), "name too long");
+        assert!(
+            validate_grant_options(&args, &t, "GET").is_err(),
+            "name too long"
+        );
         args.secret = Some("s".into());
 
         args.reason = "r".repeat(MAX_REASON_BYTES + 1);
-        assert!(validate_grant_options(&args, &t).is_err());
+        assert!(validate_grant_options(&args, &t, "GET").is_err());
         args.reason = String::new();
 
-        // A destination that cannot be written is a local failure, so it must
-        // not cost an approval. Checked here, without truncating anything: the
-        // real open still happens before the request is sent.
-        let dir = std::env::temp_dir().join(format!("keychute-out-{}", Uuid::new_v4()));
-        args.output = Some(dir.join("nope").join("out.json"));
-        let err = validate_grant_options(&args, &t).unwrap_err();
-        assert_eq!(err.code, EXIT_CONFIG);
-        assert!(err.message.contains("not a directory"), "{}", err.message);
-        // A writable destination passes, and stdout needs no directory at all.
-        std::fs::create_dir_all(&dir).unwrap();
-        args.output = Some(dir.join("out.json"));
-        assert!(validate_grant_options(&args, &t).is_ok());
-        assert!(!dir.join("out.json").exists(), "nothing is created yet");
-        args.output = Some("-".into());
-        assert!(validate_grant_options(&args, &t).is_ok());
-        // A bare filename means the working directory, not a missing parent.
-        args.output = Some("out.json".into());
-        assert!(validate_grant_options(&args, &t).is_ok());
-        std::fs::remove_dir_all(&dir).unwrap();
+        // `--timeout` becomes an `Instant`, so a value that overflows the
+        // addition has to be refused as the configuration error it is rather
+        // than panicking after stdin has been consumed.
+        args.timeout = u64::MAX;
+        assert!(validate_grant_options(&args, &t, "GET").is_err());
+        args.timeout = MAX_APPROVAL_WAIT_SECONDS;
+        assert!(validate_grant_options(&args, &t, "GET").is_ok());
+
+        // The destination is proved by `open_output`, tested separately: it
+        // opens the file, which no amount of inspecting the path can replace.
     }
 
     #[test]
