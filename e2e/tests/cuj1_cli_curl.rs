@@ -236,3 +236,75 @@ async fn a_malformed_grant_id_is_marked_as_keychutes_own_error() {
         Some("not-found")
     );
 }
+
+/// The rest of the contract: the errors axum generates BEFORE a handler runs.
+/// A query the extractor cannot deserialize, a path under /v1 matching no
+/// route, and a method no route accepts were all bare, unmarked responses — a
+/// client following the header contract would have read each as an upstream's.
+#[tokio::test(flavor = "multi_thread")]
+async fn framework_rejections_are_marked_too() {
+    let env = TestEnv::spawn(SpawnOpts::default()).await.unwrap();
+    let id = uuid::Uuid::new_v4();
+
+    let cases: Vec<(reqwest::Method, String, u16, &str)> = vec![
+        // Extractor rejection: `timeout_seconds` is a u64.
+        (
+            reqwest::Method::GET,
+            format!("/v1/access-requests/{id}/wait?timeout_seconds=abc"),
+            400,
+            "invalid-request",
+        ),
+        // No route under /v1 matches.
+        (
+            reqwest::Method::GET,
+            "/v1/nope".to_string(),
+            404,
+            "not-found",
+        ),
+        // The route exists; the method does not.
+        (
+            reqwest::Method::DELETE,
+            "/v1/access-requests".to_string(),
+            405,
+            "method-not-allowed",
+        ),
+    ];
+    for (method, path, status, code) in cases {
+        let resp = env
+            .k8s()
+            .request(method.clone(), &path)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), status, "{method} {path}");
+        assert_eq!(
+            resp.headers()
+                .get("x-keychute-error")
+                .map(|v| v.to_str().unwrap()),
+            Some(code),
+            "{method} {path} must carry the marker"
+        );
+    }
+
+    // And the routes that DO match still do: the catch-all must not shadow a
+    // real route, nor the proxy's own nested wildcard.
+    let resp = env.k8s().get("/healthz").send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let resp = env
+        .k8s()
+        .get(&format!("/v1/grants/{id}/proxy/deep/path"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        404,
+        "reaches the proxy handler, not the catch-all"
+    );
+    assert_eq!(
+        resp.headers()
+            .get("x-keychute-error")
+            .map(|v| v.to_str().unwrap()),
+        Some("not-found")
+    );
+}

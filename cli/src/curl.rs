@@ -1187,11 +1187,24 @@ fn refuse_output_over_token_file(cfg: &Config, args: &CurlArgs) -> CliResult<()>
     ))
 }
 
-/// Whether two paths name the same file, including via symlinks and `..`.
-/// The output file may not exist yet, so it resolves the deepest existing
-/// ancestor and compares the remainder literally; an unresolvable pair falls
-/// back to comparing the paths as given, which still catches the plain spelling.
+/// Whether two paths name the same file.
+///
+/// Identity first, spelling second. A hard link gives the same inode two
+/// unrelated pathnames, so no amount of path resolution relates them — and
+/// truncating either one empties the token, since it is the inode `set_len(0)`
+/// acts on. Both existing files are therefore compared by (device, inode).
+///
+/// Only when the output does not exist yet does this fall back to comparing
+/// resolved paths: nothing has been created to have an identity, and the
+/// resolution still catches symlinks, `.` and `..` in the spelling.
 fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(ma), Ok(mb)) = (std::fs::metadata(a), std::fs::metadata(b)) {
+            return (ma.dev(), ma.ino()) == (mb.dev(), mb.ino());
+        }
+    }
     fn resolve(p: &std::path::Path) -> std::path::PathBuf {
         if let Ok(c) = std::fs::canonicalize(p) {
             return c;
@@ -1221,6 +1234,13 @@ pub(crate) async fn run_curl(
     // then reports the error. Selector, method and headers all qualify.
     let selector = credential_selector(&args)?;
     refuse_output_over_token_file(cfg, &args)?;
+    // Read once here purely to settle whether it CAN be read. Local
+    // authentication that is already certain to fail is a config error like
+    // any other, and `-d @-` means a check deferred past the body read blocks
+    // on a producer for an invocation that cannot succeed. The value is
+    // discarded: every later call re-reads the file, so rotation mid-flight
+    // still works.
+    cfg.bearer()?;
     // Decidable without reading a byte of it: curl's rule is that a body
     // implies POST, and whether there will BE a body is settled by the mere
     // presence of a data argument. Inferring it here rather than after

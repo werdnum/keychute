@@ -75,6 +75,20 @@ pub fn router(state: AppState) -> Router {
             "/v1/grants/{id}/proxy/{*path}",
             any(crate::proxy::proxy_path),
         )
+        // The last two ways axum answers before a handler runs, and the last
+        // two unmarked errors on the API surface: a path under /v1 that
+        // matches no route, and a method no route accepts. Both are Keychute's
+        // own refusals — the marker is what stops a client attributing them to
+        // an upstream, and on these there is no upstream at all.
+        //
+        // Scoped to /v1 by an explicit catch-all route rather than a router
+        // fallback: the UI is merged into this router and its 404 belongs to a
+        // human reading HTML, not to the API's error envelope. The proxy's own
+        // relayed upstream responses are untouched by either — they come back
+        // through a handler, which is exactly why this is done here and not as
+        // a blanket response middleware that could not tell the two apart.
+        .route("/v1/{*rest}", any(|| async { ApiFailure::NotFound }))
+        .method_not_allowed_fallback(|| async { ApiFailure::MethodNotAllowed })
         .with_state(state)
 }
 

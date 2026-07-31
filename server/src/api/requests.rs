@@ -684,9 +684,16 @@ pub struct WaitParams {
 pub async fn wait(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Query(params): Query<WaitParams>,
+    uri: axum::http::Uri,
     headers: HeaderMap,
 ) -> Result<Response, ApiFailure> {
+    // Deserialized here rather than by a `Query<WaitParams>` extractor for the
+    // same reason the id is: an extractor rejection is axum's, generated
+    // before the handler and carrying no marker, so `?timeout_seconds=abc`
+    // would answer a bare 400 that a client reading the header contract would
+    // attribute to an upstream.
+    let Query(params) = Query::<WaitParams>::try_from_uri(&uri)
+        .map_err(|_| ApiFailure::InvalidRequest("malformed query string"))?;
     let client = authenticate_client(&state, &headers).await?;
     let id = crate::api::path_id(&id)?;
     let row = owned_request(&state, &client, id).await?;

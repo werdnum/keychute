@@ -18,6 +18,9 @@ pub enum ApiFailure {
     NotFound,
     /// 400 — malformed or semantically invalid request.
     InvalidRequest(&'static str),
+    /// 405 — the route exists but not for this method. Axum's own method
+    /// rejection carries no marker, so the router hands it here instead.
+    MethodNotAllowed,
     /// 400 — a bound from addendum #18 was exceeded.
     RequestTooLarge(&'static str),
     /// 400 — proxy path failed canonicalization.
@@ -72,6 +75,11 @@ impl ApiFailure {
             ApiFailure::InvalidRequest(m) => {
                 (StatusCode::BAD_REQUEST, "invalid-request", (*m).into())
             }
+            ApiFailure::MethodNotAllowed => (
+                StatusCode::METHOD_NOT_ALLOWED,
+                "method-not-allowed",
+                "method not allowed on this route".into(),
+            ),
             ApiFailure::RequestTooLarge(m) => {
                 (StatusCode::BAD_REQUEST, "request-too-large", (*m).into())
             }

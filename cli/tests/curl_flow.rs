@@ -621,7 +621,12 @@ async fn output_over_the_token_file_is_refused_before_anything_is_spent() {
     // in the middle cannot walk around it.
     let indirect = dir.join("sub").join("..").join("token");
     std::fs::create_dir(dir.join("sub")).unwrap();
-    for spelling in [token_file.clone(), indirect] {
+    // And by a second name for the same inode: a hard link has a pathname
+    // unrelated to the token file's, but `set_len(0)` truncates the inode, so
+    // path comparison alone would let the credential be destroyed anyway.
+    let hard_link = dir.join("alias");
+    std::fs::hard_link(&token_file, &hard_link).unwrap();
+    for spelling in [token_file.clone(), indirect, hard_link] {
         let base2 = base.clone();
         let tf = token_file.clone();
         let (code, stderr) = tokio::task::spawn_blocking(move || {
@@ -784,6 +789,44 @@ async fn removing_the_user_agent_sends_no_user_agent() {
     assert_eq!(recs[1].header("user-agent"), None);
 }
 
+/// curl: a custom header with the same name as an internal one is used
+/// "instead of the internal one". So an explicit `User-Agent` must REPLACE the
+/// CLI's default, not join it — two `User-Agent` fields reach the upstream as
+/// a request curl would never have sent, and which of them an upstream reads
+/// is its own business.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_custom_user_agent_replaces_the_default() {
+    let (base, st) = spawn_mock(ProxyMode::Upstream).await;
+    let (code, _, stderr) = tokio::task::spawn_blocking(move || {
+        run_cli(
+            &base,
+            &[
+                "curl",
+                "https://api.example.com/v1/things",
+                "--grant-id",
+                GRANT_ID,
+                "-H",
+                "User-Agent: custom/1.0",
+            ],
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(code, 0, "{stderr}");
+    let recs = st.proxied.lock().unwrap().clone();
+    let uas: Vec<&str> = recs[0]
+        .headers
+        .iter()
+        .filter(|(n, _)| n == "user-agent")
+        .map(|(_, v)| v.as_str())
+        .collect();
+    assert_eq!(
+        uas,
+        vec!["custom/1.0"],
+        "exactly one, and it is the caller's"
+    );
+}
+
 /// Run the CLI with stdin an OPEN PIPE that nobody ever writes to or closes,
 /// and give it a deadline.
 ///
@@ -859,5 +902,71 @@ async fn an_unusable_grant_is_refused_before_stdin_is_read() {
         assert!(stderr.contains(want), "{stderr}");
         // And nothing was proxied: the refusal was local.
         assert!(st.proxied.lock().unwrap().is_empty());
+    }
+}
+
+/// An unusable KEYCHUTE_TOKEN_FILE is the same class: local configuration that
+/// is already certain to fail. Deferred to the first `bearer()` call, it lands
+/// after the body read — so `-d @-` blocks on a producer, or eats finite
+/// input, for an invocation that could never have authenticated.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unusable_token_file_is_refused_before_stdin_is_read() {
+    let dir = std::env::temp_dir().join(format!("keychute-badtok-{}", Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let missing = dir.join("absent");
+    let empty = dir.join("empty");
+    std::fs::write(&empty, "   \n").unwrap();
+
+    for token_file in [missing, empty] {
+        let (base, st) = spawn_mock(ProxyMode::Upstream).await;
+        let tf = token_file.clone();
+        let (code, stderr) = tokio::task::spawn_blocking(move || {
+            use std::process::Stdio;
+            let mut child = Command::new(cli_bin())
+                .args([
+                    "curl",
+                    "https://api.example.com/v1/things",
+                    "--secret",
+                    "example-api-token",
+                    "-X",
+                    "POST",
+                    "-d",
+                    "@-",
+                ])
+                .env("KEYCHUTE_URL", &base)
+                .env("KEYCHUTE_TOKEN_FILE", &tf)
+                .env_remove("KEYCHUTE_TOKEN")
+                .env_remove("KEYCHUTE_CONTEXT")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("running keychute CLI");
+            // Held open: a check in the wrong order hangs here rather than failing.
+            let _stdin = child.stdin.take().expect("piped stdin");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if let Some(status) = child.try_wait().expect("waiting on CLI") {
+                    let out = child.wait_with_output().expect("collecting output");
+                    return Some((
+                        status.code().unwrap_or(-1),
+                        String::from_utf8_lossy(&out.stderr).into_owned(),
+                    ));
+                }
+                if std::time::Instant::now() > deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        })
+        .await
+        .unwrap()
+        .expect("must not block on stdin for a token file it cannot use");
+        assert_eq!(code, 2, "config error: {stderr}");
+        assert!(stderr.contains("KEYCHUTE_TOKEN_FILE"), "{stderr}");
+        // No approval was asked for either.
+        assert!(st.create_bodies.lock().unwrap().is_empty());
     }
 }
