@@ -385,6 +385,113 @@ async fn a_keychute_refusal_exits_denied() {
     assert!(stderr.contains("policy-denied"), "{stderr}");
 }
 
+/// `-X CONNECT` asks for something this path cannot express: CONNECT addresses
+/// a host in authority form, so hyper never sends the `/v1/grants/{id}/proxy…`
+/// path that selects the proxy route. Before this was refused locally the CLI
+/// spent a human approval, missed the route entirely, and read the resulting
+/// unmarked 404 as an upstream answer — exiting 0 on a call it never made.
+#[tokio::test(flavor = "multi_thread")]
+async fn connect_is_refused_before_any_approval_is_asked_for() {
+    let (base, st) = spawn_mock(ProxyMode::Upstream).await;
+
+    let (code, stdout, stderr) = tokio::task::spawn_blocking(move || {
+        run_cli(
+            &base,
+            &[
+                "curl",
+                "https://api.example.com/v1/things",
+                "--secret",
+                "example-api-token",
+                "-X",
+                "CONNECT",
+            ],
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        code, 2,
+        "a call that cannot be made is a config error: {stderr}"
+    );
+    assert!(stdout.is_empty());
+    assert!(stderr.contains("CONNECT"), "{stderr}");
+    // Nothing was asked of a human, and nothing was proxied.
+    assert!(
+        st.create_bodies.lock().unwrap().is_empty(),
+        "no approval may be requested for a call that cannot reach the proxy"
+    );
+    assert!(st.proxied.lock().unwrap().is_empty());
+}
+
+/// A grant that just had a call REFUSED by Keychute must not be advertised as
+/// reusable. `GET /v1/grants/{id}` does not revalidate, so a client, mechanism
+/// or secret disabled after approval still reads back unrevoked, unexpired and
+/// with uses to spare — and the old wording printed "good for N more calls, no
+/// second approval" directly under `revalidation-failed`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_call_does_not_advertise_the_grant_as_reusable() {
+    let (base, _st) = spawn_mock(ProxyMode::KeychuteError(
+        StatusCode::FORBIDDEN,
+        "revalidation-failed",
+    ))
+    .await;
+
+    let (code, _stdout, stderr) = tokio::task::spawn_blocking(move || {
+        run_cli(
+            &base,
+            &[
+                "curl",
+                "https://api.example.com/v1/x",
+                "--secret",
+                "example-api-token",
+                "--max-uses",
+                "5",
+            ],
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(code, 3, "a refusal is exit 3: {stderr}");
+    // The id is still reported — it is the only handle on the approval.
+    assert!(stderr.contains(GRANT_ID), "{stderr}");
+    assert!(
+        !stderr.contains("no second approval"),
+        "the grant is not usable; promising reuse contradicts the refusal: {stderr}"
+    );
+    assert!(
+        stderr.contains("refused this call itself"),
+        "say why the remaining uses do not help: {stderr}"
+    );
+
+    // A 5xx carrying the marker is a different animal: Keychute generated it,
+    // but about the upstream, and it says nothing about the grant. The reuse
+    // hint stays.
+    let (base, _st) = spawn_mock(ProxyMode::KeychuteError(
+        StatusCode::BAD_GATEWAY,
+        "upstream-unreachable",
+    ))
+    .await;
+    let (_code, _stdout, stderr) = tokio::task::spawn_blocking(move || {
+        run_cli(
+            &base,
+            &[
+                "curl",
+                "https://api.example.com/v1/x",
+                "--secret",
+                "example-api-token",
+                "--max-uses",
+                "5",
+            ],
+        )
+    })
+    .await
+    .unwrap();
+    assert!(
+        stderr.contains("no second approval"),
+        "a transient upstream fault leaves the grant reusable: {stderr}"
+    );
+}
+
 /// A freshly approved grant's ID is printed when the FIRST call fails, even
 /// under the default `--max-uses 1` where a successful call prints nothing.
 /// The failure may have come before the proxy accounted the use, leaving the

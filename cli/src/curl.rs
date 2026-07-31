@@ -475,6 +475,22 @@ pub(crate) fn normalize_method(m: &str) -> Result<String, String> {
             upper.len()
         ));
     }
+    if upper == "CONNECT" {
+        // Not a refusal of policy but of arithmetic: CONNECT names its target
+        // in authority form (`host:port`, RFC 9112 §3.2.3), so hyper sends it
+        // that way and the request never carries the `/v1/grants/{id}/proxy…`
+        // path that selects the proxy route. The call therefore misses the
+        // route entirely — after an approval has been spent — and comes back
+        // an unmarked 404 that reads like an upstream's own answer, so the
+        // CLI would exit 0 on a call it never made. There is no tunnel to
+        // broker at the far end either.
+        return Err(
+            "CONNECT cannot be brokered: it addresses a host rather than a path, so the \
+             request would not reach the proxy route at all — and the broker has no tunnel \
+             to hand back"
+                .into(),
+        );
+    }
     if upper == "TRACE" {
         // The server refuses this unconditionally (a TRACE-capable upstream
         // echoes the request back, credential header included). Say why here
@@ -865,7 +881,7 @@ fn read_bounded(source: impl Read, buf: &mut Vec<u8>, limit: usize) -> std::io::
 /// through untouched.
 fn classify_proxy_error(status: reqwest::StatusCode, body: &str) -> Failure {
     if status == reqwest::StatusCode::GONE {
-        return classify_gone(body);
+        return classify_gone(body).refused_by_keychute();
     }
     let msg = api_error_message(status, body);
     let code = match status.as_u16() {
@@ -878,10 +894,21 @@ fn classify_proxy_error(status: reqwest::StatusCode, body: &str) -> Failure {
         400 | 405 | 413 => EXIT_CONFIG,
         _ => EXIT_OTHER,
     };
-    fail(
+    let failure = fail(
         code,
         format!("brokered request rejected by Keychute: {msg}"),
-    )
+    );
+    // Marked as a refusal only below 500. A 4xx is Keychute's answer about
+    // THIS grant or this call — a policy denial, a revalidation failure, a
+    // malformed invocation — and repeating it verbatim gets the same answer.
+    // A 5xx carrying the marker is still Keychute's, but it describes the
+    // upstream or a transient fault, and says nothing about whether the grant
+    // is still good to reuse.
+    if status.as_u16() < 500 {
+        failure.refused_by_keychute()
+    } else {
+        failure
+    }
 }
 
 /// Derive the request idempotency key from the caller's key AND the exact call
@@ -1520,7 +1547,8 @@ pub(crate) async fn run_curl(
     // thing again instead of reusing what they just granted. The lookup decides
     // which it was; `report_reuse_budget` prints "spent" when it was spent.
     if freshly_approved && (args.max_uses != 1 || result.is_err()) {
-        report_reuse_budget(cfg, http, &args, grant_id).await;
+        let refused = result.as_ref().is_err_and(|e| e.keychute_refusal);
+        report_reuse_budget(cfg, http, &args, grant_id, refused).await;
     }
     result
 }
@@ -1836,11 +1864,20 @@ async fn acquire_grant(
 ///
 /// Best-effort in both directions: it prints, it never fails, and it runs
 /// after the call it describes so it cannot delay one.
+///
+/// `refused` says the call ended in Keychute's OWN refusal rather than a
+/// transport failure, and it has to change the wording: `GET /v1/grants/{id}`
+/// deliberately does not revalidate, so a client, mechanism or secret disabled
+/// after approval leaves a row that still reads unrevoked, unexpired and with
+/// uses to spare. Announcing "good for 3 more calls, no second approval" one
+/// line under `revalidation-failed` contradicts the error and sends the caller
+/// back to a grant that will refuse them again.
 async fn report_reuse_budget(
     cfg: &Config,
     http: &reqwest::Client,
     args: &CurlArgs,
     grant_id: Uuid,
+    refused: bool,
 ) {
     match fetch_grant(cfg, http, grant_id).await {
         Ok(info) => {
@@ -1859,7 +1896,18 @@ async fn report_reuse_budget(
             // uses it: a fast host would report a live grant as expired.
             let spent =
                 info.revoked || info.not_after <= info.server_time.unwrap_or_else(chrono::Utc::now);
-            if remaining > 0 && !spent {
+            if remaining > 0 && !spent && refused {
+                // The budget is real; the usability is not established. Say
+                // what is known — the grant still has uses and time — without
+                // the promise, because the thing that refused this call was
+                // Keychute itself and this lookup cannot see why.
+                eprintln!(
+                    "keychute: grant {grant_id} still shows uses remaining (until {}), but \
+                     Keychute refused this call itself — reusing it with `--grant-id \
+                     {grant_id}` will be refused the same way until the cause is fixed",
+                    info.not_after.to_rfc3339()
+                );
+            } else if remaining > 0 && !spent {
                 let budget = match info.max_uses {
                     Some(_) => format!("{remaining} more call(s)"),
                     None => "further calls".to_string(),
@@ -2342,6 +2390,10 @@ mod tests {
         // TRACE is refused locally with the reason, not after an approval.
         let err = normalize_method("trace").unwrap_err();
         assert!(err.contains("reflect"), "{err}");
+        // CONNECT likewise, for a different reason: it addresses a host, so
+        // the request never selects the proxy route.
+        let err = normalize_method("connect").unwrap_err();
+        assert!(err.contains("proxy route"), "{err}");
     }
 
     #[test]

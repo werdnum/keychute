@@ -145,12 +145,26 @@ struct StoreArgs {
 pub(crate) struct Failure {
     pub(crate) code: i32,
     pub(crate) message: String,
+    /// Keychute's own refusal, identified by the marker header — as opposed to
+    /// a transport failure or an upstream's answer. The distinction matters
+    /// after a grant has been approved: a refusal is the server's considered
+    /// answer about THIS grant and will be repeated, while a dropped
+    /// connection says nothing about whether the grant is still good.
+    pub(crate) keychute_refusal: bool,
 }
 
 pub(crate) fn fail(code: i32, message: impl Into<String>) -> Failure {
     Failure {
         code,
         message: message.into(),
+        keychute_refusal: false,
+    }
+}
+
+impl Failure {
+    pub(crate) fn refused_by_keychute(mut self) -> Self {
+        self.keychute_refusal = true;
+        self
     }
 }
 
