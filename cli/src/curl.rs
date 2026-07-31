@@ -396,11 +396,105 @@ pub(crate) fn parse_target(raw: &str) -> Result<Target, String> {
     {
         return Err(respelled_error(bad, raw));
     }
+    check_path_escapes(&path, raw)?;
     Ok(Target {
         origin,
         path,
         query,
     })
+}
+
+/// The same divergence from the other end: escapes the BROKER unwinds.
+///
+/// `policy::paths::canonicalize` percent-decodes the path once, and
+/// `proxy::outbound_url` then re-serializes it — so `/users/%7Ealice` is
+/// approved and hashed as `%7E` and arrives upstream as `/users/~alice`.
+/// Verified against the server: `%2B`, `%2C`, `%3A` and every other escape of
+/// a character a URL parser leaves literal change spelling the same way, while
+/// `%20`, `%22`, `%3F` and non-ASCII escapes survive untouched.
+///
+/// The query is not decoded by the broker, so this is a path-only rule.
+fn check_path_escapes(path: &str, raw: &str) -> Result<(), String> {
+    let bytes = path.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'%' {
+            i += 1;
+            continue;
+        }
+        // Malformed escapes never reach an upstream at all: the broker refuses
+        // the request. Refusing here costs the caller nothing and lands before
+        // stdin is read and before an operator is asked.
+        let (hi, lo) = match (bytes.get(i + 1), bytes.get(i + 2)) {
+            (Some(h), Some(l)) => (*h, *l),
+            _ => {
+                return Err(format!(
+                    "refusing URL {raw:?}: truncated percent escape in path"
+                ))
+            }
+        };
+        let decoded = match (hex_nibble(hi), hex_nibble(lo)) {
+            (Some(h), Some(l)) => (h << 4) | l,
+            _ => {
+                return Err(format!(
+                    "refusing URL {raw:?}: invalid percent escape in path"
+                ))
+            }
+        };
+        match decoded {
+            // The broker rejects both outright rather than sending anything.
+            b'/' => {
+                return Err(format!(
+                    "refusing URL {raw:?}: an encoded '/' in a path is refused by the broker \
+                     (it would hide a segment boundary from the path check)"
+                ))
+            }
+            b'\\' => {
+                return Err(format!(
+                    "refusing URL {raw:?}: an encoded '\\' in a path is refused by the broker"
+                ))
+            }
+            // `%` is the one escape the broker preserves: `outbound_url`
+            // re-escapes it before serializing, so `%25` arrives as `%25`.
+            b'%' => {}
+            b if sent_literally_in_path(b) => {
+                return Err(format!(
+                    "refusing URL {raw:?}: the broker percent-DECODES the path, so `%{:02X}` \
+                     would be approved and hashed as written and arrive upstream as {:?} — \
+                     the same target in a different spelling, which an upstream that signs or \
+                     logs the raw request target can tell apart. Write it literally.",
+                    decoded, decoded as char
+                ))
+            }
+            _ => {}
+        }
+        i += 3;
+    }
+    Ok(())
+}
+
+/// Whether a decoded byte would be re-serialized literally in a path — i.e.
+/// whether unwinding its escape changes the request target that is sent.
+///
+/// The probe is `Url::set_path`, which is what `proxy::outbound_url` calls,
+/// NOT whole-URL parsing: `#` and `?` are structural in a URL string but
+/// ordinary content to `set_path`, which re-encodes them. Pinned by
+/// `every_escape_the_broker_unwinds_is_refused`.
+fn sent_literally_in_path(b: u8) -> bool {
+    b.is_ascii_graphic() && !ESCAPE_SURVIVES.contains(b as char)
+}
+
+/// Bytes `set_path` percent-encodes on the way out, so their escaped spelling
+/// is the one that arrives and nothing changes.
+const ESCAPE_SURVIVES: &str = "\"#<>?`{}\\";
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Characters `Url::parse` percent-encodes rather than passing through, per
@@ -854,6 +948,7 @@ pub(crate) fn call_bound_idempotency_key(
     target: &Target,
     headers: &[(String, String)],
     body: Option<&[u8]>,
+    suppress_user_agent: bool,
 ) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -895,6 +990,11 @@ pub(crate) fn call_bound_idempotency_key(
             hasher.update(b);
         }
     }
+    // `-H 'User-Agent:'` is a removal, so it leaves the forwarded list looking
+    // exactly like an invocation that passed no headers at all — while the
+    // request that goes out differs by a whole header. It is part of the
+    // effective header set, so it is part of the call.
+    hasher.update([u8::from(suppress_user_agent)]);
     let digest = hex::encode(hasher.finalize());
     format!("{user_key}-{}", &digest[..CALL_BINDING_HEX_CHARS])
 }
@@ -1368,6 +1468,7 @@ pub(crate) async fn run_curl(
                 structured.expect("a secret selector builds its context"),
                 &headers,
                 body.as_deref(),
+                suppress_user_agent,
             )
             .await?,
             true,
@@ -1675,6 +1776,7 @@ async fn acquire_grant(
     structured: serde_json::Value,
     headers: &[(String, String)],
     body: Option<&[u8]>,
+    suppress_user_agent: bool,
 ) -> CliResult<Uuid> {
     let user_key = args
         .idempotency_key
@@ -1693,7 +1795,14 @@ async fn acquire_grant(
             ),
         ));
     }
-    let idem_key = call_bound_idempotency_key(&user_key, method, target, headers, body);
+    let idem_key = call_bound_idempotency_key(
+        &user_key,
+        method,
+        target,
+        headers,
+        body,
+        suppress_user_agent,
+    );
     validate_idempotency_key(&idem_key).map_err(|e| fail(EXIT_CONFIG, e))?;
     let constraints = constraints_for(
         target,
@@ -1818,8 +1927,13 @@ async fn report_reuse_budget(
                 );
             }
         }
+        // The id still goes out: it is the only handle on an approval that
+        // already exists, and without it the caller's only route back to the
+        // same grant is asking a human for another one.
         Err(e) => eprintln!(
-            "keychute: could not read back the granted limits: {}",
+            "keychute: grant {grant_id} — could not read back the granted limits ({}); \
+             if it has uses left, reuse it with `--grant-id {grant_id}` rather than \
+             requesting a second approval",
             e.message
         ),
     }
@@ -2013,9 +2127,10 @@ mod tests {
         assert_eq!(t.origin.port, None);
         assert_eq!(t.path, "/v1/things");
         assert_eq!(t.query.as_deref(), Some("limit=10&q=a%20b"));
-        // Encoded separators survive to the server, which is what rejects them.
-        let t = parse_target("https://api.example.com/v1%2Fthings").unwrap();
-        assert_eq!(t.path, "/v1%2Fthings");
+        // An encoded separator is refused here now: the broker rejects it
+        // outright, so deferring only bought a stdin read and an approval ask
+        // before a certain failure.
+        assert!(parse_target("https://api.example.com/v1%2Fthings").is_err());
         // A bare origin still yields a path.
         assert_eq!(parse_target("https://api.example.com").unwrap().path, "/");
         // Non-default port becomes part of the origin.
@@ -2141,6 +2256,42 @@ mod tests {
         let u = reqwest::Url::parse("https://h/caf\u{e9}?a=\u{e9}").unwrap();
         assert_eq!(u.path(), "/caf%C3%A9");
         assert_eq!(u.query(), Some("a=%C3%A9"));
+    }
+
+    /// The other half of the same property, pinned the same way: an escape is
+    /// refused exactly when unwinding it would change what is sent. The broker
+    /// decodes the path once and re-serializes, so a byte the parser writes
+    /// literally arrives in a spelling the approval never showed — while one
+    /// the parser re-encodes (`%20`, `%22`) round-trips and must stay allowed.
+    #[test]
+    fn every_escape_the_broker_unwinds_is_refused() {
+        for b in 0x21u8..=0x7e {
+            // Refused for their own reasons, with their own messages.
+            if matches!(b, b'/' | b'\\' | b'%') {
+                continue;
+            }
+            let c = b as char;
+            let mut u = reqwest::Url::parse("https://h/").unwrap();
+            u.set_path(&format!("/x{c}y"));
+            let round_trips = u.path() == format!("/x{c}y");
+            let refused = parse_target(&format!("https://h/x%{:02X}y", b)).is_err();
+            assert_eq!(
+                refused, round_trips,
+                "%{b:02X} ({c:?}): parser sends it literally = {round_trips}"
+            );
+        }
+        // `%25` is the exception the broker itself creates: `outbound_url`
+        // re-escapes `%` before serializing, so this spelling survives.
+        assert!(parse_target("https://h/a%25b").is_ok());
+        // Non-ASCII escapes are re-encoded byte for byte, so they survive too.
+        assert!(parse_target("https://h/caf%C3%A9").is_ok());
+        // Encoded separators and malformed escapes never reach an upstream.
+        assert!(parse_target("https://h/a%2Fb").is_err());
+        assert!(parse_target("https://h/a%5Cb").is_err());
+        assert!(parse_target("https://h/a%zzb").is_err());
+        assert!(parse_target("https://h/a%2").is_err());
+        // The query is NOT decoded by the broker, so its escapes are its own.
+        assert!(parse_target("https://h/a?q=%7Ealice").is_ok());
     }
 
     #[test]
@@ -2720,12 +2871,12 @@ mod tests {
     #[test]
     fn the_idempotency_key_is_bound_to_the_exact_call() {
         let base = parse_target("https://api.example.com/transfer?to=trusted").unwrap();
-        let key = call_bound_idempotency_key("k1", "POST", &base, &[], None);
+        let key = call_bound_idempotency_key("k1", "POST", &base, &[], None, false);
         // Same command, same key: a rerun resumes its original request, which
         // is the whole point of --idempotency-key.
         assert_eq!(
             key,
-            call_bound_idempotency_key("k1", "POST", &base, &[], None)
+            call_bound_idempotency_key("k1", "POST", &base, &[], None, false)
         );
 
         // Change ONLY the query and the key changes — otherwise the server
@@ -2735,22 +2886,22 @@ mod tests {
         let swapped = parse_target("https://api.example.com/transfer?to=attacker").unwrap();
         assert_ne!(
             key,
-            call_bound_idempotency_key("k1", "POST", &swapped, &[], None)
+            call_bound_idempotency_key("k1", "POST", &swapped, &[], None, false)
         );
         // Same for the other components of "which call is this".
         let other_path = parse_target("https://api.example.com/refund?to=trusted").unwrap();
         assert_ne!(
             key,
-            call_bound_idempotency_key("k1", "POST", &other_path, &[], None)
+            call_bound_idempotency_key("k1", "POST", &other_path, &[], None, false)
         );
         let other_host = parse_target("https://other.example/transfer?to=trusted").unwrap();
         assert_ne!(
             key,
-            call_bound_idempotency_key("k1", "POST", &other_host, &[], None)
+            call_bound_idempotency_key("k1", "POST", &other_host, &[], None, false)
         );
         assert_ne!(
             key,
-            call_bound_idempotency_key("k1", "GET", &base, &[], None)
+            call_bound_idempotency_key("k1", "GET", &base, &[], None, false)
         );
         // An absent query and an empty one are different request targets —
         // `/transfer?` really is sent with the `?` — so they must not alias.
@@ -2759,41 +2910,56 @@ mod tests {
         assert_eq!(no_query.query, None);
         assert_eq!(empty_query.query.as_deref(), Some(""));
         assert_ne!(
-            call_bound_idempotency_key("k1", "POST", &no_query, &[], None),
-            call_bound_idempotency_key("k1", "POST", &empty_query, &[], None)
+            call_bound_idempotency_key("k1", "POST", &no_query, &[], None, false),
+            call_bound_idempotency_key("k1", "POST", &empty_query, &[], None, false)
         );
         // A different caller key is still a different request.
         assert_ne!(
             key,
-            call_bound_idempotency_key("k2", "POST", &base, &[], None)
+            call_bound_idempotency_key("k2", "POST", &base, &[], None, false)
         );
         // Length-prefixing: no field boundary can be shifted to collide.
         let a = parse_target("https://api.example.com/ab").unwrap();
         let b = parse_target("https://api.example.com/a?b").unwrap();
         assert_ne!(
-            call_bound_idempotency_key("k", "GET", &a, &[], None),
-            call_bound_idempotency_key("k", "GET", &b, &[], None)
+            call_bound_idempotency_key("k", "GET", &a, &[], None, false),
+            call_bound_idempotency_key("k", "GET", &b, &[], None, false)
         );
         // The body and the forwarded headers are part of "which call is
         // this" too: neither is in `CreateAccessRequest`, so without them a
         // rerun keeping the key sends new bytes under the old approval.
         let hdrs = vec![("x-signature".to_string(), "abc".to_string())];
         assert_ne!(
-            call_bound_idempotency_key("k1", "POST", &base, &[], Some(b"{\"to\":\"trusted\"}")),
-            call_bound_idempotency_key("k1", "POST", &base, &[], Some(b"{\"to\":\"attacker\"}"))
+            call_bound_idempotency_key(
+                "k1",
+                "POST",
+                &base,
+                &[],
+                Some(b"{\"to\":\"trusted\"}"),
+                false
+            ),
+            call_bound_idempotency_key(
+                "k1",
+                "POST",
+                &base,
+                &[],
+                Some(b"{\"to\":\"attacker\"}"),
+                false
+            )
         );
         assert_ne!(
             key,
-            call_bound_idempotency_key("k1", "POST", &base, &hdrs, None)
+            call_bound_idempotency_key("k1", "POST", &base, &hdrs, None, false)
         );
         assert_ne!(
-            call_bound_idempotency_key("k1", "POST", &base, &hdrs, None),
+            call_bound_idempotency_key("k1", "POST", &base, &hdrs, None, false),
             call_bound_idempotency_key(
                 "k1",
                 "POST",
                 &base,
                 &[("x-signature".to_string(), "xyz".to_string())],
-                None
+                None,
+                false
             )
         );
         // Order is part of the request too.
@@ -2806,14 +2972,14 @@ mod tests {
             ("x-a".to_string(), "1".to_string()),
         ];
         assert_ne!(
-            call_bound_idempotency_key("k1", "POST", &base, &a_then_b, None),
-            call_bound_idempotency_key("k1", "POST", &base, &b_then_a, None)
+            call_bound_idempotency_key("k1", "POST", &base, &a_then_b, None, false),
+            call_bound_idempotency_key("k1", "POST", &base, &b_then_a, None, false)
         );
         // No body and an empty body are different requests: `-d ''` sends
         // `Content-Length: 0`.
         assert_ne!(
-            call_bound_idempotency_key("k1", "POST", &base, &[], None),
-            call_bound_idempotency_key("k1", "POST", &base, &[], Some(b""))
+            call_bound_idempotency_key("k1", "POST", &base, &[], None, false),
+            call_bound_idempotency_key("k1", "POST", &base, &[], Some(b""), false)
         );
         // Length-prefixing again, across the new fields.
         assert_ne!(
@@ -2822,15 +2988,24 @@ mod tests {
                 "POST",
                 &base,
                 &[("x-a".to_string(), "bc".to_string())],
-                None
+                None,
+                false
             ),
             call_bound_idempotency_key(
                 "k1",
                 "POST",
                 &base,
                 &[("x-ab".to_string(), "c".to_string())],
-                None
+                None,
+                false
             )
+        );
+        // A `User-Agent:` removal leaves the forwarded list identical to one
+        // with no `-H` at all, while the request that goes out differs by a
+        // whole header — so the suppression is part of the call too.
+        assert_ne!(
+            call_bound_idempotency_key("k1", "POST", &base, &[], None, false),
+            call_bound_idempotency_key("k1", "POST", &base, &[], None, true)
         );
         // The derived key fits the server's cap.
         assert!(validate_idempotency_key(&call_bound_idempotency_key(
@@ -2838,7 +3013,8 @@ mod tests {
             "POST",
             &base,
             &[],
-            None
+            None,
+            false
         ))
         .is_ok());
         // …and keeps 128 bits of the digest. This is a COLLISION bound, and
@@ -2857,11 +3033,12 @@ mod tests {
         // included, so taking the path from it would send this call to
         // /admin — a resource the caller never named — and launder past the
         // server check that exists to reject it.
-        let t = parse_target("https://api.example.com/a/%2e%2e/admin").unwrap();
-        assert_eq!(t.path, "/a/%2e%2e/admin");
-        // No canonical form locally either, so the local checks defer and the
-        // server returns invalid-path.
-        assert!(canonical_path(&t.path).is_none());
+        // What must never happen is RESOLVING it locally: the parser's own
+        // answer for this is `/admin`. Refusing is not resolving — the call is
+        // rejected, not quietly redirected — and the broker would reject the
+        // decoded `..` anyway.
+        assert!(parse_target("https://api.example.com/a/%2e%2e/admin").is_err());
+        assert!(canonical_path("/a/%2e%2e/admin").is_none());
         // A literal `/../` is equally preserved.
         let t = parse_target("https://api.example.com/a/../admin").unwrap();
         assert_eq!(t.path, "/a/../admin");
@@ -2886,12 +3063,12 @@ mod tests {
             let err = parse_target(raw).unwrap_err();
             assert!(err.contains("backslash"), "{raw}: {err}");
         }
-        // Encoded, no parser rewrites it, so it reaches the server intact and
-        // the server is the one that refuses it — same deference as a dot
-        // segment: no local canonical form, so no local coverage claim.
-        let t = parse_target("https://api.example.com/a%5Cb").unwrap();
-        assert_eq!(t.path, "/a%5Cb");
-        assert!(canonical_path(&t.path).is_none());
+        // Encoded, and refused here too: the broker rejects an encoded
+        // backslash in a path exactly as it rejects a raw one, so there is no
+        // server answer worth deferring to.
+        let err = parse_target("https://api.example.com/a%5Cb").unwrap_err();
+        assert!(err.contains("encoded '\\'"), "{err}");
+        assert!(canonical_path("/a%5Cb").is_none());
         // A port in the authority is not mistaken for the path.
         let t = parse_target("https://api.example.com:8443/v1").unwrap();
         assert_eq!(t.path, "/v1");

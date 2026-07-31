@@ -41,6 +41,9 @@ enum GrantShape {
     Usable,
     Expired,
     Exhausted,
+    /// The metadata endpoint itself fails — a transient 500 on a lookup that
+    /// is only ever a courtesy, and must not swallow the grant id with it.
+    LookupFails,
 }
 
 /// One proxied request, as the mock saw it.
@@ -103,12 +106,19 @@ async fn wait_request(
 }
 
 /// GET /v1/grants/{id} — the metadata the CLI checks a reused grant against.
-async fn grant_info(State(st): State<MockState>, Path(id): Path<Uuid>) -> Json<serde_json::Value> {
+async fn grant_info(State(st): State<MockState>, Path(id): Path<Uuid>) -> Response {
     assert_eq!(id.to_string(), GRANT_ID);
     let (not_after, use_count) = match st.grant {
         GrantShape::Usable => ("2099-01-01T00:00:00Z", 1),
         GrantShape::Expired => ("2020-01-01T00:00:00Z", 1),
         GrantShape::Exhausted => ("2099-01-01T00:00:00Z", 5),
+        GrantShape::LookupFails => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": {"code": "internal", "message": "nope"}})),
+            )
+                .into_response()
+        }
     };
     Json(serde_json::json!({
         "grant_id": GRANT_ID,
@@ -125,6 +135,7 @@ async fn grant_info(State(st): State<MockState>, Path(id): Path<Uuid>) -> Json<s
         "use_count": use_count,
         "revoked": false,
     }))
+    .into_response()
 }
 
 async fn proxy(State(st): State<MockState>, req: Request) -> Response {
@@ -404,6 +415,34 @@ async fn a_failed_first_call_still_reports_the_approved_grant() {
     assert!(
         stderr.contains(GRANT_ID) && stderr.contains("--grant-id"),
         "the caller needs the ID to reuse the approval instead of asking again: {stderr}"
+    );
+
+    // Same requirement when the courtesy lookup is what failed. The limits are
+    // then unknown, but the id is not — and it is the only handle on an
+    // approval that already exists.
+    let (base, _st) = spawn_mock_full(
+        ProxyMode::KeychuteError(StatusCode::BAD_GATEWAY, "upstream-unreachable"),
+        "api.example.com",
+        GrantShape::LookupFails,
+    )
+    .await;
+    let (code, _stdout, stderr) = tokio::task::spawn_blocking(move || {
+        run_cli(
+            &base,
+            &[
+                "curl",
+                "https://api.example.com/v1/x",
+                "--secret",
+                "example-api-token",
+            ],
+        )
+    })
+    .await
+    .unwrap();
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains(GRANT_ID) && stderr.contains("--grant-id"),
+        "a failed limits lookup must not swallow the grant id: {stderr}"
     );
 }
 
@@ -846,6 +885,26 @@ async fn a_changed_body_or_header_is_not_the_same_call_to_resume() {
     assert_ne!(keys[0], keys[2], "a changed body is a different call");
     assert_ne!(keys[0], keys[3], "a changed header is a different call");
     assert_ne!(keys[2], keys[3]);
+
+    // `User-Agent:` is a REMOVAL, so it leaves the forwarded header list
+    // identical to the run above while the request that goes out differs by a
+    // whole header. Without it in the binding, this resumes that approval.
+    let mut suppressed = base_args("{\"to\":\"trusted\"}", "abc");
+    suppressed.push("-H".to_string());
+    suppressed.push("User-Agent:".to_string());
+    let (code, _, stderr) = run(suppressed).await.unwrap();
+    assert_eq!(code, 0, "{stderr}");
+    let keys: Vec<String> = st
+        .create_bodies
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|b| b["idempotency_key"].as_str().unwrap().to_string())
+        .collect();
+    assert_ne!(
+        keys[0], keys[4],
+        "suppressing the User-Agent is a different effective header set"
+    );
 }
 
 /// curl: a custom header with the same name as an internal one is used
