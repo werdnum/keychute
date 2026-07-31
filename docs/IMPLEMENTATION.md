@@ -105,7 +105,7 @@ clients:                   # declarative client provisioning (reconciled at star
       api_token_sha256: "<hex>"
   - name: k8s-agent
     max_tier: cooperating-client
-    mechanisms: [cli-read]
+    mechanisms: [brokered, cli-read]
     may_store_secrets: true   # optional, default false: allows POST /v1/secrets
     auth:
       service_account:

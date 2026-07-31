@@ -293,18 +293,33 @@ pub(crate) fn parse_target(raw: &str) -> Result<Target, String> {
              is not the host it targets, and Keychute supplies the credential anyway"
         ));
     }
-    // Tab, CR and LF are DELETED by the WHATWG parser rather than rejected, so
-    // they are the backslash problem in a quieter form: `raw_path_and_query`
-    // keeps them, the approval page and the call-binding hash cover the
-    // spelling with them in, and then `proxy_call` re-parses the assembled URL
-    // and sends it without them. A query displayed as `amount=1\n000` would
-    // arrive upstream as `amount=1000` — a different call than the one that
-    // was approved, with no diagnostic anywhere.
-    if let Some(bad) = raw.chars().find(|c| matches!(c, '\t' | '\r' | '\n')) {
+    // Characters the WHATWG parser makes DISAPPEAR rather than reject, which
+    // is the backslash problem in a quieter form: `raw_path_and_query` keeps
+    // them, the approval page and the call-binding hash cover the spelling
+    // with them in, and then `proxy_call` re-parses the assembled URL and
+    // sends it without them. A query displayed as `amount=1\n000` would arrive
+    // upstream as `amount=1000` — a different call than the one that was
+    // approved, with no diagnostic anywhere.
+    //
+    // Two rules, because the parser has two ways of doing it. Tab, CR and LF
+    // are deleted from ANYWHERE in the input; every other C0 control and DEL
+    // is deleted only at the ends, along with spaces — so `?to=alice%00`
+    // survives this check with the NUL in the approval text and loses it on
+    // the wire. Refusing the whole class costs nothing: none of it is legal in
+    // a URL unencoded, and the encoded spelling always remains available.
+    if let Some(bad) = raw.chars().find(|c| c.is_ascii_control() || *c == '\u{7f}') {
         return Err(format!(
-            "refusing URL containing {bad:?} {raw:?}: URL parsers silently DELETE tab, \
-             CR and LF, so the target an operator would approve is not the target that \
-             would be sent. Percent-encode it (%09, %0D, %0A) if it is really meant."
+            "refusing URL containing {bad:?} {raw:?}: URL parsers silently DELETE control \
+             characters — tab, CR and LF anywhere, the rest at either end — so the target \
+             an operator would approve is not the target that would be sent. \
+             Percent-encode it (%09, %0D, %0A, %00 …) if it is really meant."
+        ));
+    }
+    if raw.starts_with(' ') || raw.ends_with(' ') {
+        return Err(format!(
+            "refusing URL with a leading or trailing space {raw:?}: URL parsers trim them, \
+             so the approved spelling is not the one that would be sent. Percent-encode it \
+             (%20) if it is really part of the target."
         ));
     }
     if raw.contains('\\') {
@@ -535,21 +550,71 @@ pub(crate) fn constraints_for(
 ///   `--data-binary` is for.
 /// * `-d value` and `--data-raw value` take the argument literally
 ///   (`--data-raw` also declines to treat a leading `@` as a file).
+///
+/// Opens its own sources, which is what makes it test-only: `run_curl` has to
+/// open them before `open_output` runs, so it drives `read_body_with`.
+#[cfg(test)]
 fn read_body(args: &CurlArgs) -> CliResult<Option<Vec<u8>>> {
     read_body_bounded(args, max_body_bytes()?)
 }
 
-fn read_body_bounded(args: &CurlArgs, limit: usize) -> CliResult<Option<Vec<u8>>> {
-    // `--data-raw` takes every piece literally; the other two read `@`.
-    // Exactly one flavour can be present (clap enforces it), so there is no
-    // cross-flag ordering to get wrong.
-    let (pieces, reads_at, strip_newlines) = if !args.data_raw.is_empty() {
-        (&args.data_raw, false, false)
+/// Which pieces make up the body, and how they are read. `--data-raw` takes
+/// every piece literally; the other two read `@`. Exactly one flavour can be
+/// present (clap enforces it), so there is no cross-flag ordering to get
+/// wrong.
+fn body_pieces(args: &CurlArgs) -> Option<(&Vec<String>, bool, bool)> {
+    if !args.data_raw.is_empty() {
+        Some((&args.data_raw, false, false))
     } else if !args.data.is_empty() {
-        (&args.data, true, true)
+        Some((&args.data, true, true))
     } else if !args.data_binary.is_empty() {
-        (&args.data_binary, true, false)
+        Some((&args.data_binary, true, false))
     } else {
+        None
+    }
+}
+
+/// Open every file-backed body piece, in the order given. One entry per piece;
+/// `None` for a literal piece and for `@-`, which is stdin.
+///
+/// Separate from the reading so it can run BEFORE `open_output`. With
+/// `-d @payload -o payload` the output would otherwise CREATE the input, and
+/// the missing-file error that invocation deserves would become an empty body
+/// sent under a real approval. Opening first judges the input against the
+/// filesystem as the caller found it.
+///
+/// Nothing is read here, and `@-` is not touched: stdin is still consumed only
+/// once every check has passed.
+fn open_body_sources(args: &CurlArgs) -> CliResult<Vec<Option<std::fs::File>>> {
+    let Some((pieces, reads_at, _)) = body_pieces(args) else {
+        return Ok(Vec::new());
+    };
+    let mut opened = Vec::with_capacity(pieces.len());
+    for piece in pieces {
+        opened.push(match piece.strip_prefix('@') {
+            Some("-") if reads_at => None,
+            Some(src) if reads_at => Some(
+                std::fs::File::open(src)
+                    .map_err(|e| fail(EXIT_CONFIG, format!("cannot read body file {src}: {e}")))?,
+            ),
+            _ => None,
+        });
+    }
+    Ok(opened)
+}
+
+#[cfg(test)]
+fn read_body_bounded(args: &CurlArgs, limit: usize) -> CliResult<Option<Vec<u8>>> {
+    let sources = open_body_sources(args)?;
+    read_body_with(args, limit, sources)
+}
+
+fn read_body_with(
+    args: &CurlArgs,
+    limit: usize,
+    mut sources: Vec<Option<std::fs::File>>,
+) -> CliResult<Option<Vec<u8>>> {
+    let Some((pieces, reads_at, strip_newlines)) = body_pieces(args) else {
         return Ok(None);
     };
 
@@ -578,14 +643,13 @@ fn read_body_bounded(args: &CurlArgs, limit: usize) -> CliResult<Option<Vec<u8>>
         // left of it.
         let remaining = limit.saturating_sub(out.len());
         let mut buf = Vec::new();
-        if source == "-" {
-            read_bounded(std::io::stdin().lock(), &mut buf, remaining)
-                .map_err(|e| fail(EXIT_CONFIG, format!("cannot read the body from stdin: {e}")))?;
-        } else {
-            let file = std::fs::File::open(source)
-                .map_err(|e| fail(EXIT_CONFIG, format!("cannot read body file {source}: {e}")))?;
-            read_bounded(file, &mut buf, remaining)
-                .map_err(|e| fail(EXIT_CONFIG, format!("cannot read body file {source}: {e}")))?;
+        // The handle was opened by `open_body_sources`, before anything could
+        // have created the file it names.
+        match sources.get_mut(i).and_then(Option::take) {
+            Some(file) => read_bounded(file, &mut buf, remaining)
+                .map_err(|e| fail(EXIT_CONFIG, format!("cannot read body file {source}: {e}")))?,
+            None => read_bounded(std::io::stdin().lock(), &mut buf, remaining)
+                .map_err(|e| fail(EXIT_CONFIG, format!("cannot read the body from stdin: {e}")))?,
         }
         if strip_newlines {
             buf.retain(|b| *b != b'\r' && *b != b'\n');
@@ -947,9 +1011,12 @@ pub(crate) async fn run_curl(
         }
     }
     validate_grant_options(&args, &target, &method)?;
+    // Inputs before outputs, so `-d @payload -o payload` cannot answer its own
+    // missing file with an empty one.
+    let sources = open_body_sources(&args)?;
     let output = open_output(&args)?;
 
-    let body = read_body(&args)?;
+    let body = read_body_with(&args, max_body_bytes()?, sources)?;
     // A `Connection: X-Internal` header nominates X-Internal as hop-by-hop,
     // and the broker honours that — but only if it can still SEE the
     // Connection header. Since `Connection` is itself on the strip list, a
@@ -1364,7 +1431,14 @@ async fn report_reuse_budget(
                 .map(|max| max.saturating_sub(info.use_count))
                 // No cap: bounded by the TTL alone.
                 .unwrap_or(u32::MAX);
-            if remaining > 0 {
+            // Uses left is not the same as usable. The grant can be revoked
+            // while the call it was approved for is in flight, and a short TTL
+            // can run out during a slow one — `not_after` is measured from
+            // APPROVAL, not from now. Printing "good for 4 more calls, no
+            // second approval" for either would send someone after a grant
+            // that answers `grant-expired`.
+            let spent = info.revoked || info.not_after <= chrono::Utc::now();
+            if remaining > 0 && !spent {
                 let budget = match info.max_uses {
                     Some(_) => format!("{remaining} more call(s)"),
                     None => "further calls".to_string(),
@@ -1372,6 +1446,14 @@ async fn report_reuse_budget(
                 eprintln!(
                     "keychute: grant {grant_id} approved until {} — good for {budget}; \
                      reuse it with `--grant-id {grant_id}` (no second approval)",
+                    info.not_after.to_rfc3339()
+                );
+            } else if info.revoked {
+                eprintln!("keychute: grant {grant_id} has been revoked; it cannot be reused");
+            } else if spent {
+                eprintln!(
+                    "keychute: grant {grant_id} expired at {} — its TTL ran out during this \
+                     call, so there is nothing left to reuse",
                     info.not_after.to_rfc3339()
                 );
             } else {
@@ -1608,6 +1690,14 @@ mod tests {
         assert!(parse_target("https://api.example.com/v1?amount=1\n000").is_err());
         assert!(parse_target("https://api.example.com/v1\t/x").is_err());
         assert!(parse_target("https://api.example.com/v1?a=1\r").is_err());
+        // The rest of the C0 controls are deleted at the ENDS instead, which
+        // the approval text and the call binding would still have carried.
+        assert!(parse_target("https://api.example.com/v1?to=alice\u{0}").is_err());
+        assert!(parse_target("\u{1}https://api.example.com/v1").is_err());
+        assert!(parse_target("https://api.example.com/v1?a=1\u{7f}").is_err());
+        // Spaces at either end are trimmed the same way.
+        assert!(parse_target("https://api.example.com/v1?a=1 ").is_err());
+        assert!(parse_target(" https://api.example.com/v1").is_err());
         // Percent-encoded, they are ordinary bytes and survive verbatim.
         assert_eq!(
             parse_target("https://api.example.com/v1?amount=1%0A000")
@@ -1779,6 +1869,42 @@ mod tests {
         );
         std::fs::remove_file(&dir).unwrap();
         assert!(read_body(&body_args(Some("@/nonexistent/keychute-test"), None, None)).is_err());
+    }
+
+    #[test]
+    fn the_output_cannot_create_the_body_it_is_about_to_read() {
+        // `-d @payload -o payload`. Opening the output first would create the
+        // missing input, and the invocation that deserved "no such file" would
+        // instead spend an approval sending an empty body.
+        let dir = std::env::temp_dir().join(format!("keychute-io-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let shared = dir.join("payload");
+
+        let mut args = body_args(Some(&format!("@{}", shared.display())), None, None);
+        args.output = Some(shared.clone());
+        let err = open_body_sources(&args).unwrap_err();
+        assert_eq!(err.code, EXIT_CONFIG);
+        assert!(
+            err.message.contains("cannot read body file"),
+            "{}",
+            err.message
+        );
+        assert!(
+            !shared.exists(),
+            "nothing was created on the way to failing"
+        );
+
+        // With the input actually there, the handle is taken before the output
+        // opens, so the original bytes are what gets sent.
+        std::fs::write(&shared, b"a=1").unwrap();
+        let sources = open_body_sources(&args).unwrap();
+        assert!(open_output(&args).unwrap().is_some());
+        assert_eq!(
+            read_body_with(&args, 1024, sources).unwrap().unwrap(),
+            b"a=1"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -112,7 +112,7 @@ oidc:
 #       apiTokenSha256: "0000000000000000000000000000000000000000000000000000000000000000"
 #   - name: k8s-agent
 #     maxTier: cooperating-client
-#     mechanisms: [cli-read]
+#     mechanisms: [brokered, cli-read]
 #     # Optional, default false: allows `keychute store` (POST /v1/secrets) to
 #     # deposit NEW secrets. Never permits replacing an existing one.
 #     mayStoreSecrets: true
