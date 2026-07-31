@@ -269,6 +269,22 @@ pub(crate) fn parse_target(raw: &str) -> Result<Target, String> {
              is not the host it targets, and Keychute supplies the credential anyway"
         ));
     }
+    if raw.contains('\\') {
+        // The WHATWG parser treats `\` as a path separator; the raw extractor
+        // below does not, and neither does the server. For
+        // `https://api.example\admin` the parser reads the path as `/admin`
+        // while the raw scanner reads `/` — the URL means two different things
+        // depending on who reads it, which is exactly the ambiguity approval
+        // cannot survive. The server's `policy::paths::canonicalize` refuses
+        // raw backslashes too; refuse here so the human is never asked to
+        // approve a target whose meaning is disputed.
+        return Err(format!(
+            "refusing URL with a backslash {raw:?}: URL parsers treat `\\` as a path \
+             separator and Keychute does not, so the target is ambiguous. Use `/`. \
+             (Keychute rejects `\\` in a path in every spelling, encoded included; \
+             in a query string, percent-encode it as %5C.)"
+        ));
+    }
     if url.fragment().is_some() {
         return Err(format!(
             "URL fragment in {raw:?} is never sent to a server; drop it"
@@ -579,14 +595,21 @@ pub(crate) fn call_bound_idempotency_key(user_key: &str, method: &str, target: &
     let mut hasher = Sha256::new();
     // Length-prefixed so no two different calls can produce the same preimage
     // by shifting a delimiter across fields.
-    for field in [
-        method,
-        &target.origin.to_display(),
-        &target.path,
-        target.query.as_deref().unwrap_or(""),
-    ] {
+    for field in [method, &target.origin.to_display(), &target.path] {
         hasher.update((field.len() as u64).to_be_bytes());
         hasher.update(field.as_bytes());
+    }
+    // A discriminator, not just the bytes: `/transfer` and `/transfer?` differ
+    // in the request target actually sent, and an upstream is entitled to tell
+    // them apart. Without this they hash alike, so the second run resumes the
+    // first one's approval and proxies the other target under it.
+    match &target.query {
+        None => hasher.update([0u8]),
+        Some(q) => {
+            hasher.update([1u8]);
+            hasher.update((q.len() as u64).to_be_bytes());
+            hasher.update(q.as_bytes());
+        }
     }
     let digest = hex::encode(hasher.finalize());
     format!("{user_key}-{}", &digest[..16])
@@ -1192,6 +1215,12 @@ async fn proxy_call(
         // both pass through intact. Rendering them through a lossy UTF-8
         // conversion would silently substitute replacement characters into
         // output whose whole purpose is to show what actually arrived.
+        // The version is a fixed placeholder ON PURPOSE. These headers are the
+        // UPSTREAM's, relayed by the proxy; the upstream's negotiated protocol
+        // is not carried across and this process never spoke to it. The only
+        // version available here is the CLI's own connection to Keychute, which
+        // describes a different hop entirely — printing it would state
+        // something false about the response being shown.
         let mut head: Vec<u8> = format!("HTTP/1.1 {status}\r\n").into_bytes();
         for (name, value) in resp.headers() {
             head.extend_from_slice(name.as_str().as_bytes());
@@ -1569,6 +1598,16 @@ mod tests {
         let other_host = parse_target("https://other.example/transfer?to=trusted").unwrap();
         assert_ne!(key, call_bound_idempotency_key("k1", "POST", &other_host));
         assert_ne!(key, call_bound_idempotency_key("k1", "GET", &base));
+        // An absent query and an empty one are different request targets —
+        // `/transfer?` really is sent with the `?` — so they must not alias.
+        let no_query = parse_target("https://api.example.com/transfer").unwrap();
+        let empty_query = parse_target("https://api.example.com/transfer?").unwrap();
+        assert_eq!(no_query.query, None);
+        assert_eq!(empty_query.query.as_deref(), Some(""));
+        assert_ne!(
+            call_bound_idempotency_key("k1", "POST", &no_query),
+            call_bound_idempotency_key("k1", "POST", &empty_query)
+        );
         // A different caller key is still a different request.
         assert_ne!(key, call_bound_idempotency_key("k2", "POST", &base));
         // Length-prefixing: no field boundary can be shifted to collide.
@@ -1610,6 +1649,24 @@ mod tests {
         let t = parse_target("https://api.example.com?x=1").unwrap();
         assert_eq!(t.path, "/");
         assert_eq!(t.query.as_deref(), Some("x=1"));
+        // A backslash makes the URL mean two things at once — the WHATWG
+        // parser reads `https://api.example\admin` as `/admin`, the raw
+        // extractor as `/` — so it is refused rather than approved as one and
+        // sent as the other.
+        for raw in [
+            "https://api.example\\admin",
+            "https://api.example.com/a\\b",
+            "https://api.example.com/v1?x=a\\b",
+        ] {
+            let err = parse_target(raw).unwrap_err();
+            assert!(err.contains("backslash"), "{raw}: {err}");
+        }
+        // Encoded, no parser rewrites it, so it reaches the server intact and
+        // the server is the one that refuses it — same deference as a dot
+        // segment: no local canonical form, so no local coverage claim.
+        let t = parse_target("https://api.example.com/a%5Cb").unwrap();
+        assert_eq!(t.path, "/a%5Cb");
+        assert!(canonical_path(&t.path).is_none());
         // A port in the authority is not mistaken for the path.
         let t = parse_target("https://api.example.com:8443/v1").unwrap();
         assert_eq!(t.path, "/v1");
