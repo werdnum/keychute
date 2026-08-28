@@ -40,8 +40,4 @@ spec:
     redirectURL: {{ printf "https://%s%s" .Values.ingress.host .Values.ingress.oidc.redirectPath | quote }}
     logoutPath: {{ .Values.ingress.oidc.logoutPath | quote }}
     forwardAccessToken: true
-    refreshToken: {{ .Values.ingress.oidc.refreshToken }}
-    cookieNames:
-      accessToken: {{ .Values.ingress.oidc.cookieNames.accessToken | quote }}
-      idToken: {{ .Values.ingress.oidc.cookieNames.idToken | quote }}
 {{- end }}

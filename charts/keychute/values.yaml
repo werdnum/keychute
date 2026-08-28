@@ -252,16 +252,6 @@ ingress:
     scopes: [openid, profile, email, groups]
     redirectPath: /oauth2/callback
     logoutPath: /logout
-    # Keychute is a short-lived approval UI, not a long-running browser app.
-    # Let an expired access token take the normal Keycloak SSO redirect instead
-    # of retaining a large, week-long refresh token in every request cookie.
-    refreshToken: false
-    # Envoy Gateway otherwise generates cookie-name suffixes. Stable,
-    # host-specific names avoid accumulating stale access/ID cookie sets after
-    # gateway configuration changes.
-    cookieNames:
-      accessToken: KeychuteAccessToken
-      idToken: KeychuteIdToken
 # Gateway API BackendTLSPolicy so the gateway-to-Service hop speaks TLS — the
 # backend refuses plaintext. Both `targetRefs` and `validation.caCertificateRefs`
 # are namespace-local, so this policy and the CA bundle ConfigMap live in the
