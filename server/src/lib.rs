@@ -17,6 +17,20 @@ use anyhow::Context;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+// Envoy Gateway's OIDC filter forwards the access token and keeps its session
+// tokens in cookies.  An authenticated browser request can therefore exceed
+// hyper's 16 KiB HTTP/2 default even though Envoy's own request-header budget
+// still accepts it.  Keep the application ceiling aligned with the gateway so
+// the backend cannot turn an otherwise valid approval POST into a bare 431.
+const HTTP2_MAX_HEADER_LIST_SIZE: u32 = 64 * 1024;
+
+fn configure_http_server<A>(server: &mut axum_server::Server<A>) {
+    server
+        .http_builder()
+        .http2()
+        .max_header_list_size(HTTP2_MAX_HEADER_LIST_SIZE);
+}
+
 /// Resolves on SIGTERM (Kubernetes rollout / `docker stop`) or Ctrl-C.
 ///
 /// SIGKILL is deliberately absent because it cannot be caught: the e2e harness
@@ -99,16 +113,14 @@ pub async fn run(config: config::Config) -> anyhow::Result<()> {
                 axum_server::tls_rustls::RustlsConfig::from_pem_file(&tls.cert_path, &tls.key_path)
                     .await
                     .context("loading TLS cert/key")?;
-            axum_server::bind_rustls(addr, rustls_config)
-                .handle(handle)
-                .serve(app.into_make_service())
-                .await
+            let mut server = axum_server::bind_rustls(addr, rustls_config);
+            configure_http_server(&mut server);
+            server.handle(handle).serve(app.into_make_service()).await
         }
         None => {
-            axum_server::bind(addr)
-                .handle(handle)
-                .serve(app.into_make_service())
-                .await
+            let mut server = axum_server::bind(addr);
+            configure_http_server(&mut server);
+            server.handle(handle).serve(app.into_make_service()).await
         }
     };
 
@@ -134,4 +146,43 @@ pub async fn run(config: config::Config) -> anyhow::Result<()> {
     }
     serve_result?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{routing::get, Router};
+
+    #[tokio::test]
+    async fn configured_http2_server_accepts_oidc_sized_headers() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = axum_server::Handle::new();
+        let mut server = axum_server::from_tcp(listener);
+        configure_http_server(&mut server);
+        let app = Router::new().route("/healthz", get(|| async { "ok" }));
+        let task_handle = handle.clone();
+        let task = tokio::spawn(async move {
+            server
+                .handle(task_handle)
+                .serve(app.into_make_service())
+                .await
+        });
+
+        let client = reqwest::Client::builder()
+            .http2_prior_knowledge()
+            .build()
+            .unwrap();
+        let response = client
+            .get(format!("http://{addr}/healthz"))
+            .header("x-oidc-session-probe", "x".repeat(32 * 1024))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.version(), reqwest::Version::HTTP_2);
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        handle.graceful_shutdown(None);
+        task.await.unwrap().unwrap();
+    }
 }
