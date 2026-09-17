@@ -123,7 +123,9 @@ struct StoreArgs {
     description: String,
     /// Most permissive delivery this secret may ever get: brokered,
     /// trusted-client, cooperating-client or direct. Defaults to the tightest
-    /// (brokered) and may not exceed this client's own maximum tier.
+    /// (brokered). It caps the SECRET, not this client: it may name a tier
+    /// above this client's own maximum, and every release is still bounded by
+    /// the releasing client's cap and by an operator decision.
     #[arg(long, default_value = "brokered")]
     max_tier: String,
     /// How the brokered proxy injects this credential: bearer, header, basic.

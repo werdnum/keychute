@@ -12,9 +12,12 @@
 //!   cannot replace credential bytes an operator reviewed, and cannot silently
 //!   substitute the credential behind a standing grant. Rotation stays on
 //!   `POST /ui/secrets` behind human auth.
-//! - **Tier capped.** The deposited `max_tier` defaults to `brokered` (the
-//!   tightest) and may not exceed the depositing client's own cap, so a
-//!   deposit cannot mint a secret more releasable than its depositor.
+//! - **Tier defaulted, not capped.** The deposited `max_tier` defaults to
+//!   `brokered` (the tightest) but may name any tier, including one above the
+//!   depositing client's own cap: the cap is a ceiling on the SECRET, and
+//!   every release is still bounded by the releasing client's cap and by a
+//!   human decision (deposits land unvetted). Depositing a credential is not
+//!   a claim to be trusted with it.
 //! - **No tags.** Tag membership selects policy rows; a client that could tag
 //!   its own deposit could choose which approval rules apply to it.
 //! - **Rate capped.** `limits.max_deposits_per_hour_per_client` bounds how much
@@ -156,16 +159,14 @@ async fn store_inner(
     let value = SecretBox::new(plaintext.as_slice().into());
     plaintext.zeroize();
 
-    // A deposit may not out-rank its depositor: a tier-2 client cannot mint a
-    // secret that a tier-3 mechanism would be allowed to release.
-    let client_max = Tier::from_int(client.row.max_tier)
-        .ok_or_else(|| ApiFailure::Internal(anyhow::anyhow!("client has an unknown max_tier")))?;
+    // The deposited cap is the secret's own ceiling, not a grant to its
+    // depositor: what any client may actually be released is still the
+    // minimum of that cap, the RELEASING client's own cap, and a human
+    // decision (the deposit lands unvetted, so no standing row can satisfy
+    // it). A depositor therefore gains nothing by naming a tier above its
+    // own — it just does not have to be trusted at tier 3 to hand Keychute
+    // a credential that will one day be released at tier 3.
     let max_tier = req.max_tier.unwrap_or(Tier::Brokered);
-    if max_tier > client_max {
-        return Err(ApiFailure::InvalidRequest(
-            "max_tier exceeds the client's own maximum tier",
-        ));
-    }
 
     let (injection_kind, injection_header, injection_username) = validate_injection(
         req.injection_kind.as_deref().unwrap_or("bearer"),

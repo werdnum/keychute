@@ -2,7 +2,7 @@
 //!
 //! The deposit path is the one client write that carries credential bytes INTO
 //! Keychute, so these tests pin its guardrails as much as its happy path: the
-//! config opt-in, create-only (never a rotation), and the tier cap.
+//! config opt-in, create-only (never a rotation), and the tier it names.
 
 use keychute_e2e::*;
 use std::io::Write;
@@ -201,27 +201,41 @@ async fn cli_store_refuses_to_replace_an_existing_secret() {
     assert_eq!(out.stdout, b"operator-value");
 }
 
-/// A deposit may not out-rank its depositor: k8s-agent is capped at tier 2.
+/// A deposit may out-rank its depositor: k8s-agent is capped at tier 2, but
+/// the tier it names caps the SECRET, not itself — it can hand Keychute a
+/// credential a tier-3 consumer will collect without being trusted at tier 3.
+/// The release side is unchanged: the deposit lands unvetted, so getting the
+/// bytes back still needs an operator.
 #[tokio::test(flavor = "multi_thread")]
-async fn cli_store_rejects_a_tier_above_the_client_cap() {
+async fn cli_stores_a_tier_above_the_client_cap() {
     let env = TestEnv::spawn(SpawnOpts::default()).await.unwrap();
 
     let (code, _, stderr) = run_cli_with_stdin(
         &env,
-        &["store", "too-hot", "--max-tier", "direct"],
+        &["store", "for-a-hotter-client", "--max-tier", "direct"],
         b"value\n",
     );
-    assert_eq!(code, 1, "rejected: {stderr}");
-    assert!(
-        stderr.contains("max_tier exceeds"),
-        "reason surfaced: {stderr}"
-    );
+    assert_eq!(code, 0, "store failed: {stderr}");
 
-    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM secrets WHERE name = 'too-hot'")
-        .fetch_one(&env.db)
-        .await
-        .unwrap();
-    assert_eq!(count, 0, "nothing was stored");
+    let (max_tier, vetted): (i32, bool) = sqlx::query_as(
+        "SELECT max_tier, operator_vetted FROM secrets WHERE name = 'for-a-hotter-client'",
+    )
+    .fetch_one(&env.db)
+    .await
+    .unwrap();
+    assert_eq!(
+        max_tier, 3,
+        "the secret carries the tier it was deposited at"
+    );
+    assert!(!vetted, "a deposit still lands unvetted");
+
+    // And the depositor gained no release power: its own request is still a
+    // pending decision, not a handout.
+    let cli = spawn_request_cli(&env, &["request", "for-a-hotter-client", "--timeout", "30"]);
+    let request_id = wait_pending_request_id(&env).await;
+    env.approve(&request_id, &[]).await.unwrap();
+    let out = cli.wait_with_output().expect("waiting for CLI");
+    assert_eq!(out.stdout, b"value");
 }
 
 /// The endpoint is opt-in per client: family-assistant has no

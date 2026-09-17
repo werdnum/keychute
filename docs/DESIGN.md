@@ -141,9 +141,13 @@ so the agent can choose the weaker one by default.
    - it is **create-only** — an existing name is a 409, never a rotation, so a
      compromised client cannot substitute the credential behind a standing grant
      or overwrite bytes an operator reviewed. Rotation stays operator-only;
-   - the new secret's `max_tier` defaults to `brokered` and may not exceed the
-     depositing client's own cap, so a deposit cannot mint something more
-     releasable than its depositor;
+   - the new secret's `max_tier` defaults to `brokered`, the tightest. It may
+     name a tier above the depositing client's own cap: the cap is a ceiling on
+     the SECRET, and a deposit mints no release power for its depositor — every
+     release is still bounded by the RELEASING client's cap and, because the
+     deposit lands unvetted (below), by a human decision. Requiring otherwise
+     would force an operator to trust an agent at tier 3 merely so it can hand
+     Keychute a credential a tier-3 consumer will collect;
    - the client may not tag its deposit, because tags select policy rows —
      self-tagging would be self-selecting its own approval rules;
    - a per-client hourly deposit cap, decided inside the deposit's own

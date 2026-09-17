@@ -224,8 +224,10 @@ Client authn: `Authorization: Bearer <api-token>` or
   → `201 {"secret_id": "...", "name": "...", "version": 1}`.
   Guardrails, all server-enforced: the client must have `may_store_secrets` in
   config (else `403 policy-denied`); the endpoint is **create-only**, so an
-  existing name is `409 secret-exists` and never a rotation; `max_tier` may not
-  exceed the client's own cap (`400`); tags cannot be set by a client (tag
+  existing name is `409 secret-exists` and never a rotation; `max_tier` caps the
+  secret and may name a tier above the depositing client's own cap (releases
+  stay bounded by the releasing client's cap and, while unvetted, by a human);
+  tags cannot be set by a client (tag
   membership selects policy rows); `429 too-many-deposits` past
   `limits.max_deposits_per_hour_per_client` — counted off the audit log inside
   the deposit's own transaction, behind a per-client advisory lock, so
