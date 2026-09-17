@@ -370,7 +370,10 @@ pub struct StoreSecretRequest {
     #[serde(default)]
     pub description: String,
     /// Most permissive delivery this secret will ever allow. Defaults to
-    /// `brokered` (the tightest), and may not exceed the client's own cap.
+    /// `brokered` (the tightest). It caps the SECRET, not the depositing
+    /// client, so it may name a tier above that client's own cap: every
+    /// release is still bounded by the releasing client's cap and, while the
+    /// deposit is unvetted, by an operator decision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tier: Option<Tier>,
     /// 'bearer' | 'header' | 'basic' (alias 'basic-password'). Default 'bearer'.
