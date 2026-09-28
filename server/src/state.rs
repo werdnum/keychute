@@ -41,10 +41,7 @@ impl std::ops::Deref for AppState {
 impl AppState {
     pub async fn init(config: Config) -> anyhow::Result<AppState> {
         let keyset = Keyset::load(&config.kek_file)?;
-        let db = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(20)
-            .connect(config.database_url())
-            .await?;
+        let db = crate::db::connect(config.database_url(), 20).await?;
         sqlx::migrate!("../migrations").run(&db).await?;
         crate::db::reconcile_clients(&db, &config.clients).await?;
 
