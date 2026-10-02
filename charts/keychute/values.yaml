@@ -39,7 +39,7 @@ image:
   # keeps the chart out of the `digest: ""` state in git, and it is the digest
   # the k8s-agent image in kube-config lifts the client CLI out of, so server
   # and CLI ship as a matched pair.
-  digest: "sha256:d134a8b0039cf57c9051c38303a6b18e4fec1b4cf41b8ca5cd8953e9ee5617da"
+  digest: "sha256:29388d3b19d806f407cf883b4644d0e35b91f4988ff6762f5fe1df890a948c84"
   tag: "latest"
   pullPolicy: IfNotPresent
 # imagePullSecrets are mirrored into the namespace out-of-band (e.g. by the
@@ -121,7 +121,6 @@ oidc:
 #         audience: keychute.andrewgarrett.dev
 #         subject: "system:serviceaccount:k8s-agent:k8s-agent"
 clients: []
-
 # ---------------------------------------------------------------------------
 # Provisioned secrets (GitOps). Each value is read from a key of an existing
 # Kubernetes Secret (sealed or reflected in by the deployment; this chart
@@ -147,7 +146,6 @@ clients: []
 #     service: s3
 # ---------------------------------------------------------------------------
 secrets: []
-
 # ---------------------------------------------------------------------------
 # Provisioned standing policies, reconciled at startup like `secrets`. Same
 # fields and validation as the UI's "Create policy" form; the UI will not
