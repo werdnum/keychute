@@ -79,6 +79,13 @@ pub fn parse_scope(scope: &str) -> Result<(&str, &str), &'static str> {
             return Err("SigV4 region and service must be lowercase letters, digits and '-'");
         }
     }
+    // Grant constraints are method + path. S3 selects its operation from
+    // those (plus query subresources the credential's own policy bounds);
+    // JSON- and query-protocol services pick it from `X-Amz-Target` or an
+    // `Action` parameter on a shared `POST /`, which constraints cannot see.
+    if service != "s3" {
+        return Err("SigV4 service must be 's3'; other AWS services are not supported");
+    }
     Ok((region, service))
 }
 
@@ -166,16 +173,6 @@ pub fn wire_path(decoded_path: &str) -> String {
     uri_encode(decoded_path, true)
 }
 
-/// Canonical URI. S3 signs the single-encoded path; every other AWS service
-/// signs it encoded a second time (the SigV4 spec's general rule).
-pub fn canonical_uri(service: &str, wire_path: &str) -> String {
-    if service == "s3" {
-        wire_path.to_owned()
-    } else {
-        uri_encode(wire_path, true)
-    }
-}
-
 fn hmac(key: &[u8], data: &[u8]) -> Zeroizing<Vec<u8>> {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(data);
@@ -228,7 +225,7 @@ pub fn sign(
     headers.push(("host".into(), req.host.to_owned()));
     headers.push(("x-amz-content-sha256".into(), content_sha256.clone()));
     headers.push(("x-amz-date".into(), amz_date.clone()));
-    headers.sort();
+    headers.sort_by(|a, b| a.0.cmp(&b.0));
     // Repeated header names fold into one comma-joined line.
     let mut folded: Vec<(String, String)> = Vec::new();
     for (k, v) in headers {
@@ -250,7 +247,7 @@ pub fn sign(
     let canonical_request = format!(
         "{}\n{}\n{}\n{}\n{}\n{}",
         req.method,
-        canonical_uri(scope.service, req.wire_path),
+        req.wire_path,
         canonical_query(req.query),
         canonical_headers,
         signed_headers,
@@ -293,6 +290,7 @@ mod tests {
         assert!(parse_scope("US-EAST-1/s3").is_err());
         assert!(parse_scope("us-east-1/s3/x").is_err());
         assert!(parse_scope("/s3").is_err());
+        assert!(parse_scope("us-east-1/dynamodb").is_err());
         assert!(validate_access_key_id("AKIAIOSFODNN7EXAMPLE").is_ok());
         assert!(validate_access_key_id("a/b").is_err());
         assert!(validate_access_key_id("").is_err());
@@ -303,8 +301,6 @@ mod tests {
         assert_eq!(uri_encode("a b/c~d", true), "a%20b/c~d");
         assert_eq!(uri_encode("a b/c", false), "a%20b%2Fc");
         assert_eq!(wire_path("/bucket/my key!.jpg"), "/bucket/my%20key%21.jpg");
-        assert_eq!(canonical_uri("s3", "/a%20b"), "/a%20b");
-        assert_eq!(canonical_uri("execute-api", "/a%20b"), "/a%2520b");
         assert_eq!(
             canonical_query(Some("prefix=a+b&list-type=2&delimiter=%2F&acl")),
             "acl=&delimiter=%2F&list-type=2&prefix=a%20b"
@@ -372,26 +368,32 @@ mod tests {
     }
 
     #[test]
-    fn matches_botocore_non_s3_double_encoding() {
+    fn repeated_header_values_keep_their_order() {
         let scope = Scope {
             access_key_id: "AKIDEXAMPLE",
-            region: "ap-southeast-2",
-            service: "execute-api",
+            region: "us-east-1",
+            service: "s3",
         };
-        let signed = sign(
-            &scope,
-            b"wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
-            &Request {
-                method: "POST",
-                host: "api.example.dev",
-                wire_path: &wire_path("/v1/a b"),
-                query: Some("q=1"),
-                extra_signed_headers: vec![],
-                payload: b"{}",
-            },
-            at("20261002T010203Z"),
-        );
-        assert_eq!(signed.authorization, BOTOCORE_EXECUTE_API_POST);
+        let sign_with = |values: [&str; 2]| {
+            sign(
+                &scope,
+                b"secret",
+                &Request {
+                    method: "GET",
+                    host: "minio.example.dev",
+                    wire_path: "/b/k",
+                    query: None,
+                    extra_signed_headers: values
+                        .iter()
+                        .map(|v| ("x-amz-meta-a".to_owned(), (*v).to_owned()))
+                        .collect(),
+                    payload: b"",
+                },
+                at("20261002T010203Z"),
+            )
+            .authorization
+        };
+        assert_ne!(sign_with(["z", "a"]), sign_with(["a", "z"]));
     }
 
     const BOTOCORE_S3_GET: &str = "AWS4-HMAC-SHA256 \
@@ -402,10 +404,4 @@ mod tests {
         Credential=AKIDEXAMPLE/20261002/us-east-1/s3/aws4_request, \
         SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-meta-note, \
         Signature=74b7e9c9103aa7753082736cff2bb3f7d14c101e108230c6c35d69590eec7220";
-    // botocore's plain SigV4Auth only signs x-amz-content-sha256 when the
-    // request already carries it; the vector was computed with it present.
-    const BOTOCORE_EXECUTE_API_POST: &str = "AWS4-HMAC-SHA256 \
-        Credential=AKIDEXAMPLE/20261002/ap-southeast-2/execute-api/aws4_request, \
-        SignedHeaders=host;x-amz-content-sha256;x-amz-date, \
-        Signature=c1bc26272898e3fa5001dc85c9c410f239042f26e16cb2f9e0bf7489933b2ec8";
 }

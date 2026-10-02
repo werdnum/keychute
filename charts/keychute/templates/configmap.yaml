@@ -117,11 +117,11 @@ data:
         origins: {{ .origins | default list | toJson }}
         methods: {{ .methods | default list | toJson }}
         path_prefixes: {{ .pathPrefixes | default list | toJson }}
-        {{- with .maxTtlSeconds }}
-        max_ttl_seconds: {{ . | int64 }}
+        {{- if hasKey . "maxTtlSeconds" }}
+        max_ttl_seconds: {{ .maxTtlSeconds | int64 }}
         {{- end }}
-        {{- with .maxUses }}
-        max_uses: {{ . | int64 }}
+        {{- if hasKey . "maxUses" }}
+        max_uses: {{ .maxUses | int64 }}
         {{- end }}
         {{- with .notAfter }}
         not_after: {{ . | quote }}

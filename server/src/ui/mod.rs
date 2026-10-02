@@ -2811,7 +2811,7 @@ async fn secrets_page(State(state): State<AppState>, headers: HeaderMap) -> UiRe
                             "SigV4 scope"
                             input type="text" name="injection_scope" placeholder="us-east-1/s3"
                                 autocapitalize="off" autocorrect="off" spellcheck="false";
-                            span .muted { "Only for " b { "aws-sigv4" } ": region/service. The value is the secret access key." }
+                            span .muted { "Only for " b { "aws-sigv4" } ": region/s3 (S3 only). The value is the secret access key." }
                         }
                     }
                     div .actions-bar {

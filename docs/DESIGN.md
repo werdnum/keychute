@@ -408,7 +408,9 @@ the ciphertext-only design removes the main reason to isolate.
   `Authorization: Bearer {secret}`; alternatively a named custom header, Basic
   auth, or AWS SigV4 request signing, where the secret is a secret access key
   and the proxy computes a signature over each forwarded request, which is how
-  S3-compatible stores (MinIO, R2, B2) and AWS APIs authenticate —
+  S3-compatible stores (MinIO, R2, B2) authenticate (S3 only: services that
+  select the operation from a header or parameter on a shared `POST /` would
+  escape the method/path constraints) —
   query-parameter placement is deliberately unsupported, since URLs land
   in upstream access logs, traces, and client error values, which would break the
   never-logged invariant). Injection placement is never taken from the

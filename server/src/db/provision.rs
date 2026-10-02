@@ -287,7 +287,8 @@ fn policy_key(p: &NewPolicy) -> serde_json::Value {
         p.path_prefixes,
         p.max_ttl_seconds,
         p.max_uses,
-        p.not_after,
+        // Postgres keeps microseconds; config may carry more.
+        p.not_after.map(|t| t.timestamp_micros()),
     ])
 }
 
