@@ -23,6 +23,9 @@ pub struct SecretRow {
     /// one reviews it (migration 0007): the policy engine keeps such a secret
     /// under the same "never auto-approve" clamp as one that does not exist.
     pub operator_vetted: bool,
+    /// Provisioned from config (migration 0009): reconciled at startup, and
+    /// read-only in the UI.
+    pub managed_by_config: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

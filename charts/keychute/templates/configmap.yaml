@@ -73,6 +73,60 @@ data:
             subject: {{ .subject | quote }}
           {{- end }}
       {{- end }}
+    secrets:{{ if not .Values.secrets }} []{{ end }}
+      {{- range .Values.secrets }}
+      - name: {{ .name | quote }}
+        description: {{ .description | default "" | quote }}
+        max_tier: {{ .maxTier | default "brokered" | quote }}
+        tags: {{ .tags | default list | toJson }}
+        value_file: {{ printf "/etc/keychute/provisioned/%s/%s" .valueFrom.secretName .valueFrom.key | quote }}
+        {{- with .injection }}
+        injection:
+          kind: {{ .kind | default "bearer" | quote }}
+          {{- with .header }}
+          header: {{ . | quote }}
+          {{- end }}
+          {{- with (.username | default .accessKeyId) }}
+          username: {{ . | quote }}
+          {{- end }}
+          {{- with (.usernameFrom | default .accessKeyIdFrom) }}
+          username_file: {{ printf "/etc/keychute/provisioned/%s/%s" .secretName .key | quote }}
+          {{- end }}
+          {{- with .region }}
+          region: {{ . | quote }}
+          {{- end }}
+          {{- with .service }}
+          service: {{ . | quote }}
+          {{- end }}
+        {{- end }}
+      {{- end }}
+    policies:{{ if not .Values.policies }} []{{ end }}
+      {{- range .Values.policies }}
+      - mechanism: {{ .mechanism | quote }}
+        outcome: {{ .outcome | quote }}
+        {{- with .client }}
+        client: {{ . | quote }}
+        {{- end }}
+        {{- with .secret }}
+        secret: {{ . | quote }}
+        {{- end }}
+        {{- with .secretTag }}
+        secret_tag: {{ . | quote }}
+        {{- end }}
+        priority: {{ .priority | default 0 | int64 }}
+        origins: {{ .origins | default list | toJson }}
+        methods: {{ .methods | default list | toJson }}
+        path_prefixes: {{ .pathPrefixes | default list | toJson }}
+        {{- with .maxTtlSeconds }}
+        max_ttl_seconds: {{ . | int64 }}
+        {{- end }}
+        {{- with .maxUses }}
+        max_uses: {{ . | int64 }}
+        {{- end }}
+        {{- with .notAfter }}
+        not_after: {{ . | quote }}
+        {{- end }}
+      {{- end }}
     {{- if .Values.tokenreview.enabled }}
     tokenreview_url: {{ .Values.tokenreview.url | quote }}
     tokenreview_token_path: {{ .Values.tokenreview.tokenPath | quote }}

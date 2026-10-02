@@ -649,3 +649,243 @@ async fn create_secret_from_client_never_replaces_an_existing_secret() -> anyhow
     t.teardown().await;
     Ok(())
 }
+
+fn provision_keyset() -> crate::crypto::Keyset {
+    use base64::Engine;
+    let dir = std::env::temp_dir().join(format!("keychute-provision-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("keyset.json");
+    let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+    std::fs::write(
+        &path,
+        serde_json::json!({
+            "active": "k0",
+            "keys": {"k0": b64(&[3u8; 32])},
+            "mac_key": b64(&[4u8; 32]),
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let ks = crate::crypto::Keyset::load(&path).unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+    ks
+}
+
+fn desired(name: &str, value: &[u8], tier: Tier) -> provision::DesiredSecret {
+    provision::DesiredSecret {
+        name: name.into(),
+        description: "from config".into(),
+        max_tier: tier.as_int(),
+        injection_kind: "aws-sigv4".into(),
+        injection_header: Some("us-east-1/s3".into()),
+        injection_username: Some("lake-media-read".into()),
+        tags: vec!["minio".into()],
+        value: crate::crypto::SecretBytes::new(value.into()),
+    }
+}
+
+async fn audit_count(db: &PgPool, kind: &str, secret: &str) -> anyhow::Result<i64> {
+    Ok(sqlx::query_scalar(
+        "SELECT count(*) FROM audit_log WHERE kind = $1 AND secret_name = $2 AND actor = 'config'",
+    )
+    .bind(kind)
+    .bind(secret)
+    .fetch_one(db)
+    .await?)
+}
+
+#[tokio::test]
+async fn provisioned_secrets_reconcile_idempotently() -> anyhow::Result<()> {
+    use provision::SecretChange;
+    let Some(t) = setup().await? else {
+        return Ok(());
+    };
+    let db = &t.pool;
+    let ks = provision_keyset();
+
+    // First start: created, vetted, managed, tagged.
+    let changes =
+        provision::reconcile_secrets(db, &ks, &[desired("s3", b"k1", Tier::Brokered)]).await?;
+    assert_eq!(changes, vec![("s3".to_owned(), SecretChange::Created)]);
+    let row = get_secret_by_name(db, "s3").await?.unwrap();
+    assert!(row.managed_by_config && row.operator_vetted);
+    assert_eq!(row.current_version, 1);
+    assert_eq!(row.injection_username.as_deref(), Some("lake-media-read"));
+    assert_eq!(
+        get_tags_for_secret(db, row.id).await?,
+        vec!["minio".to_owned()]
+    );
+
+    // Same config again: nothing written.
+    let changes =
+        provision::reconcile_secrets(db, &ks, &[desired("s3", b"k1", Tier::Brokered)]).await?;
+    assert_eq!(changes, vec![("s3".to_owned(), SecretChange::Unchanged)]);
+    assert_eq!(
+        get_secret_by_name(db, "s3").await?.unwrap().current_version,
+        1
+    );
+
+    // New bytes: rotated, metadata untouched.
+    let changes =
+        provision::reconcile_secrets(db, &ks, &[desired("s3", b"k2", Tier::Brokered)]).await?;
+    assert_eq!(
+        changes,
+        vec![(
+            "s3".to_owned(),
+            SecretChange::Updated {
+                metadata: false,
+                rotated: true
+            }
+        )]
+    );
+    let row = get_secret_by_name(db, "s3").await?.unwrap();
+    assert_eq!(row.current_version, 2);
+    let v = get_secret_version(db, row.id, 2).await?.unwrap();
+    let plain = ks.open(
+        &v.ciphertext,
+        &v.nonce,
+        &v.wrapped_dek,
+        &v.kek_id,
+        crate::crypto::AadContext::SecretVersion {
+            secret_id: row.id,
+            version: 2,
+        },
+    )?;
+    use secrecy::ExposeSecret;
+    assert_eq!(plain.expose_secret(), b"k2");
+    assert_eq!(
+        audit_count(db, audit::kinds::SECRET_ROTATED, "s3").await?,
+        1
+    );
+
+    // Metadata change only.
+    let changes =
+        provision::reconcile_secrets(db, &ks, &[desired("s3", b"k2", Tier::TrustedClient)]).await?;
+    assert_eq!(
+        changes,
+        vec![(
+            "s3".to_owned(),
+            SecretChange::Updated {
+                metadata: true,
+                rotated: false
+            }
+        )]
+    );
+    assert_eq!(
+        audit_count(db, audit::kinds::SECRET_UPDATED, "s3").await?,
+        1
+    );
+
+    // Dropped from config: deleted.
+    provision::reconcile_secrets(db, &ks, &[]).await?;
+    assert!(get_secret_by_name(db, "s3").await?.is_none());
+    assert_eq!(
+        audit_count(db, audit::kinds::SECRET_DELETED, "s3").await?,
+        1
+    );
+
+    t.teardown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn provisioning_adopts_but_never_deletes_unmanaged_secrets() -> anyhow::Result<()> {
+    let Some(t) = setup().await? else {
+        return Ok(());
+    };
+    let db = &t.pool;
+    let ks = provision_keyset();
+    // An operator-created row and an unvetted client deposit.
+    create_secret(db, "ui-made", "", 0, "bearer", None).await?;
+    let deposit = create_secret(db, "claimed", "", 0, "bearer", None).await?;
+    sqlx::query("UPDATE secrets SET operator_vetted = false WHERE id = $1")
+        .bind(deposit.id)
+        .execute(db)
+        .await?;
+
+    // Config claims "claimed": adopted, vetted, operator bytes rotated in.
+    provision::reconcile_secrets(db, &ks, &[desired("claimed", b"op", Tier::Brokered)]).await?;
+    let row = get_secret_by_name(db, "claimed").await?.unwrap();
+    assert!(row.managed_by_config && row.operator_vetted);
+    assert_eq!(row.injection_kind, "aws-sigv4");
+    assert_eq!(row.current_version, 1);
+
+    // Removing it from config deletes it; the UI-made row is never touched.
+    provision::reconcile_secrets(db, &ks, &[]).await?;
+    assert!(get_secret_by_name(db, "claimed").await?.is_none());
+    assert!(get_secret_by_name(db, "ui-made").await?.is_some());
+
+    t.teardown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn provisioned_policies_reconcile_by_content() -> anyhow::Result<()> {
+    let Some(t) = setup().await? else {
+        return Ok(());
+    };
+    let db = &t.pool;
+    let rule = |outcome: &str| NewPolicy {
+        client_name: Some("family-assistant".into()),
+        secret_name: Some("minio".into()),
+        secret_tag: None,
+        mechanism: "brokered".into(),
+        outcome: outcome.into(),
+        priority: 0,
+        origins: serde_json::json!([{"host": "minio.example.dev"}]),
+        methods: vec!["GET".into()],
+        path_prefixes: vec!["/lake-media/sha256".into()],
+        max_ttl_seconds: Some(600),
+        max_uses: None,
+        not_after: None,
+        created_by: provision::CONFIG_ACTOR.into(),
+    };
+    // A UI-made row is never touched by reconciliation.
+    insert_policy(db, &rule("deny")).await?;
+
+    let c = provision::reconcile_policies(db, &[rule("auto-approve")]).await?;
+    assert_eq!(
+        c,
+        provision::PolicyChanges {
+            created: 1,
+            deleted: 0
+        }
+    );
+    let id = list_policies(db)
+        .await?
+        .into_iter()
+        .find(|p| p.managed_by_config)
+        .unwrap()
+        .id;
+
+    // Unchanged config: same row, nothing written.
+    let c = provision::reconcile_policies(db, &[rule("auto-approve")]).await?;
+    assert_eq!(c, provision::PolicyChanges::default());
+    assert!(list_policies(db).await?.iter().any(|p| p.id == id));
+
+    // A changed rule replaces the row.
+    let c = provision::reconcile_policies(db, &[rule("notify-only")]).await?;
+    assert_eq!(
+        c,
+        provision::PolicyChanges {
+            created: 1,
+            deleted: 1
+        }
+    );
+
+    // Empty config: managed rows go, the UI row stays.
+    let c = provision::reconcile_policies(db, &[]).await?;
+    assert_eq!(
+        c,
+        provision::PolicyChanges {
+            created: 0,
+            deleted: 1
+        }
+    );
+    let left = list_policies(db).await?;
+    assert_eq!(left.len(), 1);
+    assert!(!left[0].managed_by_config);
+
+    t.teardown().await;
+    Ok(())
+}

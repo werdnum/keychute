@@ -10,6 +10,7 @@ pub mod injection;
 pub mod notify;
 pub mod policy;
 pub mod proxy;
+pub mod sigv4;
 pub mod state;
 pub mod ui;
 

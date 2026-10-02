@@ -405,8 +405,11 @@ the ciphertext-only design removes the main reason to isolate.
 - `secrets` — id, name, description, max_tier, created/updated, current_version,
   and an operator-managed **injection template** for brokered use: how the
   credential is placed on proxied requests (default
-  `Authorization: Bearer {secret}`; alternatively a named custom header or Basic
-  auth — query-parameter placement is deliberately unsupported, since URLs land
+  `Authorization: Bearer {secret}`; alternatively a named custom header, Basic
+  auth, or AWS SigV4 request signing, where the secret is a secret access key
+  and the proxy computes a signature over each forwarded request, which is how
+  S3-compatible stores (MinIO, R2, B2) and AWS APIs authenticate —
+  query-parameter placement is deliberately unsupported, since URLs land
   in upstream access logs, traces, and client error values, which would break the
   never-logged invariant). Injection placement is never taken from the
   requesting client — an agent that could choose the header could smuggle the
@@ -429,6 +432,15 @@ the ciphertext-only design removes the main reason to isolate.
   without imperative bootstrap or direct DB edits. API tokens are generated
   out-of-band by the operator; only their hashes appear in config (a hash of a
   high-entropy token is safe to commit).
+- **Provisioned secrets and policies.** The same config file may list secrets
+  (name, tier, tags, injection template, and a path to a file holding the
+  value, in Kubernetes a mounted Secret) and standing policy rows, so a
+  credential and the rule that releases it can ship together through GitOps
+  with no UI step. Startup reconciles them like clients: create, update,
+  rotate on changed bytes, and delete what the config dropped. Only rows the
+  config created or adopted are touched, and the UI treats those as read-only.
+  The values never enter git: the config holds file paths, and the files come
+  from Secrets the deployment already seals.
 - `policies` — (client, secret | secret-tag) → mechanism, tier, constraints
   (HTTPS origins, methods, path prefixes, autofill page origin), outcome
   (`auto-approve` / `notify-only` / `require-approval` / `deny`), expiry.

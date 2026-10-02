@@ -929,6 +929,7 @@ mod tests {
             not_after: None,
             created_by: "test".into(),
             created_at: Utc::now(),
+            managed_by_config: false,
         }
     }
 

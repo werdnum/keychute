@@ -583,6 +583,15 @@ impl TestEnv {
     }
 
     /// Restart the server against the same config + database.
+    /// Append top-level YAML (e.g. `secrets:` / `policies:`) to the server
+    /// config. Takes effect on the next [`TestEnv::restart_server`].
+    pub fn append_config(&self, yaml: &str) -> anyhow::Result<()> {
+        let mut config = std::fs::read_to_string(&self.config_path)?;
+        config.push_str(yaml);
+        std::fs::write(&self.config_path, config)?;
+        Ok(())
+    }
+
     pub async fn restart_server(&mut self) -> anyhow::Result<()> {
         self.stop_server();
         self.start_server().await

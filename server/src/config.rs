@@ -24,6 +24,13 @@ pub struct Config {
     pub human_auth: HumanAuthConfig,
     #[serde(default)]
     pub clients: Vec<ClientConfig>,
+    /// Secrets provisioned from files (GitOps): reconciled at startup, see
+    /// [`crate::db::provision`].
+    #[serde(default)]
+    pub secrets: Vec<SecretConfig>,
+    /// Standing policy rows provisioned from config, reconciled at startup.
+    #[serde(default)]
+    pub policies: Vec<PolicyConfig>,
     #[serde(default)]
     pub tokenreview_url: Option<String>,
     #[serde(default)]
@@ -118,6 +125,231 @@ pub struct ClientAuthConfig {
 pub struct ServiceAccountAuth {
     pub audience: String,
     pub subject: String,
+}
+
+/// A secret whose value comes from a file (in Kubernetes, a mounted Secret).
+///
+/// The config is the source of truth for every row it names: startup creates
+/// the row, updates its metadata, rotates in a new version when the file's
+/// bytes differ from the current one, and deletes rows that were provisioned
+/// from config but are no longer listed. The operator chose these bytes, so
+/// they are vetted; the UI refuses to rotate or delete them, since the next
+/// restart would undo it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecretConfig {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default = "default_secret_tier")]
+    pub max_tier: Tier,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub injection: InjectionConfig,
+    /// File holding the credential. One trailing newline (`\n` or `\r\n`) is
+    /// dropped, since files written by `echo` or editors end in one and no
+    /// credential header can carry it.
+    pub value_file: PathBuf,
+}
+
+fn default_secret_tier() -> Tier {
+    Tier::Brokered
+}
+
+/// Injection template for a provisioned secret. Same kinds and rules as the
+/// UI (`crate::injection::validate_injection`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InjectionConfig {
+    /// `bearer` | `header` | `basic` | `aws-sigv4`.
+    #[serde(default = "default_injection_kind")]
+    pub kind: String,
+    /// Header name, for kind `header`.
+    #[serde(default)]
+    pub header: Option<String>,
+    /// Basic-auth username, or the SigV4 access key id. Either inline or read
+    /// from a file (the access key id usually sits in the same Secret as the
+    /// secret key).
+    #[serde(default, alias = "access_key_id")]
+    pub username: Option<String>,
+    #[serde(default, alias = "access_key_id_file")]
+    pub username_file: Option<PathBuf>,
+    /// SigV4 region and service, for kind `aws-sigv4`.
+    #[serde(default)]
+    pub region: Option<String>,
+    #[serde(default)]
+    pub service: Option<String>,
+}
+
+fn default_injection_kind() -> String {
+    "bearer".into()
+}
+
+impl Default for InjectionConfig {
+    fn default() -> Self {
+        InjectionConfig {
+            kind: default_injection_kind(),
+            header: None,
+            username: None,
+            username_file: None,
+            region: None,
+            service: None,
+        }
+    }
+}
+
+/// Strip at most one trailing newline from a file-provided value.
+pub fn trim_one_newline(bytes: &[u8]) -> &[u8] {
+    bytes
+        .strip_suffix(b"\r\n")
+        .or_else(|| bytes.strip_suffix(b"\n"))
+        .unwrap_or(bytes)
+}
+
+impl InjectionConfig {
+    /// Resolve to the stored `(injection_kind, injection_header,
+    /// injection_username)` columns, reading `username_file` if set.
+    pub fn resolve(&self) -> anyhow::Result<(String, Option<String>, Option<String>)> {
+        let username = match (&self.username, &self.username_file) {
+            (Some(_), Some(_)) => bail!("set username or username_file, not both"),
+            (Some(u), None) => Some(u.clone()),
+            (None, Some(path)) => {
+                let raw =
+                    std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+                Some(
+                    String::from_utf8(trim_one_newline(&raw).to_vec())
+                        .with_context(|| format!("{} is not UTF-8", path.display()))?,
+                )
+            }
+            (None, None) => None,
+        };
+        let scope = match (&self.region, &self.service) {
+            (Some(r), Some(s)) => Some(format!("{r}/{s}")),
+            (None, None) => None,
+            _ => bail!("set both region and service, or neither"),
+        };
+        let free_text = match self.kind.as_str() {
+            "header" => self.header.clone(),
+            _ => {
+                if self.header.is_some() {
+                    bail!("`header` is only valid for injection kind 'header'");
+                }
+                username.clone()
+            }
+        };
+        if self.kind == "header" && username.is_some() {
+            bail!("`username` is not valid for injection kind 'header'");
+        }
+        if self.kind == "bearer" && username.is_some() {
+            bail!("`username` is not valid for injection kind 'bearer'");
+        }
+        crate::injection::validate_injection(&self.kind, free_text.as_deref(), scope.as_deref())
+            .map_err(|e| anyhow::anyhow!(e))
+    }
+}
+
+/// A standing policy row provisioned from config. Same fields and the same
+/// validation as the UI's "Create policy" form.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyConfig {
+    /// Client name; absent = any client.
+    #[serde(default)]
+    pub client: Option<String>,
+    /// Secret name; absent (with no `secret_tag`) = any secret.
+    #[serde(default)]
+    pub secret: Option<String>,
+    #[serde(default)]
+    pub secret_tag: Option<String>,
+    pub mechanism: Mechanism,
+    /// `auto-approve` | `notify-only` | `require-approval` | `deny`.
+    pub outcome: String,
+    #[serde(default)]
+    pub priority: i32,
+    /// `host[:port]` — HTTPS is implied.
+    #[serde(default)]
+    pub origins: Vec<String>,
+    #[serde(default)]
+    pub methods: Vec<String>,
+    #[serde(default)]
+    pub path_prefixes: Vec<String>,
+    #[serde(default)]
+    pub max_ttl_seconds: Option<i64>,
+    #[serde(default)]
+    pub max_uses: Option<i32>,
+    #[serde(default)]
+    pub not_after: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl PolicyConfig {
+    /// Validate and normalize into the row shape the store writes.
+    pub fn to_new_policy(&self) -> anyhow::Result<crate::db::NewPolicy> {
+        if self.secret.is_some() && self.secret_tag.is_some() {
+            bail!("set at most one of secret / secret_tag");
+        }
+        let outcome = self.outcome.as_str();
+        if !matches!(
+            outcome,
+            "auto-approve" | "notify-only" | "require-approval" | "deny"
+        ) {
+            bail!("invalid outcome {outcome:?}");
+        }
+        let origins = self
+            .origins
+            .iter()
+            .map(|o| {
+                keychute_types::Origin::parse(o).map_err(|e| anyhow::anyhow!("bad origin: {e}"))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        // Same rule as the UI form: a brokered grant rule with no origin would
+        // send the credential to whatever host the client names.
+        if self.mechanism == Mechanism::Brokered
+            && origins.is_empty()
+            && matches!(outcome, "auto-approve" | "notify-only")
+        {
+            bail!(
+                "a brokered auto-approve/notify-only policy must name at least one origin: \
+                 without one it would release the credential to any host the client asks for"
+            );
+        }
+        let mut methods = Vec::new();
+        for m in &self.methods {
+            if !crate::policy::is_valid_http_method(m) {
+                bail!("invalid HTTP method {m:?}");
+            }
+            methods.push(m.to_ascii_uppercase());
+        }
+        let path_prefixes = self
+            .path_prefixes
+            .iter()
+            .map(|p| {
+                crate::policy::paths::canonicalize(p)
+                    .map_err(|e| anyhow::anyhow!("bad path prefix {p:?}: {e}"))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        if self.max_ttl_seconds.is_some_and(|v| v <= 0) {
+            bail!("max_ttl_seconds must be positive");
+        }
+        if self.max_uses.is_some_and(|v| v <= 0) {
+            bail!("max_uses must be positive");
+        }
+        Ok(crate::db::NewPolicy {
+            client_name: self.client.clone(),
+            secret_name: self.secret.clone(),
+            secret_tag: self.secret_tag.clone(),
+            mechanism: self.mechanism.as_str().to_owned(),
+            outcome: outcome.to_owned(),
+            priority: self.priority,
+            origins: serde_json::to_value(&origins)?,
+            methods,
+            path_prefixes,
+            max_ttl_seconds: self.max_ttl_seconds,
+            max_uses: self.max_uses,
+            not_after: self.not_after,
+            created_by: crate::db::provision::CONFIG_ACTOR.to_owned(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -421,6 +653,29 @@ impl Config {
         if names.len() != self.clients.len() {
             bail!("duplicate client names in config");
         }
+        let mut secret_names = std::collections::HashSet::new();
+        for s in &self.secrets {
+            if s.name.trim().is_empty() || s.name.trim() != s.name {
+                bail!("provisioned secret name {:?} is empty or padded", s.name);
+            }
+            if !secret_names.insert(&s.name) {
+                bail!("duplicate provisioned secret name {}", s.name);
+            }
+            if s.tags.iter().any(|t| t.trim().is_empty()) {
+                bail!("secret {}: empty tag", s.name);
+            }
+        }
+        for (i, p) in self.policies.iter().enumerate() {
+            p.to_new_policy()
+                .with_context(|| format!("policies[{i}]"))?;
+            // A policy naming a client that is not configured can never match:
+            // almost certainly a typo, and a silent one.
+            if let Some(c) = &p.client {
+                if !names.contains(c) {
+                    bail!("policies[{i}]: client {c:?} is not a configured client");
+                }
+            }
+        }
         // Addendum #2: authn bindings must be unambiguous across clients.
         let mut token_hashes = std::collections::HashSet::new();
         let mut sa_bindings = std::collections::HashSet::new();
@@ -638,5 +893,77 @@ clients:
             cfg.human_auth.r#static.as_ref().unwrap().token_sha256,
             "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
         );
+    }
+
+    #[test]
+    fn provisioned_secrets_and_policies_parse_and_validate() {
+        let yaml = format!(
+            "{BASE_YAML}secrets:\n\
+             \x20 - name: minio\n\
+             \x20   value_file: /etc/keychute/provisioned/minio/secretKey\n\
+             \x20   injection:\n\
+             \x20     kind: aws-sigv4\n\
+             \x20     access_key_id: lake-media-read\n\
+             \x20     region: us-east-1\n\
+             \x20     service: s3\n\
+             policies:\n\
+             \x20 - client: agent\n\
+             \x20   secret: minio\n\
+             \x20   mechanism: brokered\n\
+             \x20   outcome: auto-approve\n\
+             \x20   origins: [\"minio.example.dev\"]\n\
+             \x20   methods: [get]\n\
+             \x20   path_prefixes: [/lake-media/sha256]\n"
+        );
+        let mut cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        cfg.normalize();
+        cfg.validate().unwrap();
+        assert_eq!(
+            cfg.secrets[0].injection.resolve().unwrap(),
+            (
+                "aws-sigv4".to_owned(),
+                Some("us-east-1/s3".to_owned()),
+                Some("lake-media-read".to_owned())
+            )
+        );
+        let p = cfg.policies[0].to_new_policy().unwrap();
+        assert_eq!(p.methods, vec!["GET".to_owned()]);
+        assert_eq!(p.created_by, "config");
+
+        // A typo'd client name would be a dead rule: refused.
+        let mut bad = cfg.clone();
+        bad.policies[0].client = Some("agnet".into());
+        assert!(bad
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("not a configured client"));
+        // Brokered auto-approve with no origin: refused, as in the UI.
+        let mut bad = cfg.clone();
+        bad.policies[0].origins.clear();
+        assert!(format!("{:#}", bad.validate().unwrap_err()).contains("at least one origin"));
+        // Duplicate provisioned names.
+        let mut bad = cfg.clone();
+        bad.secrets.push(bad.secrets[0].clone());
+        assert!(bad
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate"));
+        // Half a SigV4 scope.
+        let mut inj = cfg.secrets[0].injection.clone();
+        inj.service = None;
+        assert!(inj.resolve().is_err());
+        // Unknown keys are typos, not silently ignored settings.
+        let typo = yaml.replace("value_file:", "valuefile:");
+        assert!(serde_yaml::from_str::<Config>(&typo).is_err());
+    }
+
+    #[test]
+    fn trim_one_newline_only() {
+        assert_eq!(trim_one_newline(b"k\n"), b"k");
+        assert_eq!(trim_one_newline(b"k\r\n"), b"k");
+        assert_eq!(trim_one_newline(b"k\n\n"), b"k\n");
+        assert_eq!(trim_one_newline(b"k"), b"k");
     }
 }

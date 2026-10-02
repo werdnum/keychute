@@ -86,11 +86,8 @@ fn connection_named(headers: &HeaderMap) -> Vec<String> {
 
 /// Copy caller headers minus the strip list, minus headers named in the
 /// caller's `Connection` value, minus any header equal (case-insensitive) to
-/// the injection header. Nothing else is recomputed here.
-pub(crate) fn build_outbound_headers(
-    caller: &HeaderMap,
-    injection_header: &HeaderName,
-) -> HeaderMap {
+/// one the injection sets (`injected`). Nothing else is recomputed here.
+pub(crate) fn build_outbound_headers(caller: &HeaderMap, injected: &[&str]) -> HeaderMap {
     let dynamic = connection_named(caller);
     let mut out = HeaderMap::new();
     for (name, value) in caller.iter() {
@@ -98,7 +95,7 @@ pub(crate) fn build_outbound_headers(
         if STRIP_LIST.contains(&n)
             || n.starts_with("x-forwarded-")
             || dynamic.iter().any(|d| d == n)
-            || name == injection_header
+            || injected.contains(&n)
         {
             continue;
         }
@@ -125,7 +122,11 @@ pub(crate) fn build_response_headers(upstream: &HeaderMap) -> HeaderMap {
 pub(crate) enum InjectionSpec<'a> {
     Bearer,
     Header(&'a str),
-    BasicPassword { username: &'a str },
+    BasicPassword {
+        username: &'a str,
+    },
+    /// Per-request signature (migration 0009): see [`crate::sigv4`].
+    AwsSigV4(crate::sigv4::Scope<'a>),
 }
 
 impl InjectionSpec<'_> {
@@ -163,6 +164,29 @@ impl InjectionSpec<'_> {
                 }
                 Ok(AUTHORIZATION)
             }
+            InjectionSpec::AwsSigV4(scope) => {
+                crate::sigv4::validate_access_key_id(scope.access_key_id)
+                    .map_err(|_| ApiFailure::BadCredentialEncoding)?;
+                crate::sigv4::parse_scope(&format!("{}/{}", scope.region, scope.service))
+                    .map_err(|_| ApiFailure::BadCredentialEncoding)?;
+                Ok(AUTHORIZATION)
+            }
+        }
+    }
+
+    /// Every outbound header name the injection sets, lowercase — the caller's
+    /// copies of these are dropped. For SigV4 that is the signature, the
+    /// headers it synthesizes, and the S3 copy-source family (which would let a
+    /// request read a second object outside the grant's path constraint).
+    pub(crate) fn owned_headers(&self) -> Vec<&'static str> {
+        match self {
+            InjectionSpec::AwsSigV4(_) => {
+                let mut names = vec!["authorization"];
+                names.extend_from_slice(crate::sigv4::SYNTHESIZED);
+                names.extend_from_slice(crate::sigv4::STRIPPED_CALLER_HEADERS);
+                names
+            }
+            _ => Vec::new(),
         }
     }
 }
@@ -226,7 +250,72 @@ pub(crate) fn injection_header(
             bytes.extend_from_slice(encoded.as_bytes());
             Ok((name, value(bytes)?))
         }
+        // Signed per request by [`sigv4_headers`]; there is no static value.
+        InjectionSpec::AwsSigV4(_) => Err(ApiFailure::Internal(anyhow::anyhow!(
+            "aws-sigv4 has no static injection header"
+        ))),
     }
+}
+
+/// Sign the outbound request for the `aws-sigv4` kind. `url` is the exact URL
+/// about to be requested (its path already in SigV4 wire form) and `outbound`
+/// the caller headers that survived stripping: every `x-amz-*` among them is
+/// signed, since S3-compatible servers reject unsigned `x-amz-*` headers.
+pub(crate) fn sigv4_headers(
+    scope: &crate::sigv4::Scope<'_>,
+    secret: &[u8],
+    method: &str,
+    url: &url::Url,
+    outbound: &HeaderMap,
+    payload: &[u8],
+) -> Result<Vec<(HeaderName, HeaderValue)>, ApiFailure> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| ApiFailure::Internal(anyhow::anyhow!("upstream URL has no host")))?;
+    // `Url::port` is None for the scheme default, matching the Host header
+    // the HTTP client sends.
+    let host = match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_owned(),
+    };
+    let mut extra = Vec::new();
+    for (name, value) in outbound.iter() {
+        if name.as_str().starts_with("x-amz-") {
+            let v = value
+                .to_str()
+                .map_err(|_| ApiFailure::InvalidRequest("x-amz-* header is not visible ASCII"))?;
+            extra.push((name.as_str().to_owned(), v.to_owned()));
+        }
+    }
+    let signed = crate::sigv4::sign(
+        scope,
+        secret,
+        &crate::sigv4::Request {
+            method,
+            host: &host,
+            wire_path: url.path(),
+            query: url.query(),
+            extra_signed_headers: extra,
+            payload,
+        },
+        chrono::Utc::now(),
+    );
+    let mut authorization = HeaderValue::from_str(&signed.authorization)
+        .map_err(|_| ApiFailure::BadCredentialEncoding)?;
+    authorization.set_sensitive(true);
+    Ok(vec![
+        (AUTHORIZATION, authorization),
+        (
+            HeaderName::from_static("x-amz-date"),
+            HeaderValue::from_str(&signed.amz_date)
+                .map_err(|e| ApiFailure::Internal(anyhow::anyhow!("x-amz-date: {e}")))?,
+        ),
+        (
+            HeaderName::from_static("x-amz-content-sha256"),
+            HeaderValue::from_str(&signed.content_sha256)
+                .map_err(|e| ApiFailure::Internal(anyhow::anyhow!("x-amz-content-sha256: {e}")))?,
+        ),
+    ])
 }
 
 /// Build the outbound URL from the approved origin and the **canonical**
@@ -262,13 +351,24 @@ pub(crate) fn injection_header(
 /// would arrive as `/a%41` and be read upstream as `/aA`. So `%` — and only
 /// `%` — is escaped here before `set_path` does the rest, which keeps the
 /// outbound path exactly single-encoded.
+///
+/// `sigv4_path` sends the path in SigV4's strict single encoding instead
+/// ([`crate::sigv4::wire_path`]: everything outside RFC 3986 unreserved is
+/// escaped). It decodes to the same canonical path; it exists so the bytes
+/// signed and the bytes sent are the same string. `set_path` leaves it as is,
+/// since it holds only unreserved characters, `/` and `%XX` escapes.
 fn outbound_url(
     origin: &str,
     canonical_path: &str,
     query: Option<&str>,
+    sigv4_path: bool,
 ) -> Result<url::Url, url::ParseError> {
     let mut url = url::Url::parse(origin)?;
-    url.set_path(&canonical_path.replace('%', "%25"));
+    if sigv4_path {
+        url.set_path(&crate::sigv4::wire_path(canonical_path));
+    } else {
+        url.set_path(&canonical_path.replace('%', "%25"));
+    }
     url.set_query(query);
     Ok(url)
 }
@@ -529,6 +629,23 @@ async fn handle_inner(
                 username: &basic_username,
             }
         }
+        "aws-sigv4" => {
+            // Access key id in injection_username, `region/service` in
+            // injection_header (migration 0009). Either missing fails closed.
+            basic_username = db::api_ext::get_injection_username(&state.db, secret.id)
+                .await?
+                .ok_or(ApiFailure::BadCredentialEncoding)?;
+            let (region, service) = secret
+                .injection_header
+                .as_deref()
+                .and_then(|scope| crate::sigv4::parse_scope(scope).ok())
+                .ok_or(ApiFailure::BadCredentialEncoding)?;
+            InjectionSpec::AwsSigV4(crate::sigv4::Scope {
+                access_key_id: &basic_username,
+                region,
+                service,
+            })
+        }
         _ => return Err(ApiFailure::BadCredentialEncoding),
     };
     // Everything about the template that can fail without seeing the plaintext
@@ -548,13 +665,12 @@ async fn handle_inner(
     // `/a%3Fb?x=1` as `/a?b?x=1` — ambiguous about where the credential
     // actually went. Deriving it from `outbound_url` makes the audit row
     // exactly the target that is about to be requested.
-    let audited_path = {
-        let sent = outbound_url(&origin.to_display(), &canonical, parts.uri.query())
-            .map_err(|e| ApiFailure::Internal(anyhow::anyhow!("origin parse: {e}")))?;
-        match sent.query() {
-            Some(q) => format!("{}?{}", sent.path(), q),
-            None => sent.path().to_owned(),
-        }
+    let sigv4 = matches!(spec, InjectionSpec::AwsSigV4(_));
+    let sent_url = outbound_url(&origin.to_display(), &canonical, parts.uri.query(), sigv4)
+        .map_err(|e| ApiFailure::Internal(anyhow::anyhow!("origin parse: {e}")))?;
+    let audited_path = match sent_url.query() {
+        Some(q) => format!("{}?{}", sent_url.path(), q),
+        None => sent_url.path().to_owned(),
     };
     let target = db::AuditTarget {
         method: method.clone(),
@@ -598,18 +714,37 @@ async fn handle_inner(
         )
         .map_err(|e| ApiFailure::Internal(e.into()))?;
 
-    // Injection header (confined expose_secret site: proxy header injection).
-    let (header_name, header_value) = injection_header(&spec, plaintext.expose_secret())?;
-    let mut outbound = build_outbound_headers(&parts.headers, &header_name);
-    outbound.insert(header_name, header_value);
+    // Injection (confined expose_secret site: proxy header injection).
+    let injected = match &spec {
+        InjectionSpec::AwsSigV4(scope) => {
+            let outbound = build_outbound_headers(&parts.headers, &spec.owned_headers());
+            let signed = sigv4_headers(
+                scope,
+                plaintext.expose_secret(),
+                &method,
+                &sent_url,
+                &outbound,
+                &body_bytes,
+            )?;
+            (outbound, signed)
+        }
+        _ => {
+            let (header_name, header_value) = injection_header(&spec, plaintext.expose_secret())?;
+            let outbound = build_outbound_headers(&parts.headers, &[header_name.as_str()]);
+            (outbound, vec![(header_name, header_value)])
+        }
+    };
+    let (mut outbound, injected) = injected;
+    for (name, value) in injected {
+        outbound.insert(name, value);
+    }
     forward(
         state,
-        parts,
         body_bytes,
         grant,
         version.id,
         origin,
-        &canonical,
+        sent_url,
         &audited_path,
         &method,
         outbound,
@@ -623,14 +758,14 @@ async fn handle_inner(
 #[allow(clippy::too_many_arguments)]
 async fn forward(
     state: &AppState,
-    parts: axum::http::request::Parts,
     // Already buffered and size-checked by the caller (before use-accounting).
     body_bytes: axum::body::Bytes,
     grant: db::GrantRow,
     secret_version_id: Uuid,
     origin: &Origin,
-    canonical_path: &str,
-    // `canonical_path` plus the caller's verbatim query string, for audit.
+    // Exactly what is requested: approved origin, canonical path, caller query.
+    url: url::Url,
+    // `url`'s path and query, for audit.
     audited_path: &str,
     method: &str,
     outbound_headers: HeaderMap,
@@ -639,9 +774,6 @@ async fn forward(
     // Fired once upstream has responded, to disarm the outer deadline race.
     committed: tokio::sync::oneshot::Sender<()>,
 ) -> Result<Response, ApiFailure> {
-    let url = outbound_url(&origin.to_display(), canonical_path, parts.uri.query())
-        .map_err(|e| ApiFailure::Internal(anyhow::anyhow!("origin parse: {e}")))?;
-
     let upstream = state
         .upstream
         // The NORMALIZED method — the one the grant check authorized and the
@@ -791,7 +923,7 @@ mod tests {
             ("X-Api-Key", "should-be-stripped-as-injection"),
         ]);
         let injection = HeaderName::from_static("x-api-key");
-        let out = build_outbound_headers(&caller, &injection);
+        let out = build_outbound_headers(&caller, &[injection.as_str()]);
 
         let kept: Vec<&str> = out.keys().map(|k| k.as_str()).collect();
         assert_eq!(out.len(), 3, "kept: {kept:?}");
@@ -943,7 +1075,7 @@ mod tests {
     /// `handle_inner` does, then build the outbound URL from it.
     fn forwarded_path(raw: &str) -> String {
         let canonical = paths::canonicalize(raw).expect("canonicalize");
-        let url = outbound_url("https://up.example.com", &canonical, None).unwrap();
+        let url = outbound_url("https://up.example.com", &canonical, None, false).unwrap();
         url.path().to_owned()
     }
 
@@ -979,14 +1111,15 @@ mod tests {
         // the path rather than starting a query or fragment.
         let canonical = paths::canonicalize("/a%3Fb%23c").unwrap();
         assert_eq!(canonical, "/a?b#c");
-        let url = outbound_url("https://up.example.com", &canonical, None).unwrap();
+        let url = outbound_url("https://up.example.com", &canonical, None, false).unwrap();
         assert_eq!(url.path(), "/a%3Fb%23c");
         assert_eq!(url.query(), None);
         assert_eq!(url.fragment(), None);
         assert_eq!(url.as_str(), "https://up.example.com/a%3Fb%23c");
 
         // The caller's real query is attached separately and verbatim.
-        let url = outbound_url("https://up.example.com", &canonical, Some("x=1&y=2")).unwrap();
+        let url =
+            outbound_url("https://up.example.com", &canonical, Some("x=1&y=2"), false).unwrap();
         assert_eq!(url.path(), "/a%3Fb%23c");
         assert_eq!(url.query(), Some("x=1&y=2"));
     }
@@ -1019,7 +1152,7 @@ mod tests {
     #[test]
     fn outbound_url_keeps_the_approved_origin() {
         // Origin host/port/scheme are never influenced by the path.
-        let url = outbound_url("https://up.example.com:8443", "/v1/echo", None).unwrap();
+        let url = outbound_url("https://up.example.com:8443", "/v1/echo", None, false).unwrap();
         assert_eq!(url.as_str(), "https://up.example.com:8443/v1/echo");
     }
 

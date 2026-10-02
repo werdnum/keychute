@@ -21,6 +21,9 @@ pub mod kinds {
     pub const PROXY_COMPLETED: &str = "proxy-completed";
     pub const SECRET_CREATED: &str = "secret-created";
     pub const SECRET_ROTATED: &str = "secret-rotated";
+    /// A provisioned secret's metadata (tier, template, tags) changed, or an
+    /// existing row was adopted by config.
+    pub const SECRET_UPDATED: &str = "secret-updated";
     /// An operator deleted a stored secret and all of its versions. The row
     /// survives the credential it names — the audit log is how an incident
     /// responder learns the secret ever existed.

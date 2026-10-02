@@ -171,6 +171,9 @@ async fn store_inner(
     let (injection_kind, injection_header, injection_username) = validate_injection(
         req.injection_kind.as_deref().unwrap_or("bearer"),
         req.injection_header.as_deref().filter(|h| !h.is_empty()),
+        // No deposit field carries a SigV4 scope, so 'aws-sigv4' is refused
+        // here: that template is operator-configured only.
+        None,
     )
     .map_err(ApiFailure::InvalidRequest)?;
 

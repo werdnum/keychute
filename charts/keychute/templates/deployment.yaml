@@ -177,6 +177,11 @@ spec:
               mountPath: /etc/keychute/db-ca
               readOnly: true
             {{- end }}
+            {{- range (include "keychute.provisionedSecretNames" . | fromJsonArray) }}
+            - name: {{ include "keychute.provisionedVolume" . }}
+              mountPath: /etc/keychute/provisioned/{{ . }}
+              readOnly: true
+            {{- end }}
             # readOnlyRootFilesystem: true — give the process somewhere to put
             # transient files.
             - name: tmp
@@ -217,6 +222,12 @@ spec:
         - name: upstream-ca
           secret:
             secretName: {{ .Values.upstreamCA.secretName }}
+        {{- end }}
+        {{- range (include "keychute.provisionedSecretNames" . | fromJsonArray) }}
+        - name: {{ include "keychute.provisionedVolume" . }}
+          secret:
+            secretName: {{ . }}
+            defaultMode: 0400
         {{- end }}
         - name: tmp
           emptyDir: {}

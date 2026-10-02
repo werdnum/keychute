@@ -117,5 +117,36 @@ take effect (nothing is re-read at runtime).
 {{- if .Values.database.sslRootCertSecret -}}
 {{- $secrets = append $secrets .Values.database.sslRootCertSecret -}}
 {{- end -}}
+{{- range (include "keychute.provisionedSecretNames" . | fromJsonArray) -}}
+{{- $secrets = append $secrets . -}}
+{{- end -}}
 {{- $secrets | uniq | join "," -}}
+{{- end -}}
+
+{{/*
+JSON array of the distinct Kubernetes Secrets that provisioned secrets read
+from (`valueFrom`, `injection.usernameFrom`, `injection.accessKeyIdFrom`).
+Each is mounted at /etc/keychute/provisioned/<secretName>.
+*/}}
+{{- define "keychute.provisionedSecretNames" -}}
+{{- $names := list -}}
+{{- range .Values.secrets -}}
+{{- if not .valueFrom -}}
+{{- fail (printf "keychute: secrets[%s] needs valueFrom.secretName and valueFrom.key" .name) -}}
+{{- end -}}
+{{- $names = append $names .valueFrom.secretName -}}
+{{- with .injection -}}
+{{- with .usernameFrom -}}{{- $names = append $names .secretName -}}{{- end -}}
+{{- with .accessKeyIdFrom -}}{{- $names = append $names .secretName -}}{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- $names | uniq | toJson -}}
+{{- end -}}
+
+{{/*
+Volume name for a provisioned-secret mount: stable and DNS-label safe
+whatever the Secret is called.
+*/}}
+{{- define "keychute.provisionedVolume" -}}
+prov-{{ . | sha256sum | trunc 12 }}
 {{- end -}}
