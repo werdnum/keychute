@@ -5,7 +5,10 @@ use keychute_types::{Mechanism, Tier};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
+// Unknown keys are rejected: a misspelled `secrets:` or `policies:` would
+// otherwise read as an empty list and delete every managed row.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub listen_addr: String,
     /// External base URL used in push approval links, e.g. https://keychute.example.dev
@@ -725,6 +728,17 @@ clients:
     auth:
       api_token_sha256: "  FFEE00112233445566778899AABBCCDDEEFF00112233445566778899AABBCCDD  "
 "#;
+
+    #[test]
+    fn misspelled_top_level_key_is_rejected() {
+        // Read as absent, `secret:` would provision nothing and prune every
+        // managed secret.
+        let yaml = format!("{BASE_YAML}secret: []\n");
+        let err = serde_yaml::from_str::<Config>(&yaml)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown field `secret`"), "{err}");
+    }
 
     #[test]
     fn client_auth_binding_is_exactly_one() {

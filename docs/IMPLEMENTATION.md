@@ -651,8 +651,10 @@ These override anything above where they conflict.
     the access key id and `injection_header` the `region/s3` scope. The
     service must be `s3`: grant constraints are method + path, and JSON- or
     query-protocol services choose the operation from `X-Amz-Target` or an
-    `Action` parameter on a shared `POST /`, which they cannot see. The
-    proxy signs each forwarded request (`server/src/sigv4.rs`) over exactly
+    `Action` parameter on a shared `POST /`, which they cannot see. For the
+    same reason a request carrying a query string is refused with 400 before
+    use-accounting: S3 selects subresources and object versions there
+    (`?acl`, `?versionId=`). The proxy signs each forwarded request (`server/src/sigv4.rs`) over exactly
     what it sends: the path goes out in SigV4's strict single encoding,
     `host`, `x-amz-date`, `x-amz-content-sha256` (the buffered body's hash)
     and every surviving caller `x-amz-*` header are signed (repeated values

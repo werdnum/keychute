@@ -3,7 +3,7 @@
 //!
 //! Unlike the other injection kinds, a SigV4 credential is not a header value
 //! that can be pasted onto the request: the `Authorization` header is an HMAC
-//! over the request itself (method, path, query, selected headers, payload
+//! over the request itself (method, path, selected headers, payload
 //! hash and timestamp), keyed by a key derived from the secret access key. So
 //! the signature is computed here, per forwarded request, after the proxy has
 //! settled the exact method, URL and body it is about to send.
@@ -79,10 +79,11 @@ pub fn parse_scope(scope: &str) -> Result<(&str, &str), &'static str> {
             return Err("SigV4 region and service must be lowercase letters, digits and '-'");
         }
     }
-    // Grant constraints are method + path. S3 selects its operation from
-    // those (plus query subresources the credential's own policy bounds);
-    // JSON- and query-protocol services pick it from `X-Amz-Target` or an
-    // `Action` parameter on a shared `POST /`, which constraints cannot see.
+    // Grant constraints are method + path, so only a service whose operation
+    // those select is signable: S3, with the query string refused by the
+    // proxy (it carries S3 subresources such as `?acl` and `?versionId`).
+    // JSON- and query-protocol services pick the operation from
+    // `X-Amz-Target` or an `Action` parameter on a shared `POST /`.
     if service != "s3" {
         return Err("SigV4 service must be 's3'; other AWS services are not supported");
     }
@@ -106,60 +107,6 @@ pub fn uri_encode(input: &str, keep_slash: bool) -> String {
         }
     }
     out
-}
-
-/// Percent-decode a query component, treating `+` as a space (form encoding,
-/// which is how S3-compatible servers read a raw query when re-deriving the
-/// canonical form).
-fn query_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'+' => out.push(b' '),
-            b'%' if i + 2 < bytes.len() => {
-                match std::str::from_utf8(&bytes[i + 1..i + 3])
-                    .ok()
-                    .and_then(|h| u8::from_str_radix(h, 16).ok())
-                {
-                    Some(v) => {
-                        out.push(v);
-                        i += 2;
-                    }
-                    None => out.push(b'%'),
-                }
-            }
-            b => out.push(b),
-        }
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-/// Canonical query string: decode each `k=v`, re-encode both with
-/// [`uri_encode`], sort by key then value, join with `&`.
-pub fn canonical_query(raw: Option<&str>) -> String {
-    let Some(raw) = raw.filter(|q| !q.is_empty()) else {
-        return String::new();
-    };
-    let mut pairs: Vec<(String, String)> = raw
-        .split('&')
-        .filter(|p| !p.is_empty())
-        .map(|p| {
-            let (k, v) = p.split_once('=').unwrap_or((p, ""));
-            (
-                uri_encode(&query_decode(k), false),
-                uri_encode(&query_decode(v), false),
-            )
-        })
-        .collect();
-    pairs.sort();
-    pairs
-        .iter()
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect::<Vec<_>>()
-        .join("&")
 }
 
 /// The wire path for a SigV4 request: the decoded canonical path,
@@ -187,8 +134,6 @@ pub struct Request<'a> {
     pub host: &'a str,
     /// The path as sent on the wire ([`wire_path`]).
     pub wire_path: &'a str,
-    /// The raw query string as sent, without `?`.
-    pub query: Option<&'a str>,
     /// Other headers to sign (lowercase names); `host` and the synthesized
     /// headers are added by the signer.
     pub extra_signed_headers: Vec<(String, String)>,
@@ -246,12 +191,7 @@ pub fn sign(
 
     let canonical_request = format!(
         "{}\n{}\n{}\n{}\n{}\n{}",
-        req.method,
-        req.wire_path,
-        canonical_query(req.query),
-        canonical_headers,
-        signed_headers,
-        content_sha256
+        req.method, req.wire_path, "", canonical_headers, signed_headers, content_sha256
     );
     let credential_scope = format!("{date}/{}/{}/aws4_request", scope.region, scope.service);
     let string_to_sign = format!(
@@ -301,12 +241,6 @@ mod tests {
         assert_eq!(uri_encode("a b/c~d", true), "a%20b/c~d");
         assert_eq!(uri_encode("a b/c", false), "a%20b%2Fc");
         assert_eq!(wire_path("/bucket/my key!.jpg"), "/bucket/my%20key%21.jpg");
-        assert_eq!(
-            canonical_query(Some("prefix=a+b&list-type=2&delimiter=%2F&acl")),
-            "acl=&delimiter=%2F&list-type=2&prefix=a%20b"
-        );
-        assert_eq!(canonical_query(None), "");
-        assert_eq!(canonical_query(Some("")), "");
     }
 
     fn at(s: &str) -> chrono::DateTime<chrono::Utc> {
@@ -330,7 +264,6 @@ mod tests {
                 method: "GET",
                 host: "minio.example.dev",
                 wire_path: &wire_path("/lake-media/sha256/ab/abcdef"),
-                query: None,
                 extra_signed_headers: vec![],
                 payload: b"",
             },
@@ -345,7 +278,7 @@ mod tests {
     }
 
     #[test]
-    fn matches_botocore_s3_put_with_query_and_amz_header() {
+    fn matches_botocore_s3_put_with_amz_header() {
         let scope = Scope {
             access_key_id: "AKIDEXAMPLE",
             region: "us-east-1",
@@ -358,7 +291,6 @@ mod tests {
                 method: "PUT",
                 host: "minio.example.dev:9000",
                 wire_path: &wire_path("/bucket/a b.txt"),
-                query: Some("x-id=PutObject&tagging"),
                 extra_signed_headers: vec![("x-amz-meta-note".into(), "  hello   world ".into())],
                 payload: b"hello",
             },
@@ -382,7 +314,6 @@ mod tests {
                     method: "GET",
                     host: "minio.example.dev",
                     wire_path: "/b/k",
-                    query: None,
                     extra_signed_headers: values
                         .iter()
                         .map(|v| ("x-amz-meta-a".to_owned(), (*v).to_owned()))
@@ -403,5 +334,5 @@ mod tests {
     const BOTOCORE_S3_PUT: &str = "AWS4-HMAC-SHA256 \
         Credential=AKIDEXAMPLE/20261002/us-east-1/s3/aws4_request, \
         SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-meta-note, \
-        Signature=74b7e9c9103aa7753082736cff2bb3f7d14c101e108230c6c35d69590eec7220";
+        Signature=df90e737a5a91cbe07e4433757d3a0558b423385bbd939d4e39bc223bfd2f6e7";
 }

@@ -294,7 +294,6 @@ pub(crate) fn sigv4_headers(
             method,
             host: &host,
             wire_path: url.path(),
-            query: url.query(),
             extra_signed_headers: extra,
             payload,
         },
@@ -666,6 +665,13 @@ async fn handle_inner(
     // actually went. Deriving it from `outbound_url` makes the audit row
     // exactly the target that is about to be requested.
     let sigv4 = matches!(spec, InjectionSpec::AwsSigV4(_));
+    // S3 picks subresources and object versions from the query (`?acl`,
+    // `?versionId=`), which grant constraints never examine.
+    if sigv4 && parts.uri.query().is_some() {
+        return Err(ApiFailure::InvalidRequest(
+            "aws-sigv4 grants do not forward a query string",
+        ));
+    }
     let sent_url = outbound_url(&origin.to_display(), &canonical, parts.uri.query(), sigv4)
         .map_err(|e| ApiFailure::Internal(anyhow::anyhow!("origin parse: {e}")))?;
     let audited_path = match sent_url.query() {

@@ -63,12 +63,24 @@ async fn provisioned_sigv4_secret_signs_exactly_what_is_sent() {
     assert_eq!(body["state"], "approved", "{body}");
     let grant_id = body["grant_id"].as_str().unwrap().to_owned();
 
+    // A query would select S3 subresources or versions the grant never saw.
+    let refused = env
+        .fa()
+        .get(&format!(
+            "/v1/grants/{grant_id}/proxy/lake-media/sha256/ab/abc%20def"
+        ))
+        .query(&[("versionId", "v1")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 400);
+    assert!(env.upstream_requests.lock().unwrap().is_empty());
+
     let resp = env
         .fa()
         .get(&format!(
             "/v1/grants/{grant_id}/proxy/lake-media/sha256/ab/abc%20def"
         ))
-        .query(&[("versionId", "v 1")])
         .header("X-Amz-Meta-Note", "kept and signed")
         .header("X-Amz-Date", "19990101T000000Z")
         .header("X-Amz-Copy-Source", "other-bucket/secret-object")
@@ -81,6 +93,7 @@ async fn provisioned_sigv4_secret_signs_exactly_what_is_sent() {
     assert_eq!(recs.len(), 1);
     let r = &recs[0];
     assert_eq!(r.path, "/lake-media/sha256/ab/abc%20def");
+    assert_eq!(r.query, None);
     assert_eq!(
         r.header("x-amz-copy-source"),
         None,
@@ -121,7 +134,6 @@ async fn provisioned_sigv4_secret_signs_exactly_what_is_sent() {
             method: &r.method,
             host: &host,
             wire_path: &r.path,
-            query: r.query.as_deref(),
             extra_signed_headers: vec![(
                 "x-amz-meta-note".into(),
                 r.header("x-amz-meta-note").unwrap().to_owned(),

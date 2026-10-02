@@ -410,7 +410,8 @@ the ciphertext-only design removes the main reason to isolate.
   and the proxy computes a signature over each forwarded request, which is how
   S3-compatible stores (MinIO, R2, B2) authenticate (S3 only: services that
   select the operation from a header or parameter on a shared `POST /` would
-  escape the method/path constraints) —
+  escape the method/path constraints, and for the same reason no query string
+  is forwarded) —
   query-parameter placement is deliberately unsupported, since URLs land
   in upstream access logs, traces, and client error values, which would break the
   never-logged invariant). Injection placement is never taken from the
