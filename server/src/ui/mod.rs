@@ -1629,14 +1629,21 @@ fn parse_narrow_u64(input: Option<&str>, requested: u64, what: &str) -> UiResult
     }
 }
 
+/// Refusals for UI edits to rows the config file owns (migration 0009).
+const MANAGED_SECRET: &str = "this secret is provisioned from Keychute's config (GitOps): \
+     change or remove it there. An edit here would be reverted on the next restart.";
+const MANAGED_POLICY: &str = "this policy is provisioned from Keychute's config (GitOps): \
+     change or remove it there. A deletion here would be reverted on the next restart.";
+
 /// Operator-facing wrapper around [`crate::injection::validate_injection`]
 /// (shared with the client deposit endpoint): same rules, UI error shape.
 #[allow(clippy::type_complexity)]
 fn validate_injection(
     kind: &str,
     header: Option<&str>,
+    scope: Option<&str>,
 ) -> UiResult<(String, Option<String>, Option<String>)> {
-    crate::injection::validate_injection(kind, header).map_err(UiError::bad_request)
+    crate::injection::validate_injection(kind, header, scope).map_err(UiError::bad_request)
 }
 
 /// Parse the approval form's render-time marker: `Some(true)` = the page was
@@ -2019,7 +2026,7 @@ async fn approve(
                 }
                 let kind = non_empty(&form.injection_kind).unwrap_or("bearer");
                 let (injection_kind, injection_header, injection_username) =
-                    validate_injection(kind, non_empty(&form.injection_header))?;
+                    validate_injection(kind, non_empty(&form.injection_header), None)?;
                 let secret_id = Uuid::new_v4();
                 // Created by the approval transaction itself, so there is no
                 // earlier incarnation for it to verify against.
@@ -2317,10 +2324,14 @@ async fn policies_page(
                                     }
                                     td data-label="By" { span .muted { (p.created_by) } }
                                     td .actions data-label="" {
+                                        @if p.managed_by_config {
+                                            span .badge .muted title="Provisioned from config; edit it there" { "config" }
+                                        } @else {
                                         form method="post" action={ "/ui/policies/" (p.id) "/delete" } .inline {
                                             input type="hidden" name="csrf_token"
                                                 value=(csrf::issue_token(&state.keyset, R_POLICY_DELETE, &p.id.to_string(), &op.subject, "", now));
                                             button .danger .small type="submit" { "Delete" }
+                                        }
                                         }
                                     }
                                 }
@@ -2626,6 +2637,13 @@ async fn delete_policy(
         "",
         &form.csrf_token,
     )?;
+    if db::list_policies(&state.db)
+        .await?
+        .iter()
+        .any(|p| p.id == id && p.managed_by_config)
+    {
+        return Err(UiError::new(StatusCode::CONFLICT, MANAGED_POLICY));
+    }
     // Deletion and its audit row commit together (same reasoning as creation).
     // No matching row means nothing was deleted and nothing audited — report
     // the conflict instead of a silent no-op redirect.
@@ -2726,11 +2744,15 @@ async fn secrets_page(State(state): State<AppState>, headers: HeaderMap) -> UiRe
                                         // straight to the delete: this is the
                                         // one action that destroys credential
                                         // bytes.
+                                        @if s.managed_by_config {
+                                            span .badge .muted title="Provisioned from config; edit it there" { "config" }
+                                        } @else {
                                         form method="post"
                                             action={ "/ui/secrets/" (s.id) "/delete" } .inline {
                                             input type="hidden" name="csrf_token"
                                                 value=(csrf::issue_token(&state.keyset, R_SECRET_DELETE, &s.id.to_string(), &op.subject, "", now));
                                             button .small .danger type="submit" { "Delete" }
+                                        }
                                         }
                                     }
                                 }
@@ -2776,13 +2798,20 @@ async fn secrets_page(State(state): State<AppState>, headers: HeaderMap) -> UiRe
                                 option value="bearer" selected { "bearer" }
                                 option value="header" { "header" }
                                 option value="basic" { "basic-password" }
+                                option value="aws-sigv4" { "aws-sigv4" }
                             }
                         }
                         label {
-                            "Header name / basic-auth username"
+                            "Header name / basic-auth username / SigV4 access key id"
                             input type="text" name="injection_header"
                                 autocapitalize="off" autocorrect="off" spellcheck="false";
-                            span .muted { "Only for kinds " b { "header" } " and " b { "basic-password" } "." }
+                            span .muted { "Only for kinds " b { "header" } ", " b { "basic-password" } " and " b { "aws-sigv4" } "." }
+                        }
+                        label {
+                            "SigV4 scope"
+                            input type="text" name="injection_scope" placeholder="us-east-1/s3"
+                                autocapitalize="off" autocorrect="off" spellcheck="false";
+                            span .muted { "Only for " b { "aws-sigv4" } ": region/s3 (S3 only). The value is the secret access key." }
                         }
                     }
                     div .actions-bar {
@@ -2812,6 +2841,8 @@ struct SecretForm {
     injection_kind: Option<String>,
     #[serde(default)]
     injection_header: Option<String>,
+    #[serde(default)]
+    injection_scope: Option<String>,
 }
 
 impl Drop for SecretForm {
@@ -3227,6 +3258,9 @@ async fn delete_secret_page(
         .into_iter()
         .find(|s| s.id == id)
         .ok_or_else(|| UiError::new(StatusCode::NOT_FOUND, "no such secret"))?;
+    if secret.managed_by_config {
+        return Err(UiError::new(StatusCode::CONFLICT, MANAGED_SECRET));
+    }
     let now = Utc::now();
     let tags = db::get_tags_for_secret(&state.db, secret.id).await?;
     let policies = db::list_policies(&state.db).await?;
@@ -3431,6 +3465,13 @@ async fn delete_secret(
         .current_version
         .parse()
         .map_err(|_| UiError::bad_request("invalid version"))?;
+    if db::list_secrets(&state.db)
+        .await?
+        .iter()
+        .any(|s| s.id == id && s.managed_by_config)
+    {
+        return Err(UiError::new(StatusCode::CONFLICT, MANAGED_SECRET));
+    }
     // Gone or rotated since the confirmation page rendered: nothing was
     // written and nothing audited, so say so rather than redirecting as if
     // this call did the work — same as the revoke and vet handlers.
@@ -3477,6 +3518,9 @@ async fn save_secret(
     };
 
     match db::get_secret_by_name(&state.db, &name).await? {
+        Some(existing) if existing.managed_by_config => {
+            return Err(UiError::new(StatusCode::CONFLICT, MANAGED_SECRET));
+        }
         Some(existing) => {
             // Rotation: append a new version; metadata unchanged.
             let rotated = db::ui_ext::rotate_secret_version(
@@ -3515,8 +3559,11 @@ async fn save_secret(
                 }
             };
             let kind = non_empty(&form.injection_kind).unwrap_or("bearer");
-            let (injection_kind, injection_header, injection_username) =
-                validate_injection(kind, non_empty(&form.injection_header))?;
+            let (injection_kind, injection_header, injection_username) = validate_injection(
+                kind,
+                non_empty(&form.injection_header),
+                non_empty(&form.injection_scope),
+            )?;
             let secret_id = Uuid::new_v4();
             let keyset = &state.keyset;
             let created = db::ui_ext::create_secret_with_version(
@@ -3568,29 +3615,31 @@ mod tests {
 
     #[test]
     fn validate_injection_routes_basic_username_to_username_column() {
-        let Ok((kind, header, username)) = validate_injection("basic", Some("svc")) else {
+        let Ok((kind, header, username)) = validate_injection("basic", Some("svc"), None) else {
             panic!("basic injection should validate");
         };
         assert_eq!(kind, "basic");
         assert_eq!(header, None);
         assert_eq!(username.as_deref(), Some("svc"));
         // 'basic-password' is an accepted alias, normalized to 'basic'.
-        let Ok((kind, header, username)) = validate_injection("basic-password", Some("svc")) else {
+        let Ok((kind, header, username)) = validate_injection("basic-password", Some("svc"), None)
+        else {
             panic!("basic-password alias should validate");
         };
         assert_eq!(kind, "basic");
         assert_eq!(header, None);
         assert_eq!(username.as_deref(), Some("svc"));
         // 'header' keeps using the header column; no username.
-        let Ok((kind, header, username)) = validate_injection("header", Some("X-Api-Key")) else {
+        let Ok((kind, header, username)) = validate_injection("header", Some("X-Api-Key"), None)
+        else {
             panic!("header injection should validate");
         };
         assert_eq!(kind, "header");
         assert_eq!(header.as_deref(), Some("X-Api-Key"));
         assert_eq!(username, None);
         // Bad usernames still rejected.
-        assert!(validate_injection("basic", Some("a:b")).is_err());
-        assert!(validate_injection("basic", None).is_err());
+        assert!(validate_injection("basic", Some("a:b"), None).is_err());
+        assert!(validate_injection("basic", None, None).is_err());
     }
 
     #[test]
@@ -3716,6 +3765,7 @@ mod tests {
             current_version: version,
             enabled: true,
             operator_vetted: true,
+            managed_by_config: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -3776,6 +3826,7 @@ mod tests {
             not_after: None,
             created_by: "andrew".into(),
             created_at: now,
+            managed_by_config: false,
         };
         let tags = vec!["prod".to_owned()];
 
@@ -3814,26 +3865,26 @@ mod tests {
     #[test]
     fn injection_validation() {
         assert_eq!(
-            validate_injection("bearer", None).unwrap(),
+            validate_injection("bearer", None, None).unwrap(),
             ("bearer".into(), None, None)
         );
         assert_eq!(
-            validate_injection("header", Some("X-Api-Key")).unwrap(),
+            validate_injection("header", Some("X-Api-Key"), None).unwrap(),
             ("header".into(), Some("X-Api-Key".into()), None)
         );
-        assert!(validate_injection("header", None).is_err());
-        assert!(validate_injection("header", Some("Authorization")).is_err());
-        assert!(validate_injection("header", Some("host")).is_err());
-        assert!(validate_injection("header", Some("X-Forwarded-For")).is_err());
-        assert!(validate_injection("header", Some("Bad Header")).is_err());
-        assert!(validate_injection("header", Some("Transfer-Encoding")).is_err());
+        assert!(validate_injection("header", None, None).is_err());
+        assert!(validate_injection("header", Some("Authorization"), None).is_err());
+        assert!(validate_injection("header", Some("host"), None).is_err());
+        assert!(validate_injection("header", Some("X-Forwarded-For"), None).is_err());
+        assert!(validate_injection("header", Some("Bad Header"), None).is_err());
+        assert!(validate_injection("header", Some("Transfer-Encoding"), None).is_err());
         assert_eq!(
-            validate_injection("basic", Some("svc-user")).unwrap(),
+            validate_injection("basic", Some("svc-user"), None).unwrap(),
             ("basic".into(), None, Some("svc-user".into()))
         );
-        assert!(validate_injection("basic", Some("user:name")).is_err());
-        assert!(validate_injection("basic", None).is_err());
-        assert!(validate_injection("nonsense", None).is_err());
+        assert!(validate_injection("basic", Some("user:name"), None).is_err());
+        assert!(validate_injection("basic", None, None).is_err());
+        assert!(validate_injection("nonsense", None, None).is_err());
     }
 
     #[test]

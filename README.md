@@ -30,6 +30,11 @@ v1 server-side implementation (design milestones M0–M3) plus packaging:
 - `charts/keychute/` — the Helm chart; `Dockerfile` + `.github/workflows/` —
   the multi-arch image build.
 
+Secrets and standing policies can also be provisioned declaratively in the
+config file (Helm values `secrets:` / `policies:`), with values read from
+mounted Kubernetes Secrets, and brokered calls can be AWS SigV4-signed for
+S3-compatible APIs (injection kind `aws-sigv4`).
+
 ## Development
 
 Requires Rust (stable) and PostgreSQL 16.

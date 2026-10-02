@@ -47,6 +47,19 @@ impl AppState {
             .await?;
         sqlx::migrate!("../migrations").run(&db).await?;
         crate::db::reconcile_clients(&db, &config.clients).await?;
+        let desired = crate::db::provision::desired_secrets(&config.secrets)?;
+        for (name, change) in
+            crate::db::provision::reconcile_secrets(&db, &keyset, &desired).await?
+        {
+            tracing::info!(secret = %name, ?change, "reconciled provisioned secret");
+        }
+        let policies = config
+            .policies
+            .iter()
+            .map(|p| p.to_new_policy())
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let changes = crate::db::provision::reconcile_policies(&db, &policies).await?;
+        tracing::info!(?changes, "reconciled provisioned policies");
 
         let notifier = crate::notify::build_notifier(&config)?;
         let mut upstream_builder = reqwest::Client::builder()

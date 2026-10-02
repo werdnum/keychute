@@ -21,6 +21,8 @@ pub struct PolicyRow {
     pub not_after: Option<DateTime<Utc>>,
     pub created_by: String,
     pub created_at: DateTime<Utc>,
+    /// Provisioned from config (migration 0009); the UI will not delete it.
+    pub managed_by_config: bool,
 }
 
 #[derive(Debug, Clone)]

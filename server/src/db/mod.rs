@@ -11,6 +11,7 @@ pub mod api_ext;
 pub mod clients;
 pub mod grants;
 pub mod policies;
+pub mod provision;
 pub mod requests;
 pub mod secrets;
 pub mod ui_ext;

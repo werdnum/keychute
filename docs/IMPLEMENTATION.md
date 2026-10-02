@@ -111,6 +111,26 @@ clients:                   # declarative client provisioning (reconciled at star
       service_account:
         audience: "keychute.example.dev"
         subject: "system:serviceaccount:k8s-agent:k8s-agent"
+secrets:                   # provisioned secrets (GitOps), reconciled at startup
+  - name: minio-lake-media
+    description: "lake-media read-only"
+    max_tier: brokered     # default brokered
+    tags: []
+    value_file: /etc/keychute/provisioned/minio-lake-media-read/secretKey  # one trailing newline dropped
+    injection:             # default {kind: bearer}
+      kind: aws-sigv4      # bearer | header (header:) | basic (username:/username_file:) | aws-sigv4
+      access_key_id: lake-media-read   # alias of username; or access_key_id_file
+      region: us-east-1
+      service: s3
+policies:                  # provisioned policy rows, same validation as the UI form
+  - client: family-assistant   # optional (any client); must be a configured client
+    secret: minio-lake-media   # or secret_tag; neither = any secret
+    mechanism: brokered
+    outcome: auto-approve
+    origins: ["minio.example.dev"]   # host[:port]
+    methods: [GET, HEAD]
+    path_prefixes: ["/lake-media/sha256"]
+    max_ttl_seconds: 3600
 tokenreview_url: "https://kubernetes.default.svc/apis/authentication.k8s.io/v1/tokenreviews"  # e2e overrides
 tokenreview_token_path: null   # bearer for TokenReview calls (in-cluster SA token); null → no auth header
 tokenreview_ca_path: null
@@ -626,7 +646,24 @@ These override anything above where they conflict.
     `injection_username`; header = `Authorization: Basic
     base64(username ":" secret)`). Malformed/NUL/CR/LF bytes in the secret for
     header placement → the proxy call fails closed with 502 code
-    `bad-credential-encoding` (never sent partially).
+    `bad-credential-encoding` (never sent partially). `aws-sigv4` (migration
+    0009): the secret is an AWS secret access key; `injection_username` holds
+    the access key id and `injection_header` the `region/s3` scope. The
+    service must be `s3`: grant constraints are method + path, and JSON- or
+    query-protocol services choose the operation from `X-Amz-Target` or an
+    `Action` parameter on a shared `POST /`, which they cannot see. For the
+    same reason a request carrying a query string is refused with 400 before
+    use-accounting: S3 selects subresources and object versions there
+    (`?acl`, `?versionId=`). The proxy signs each forwarded request (`server/src/sigv4.rs`) over exactly
+    what it sends: the path goes out in SigV4's strict single encoding,
+    `host`, `x-amz-date`, `x-amz-content-sha256` (the buffered body's hash)
+    and every surviving caller `x-amz-*` header are signed (repeated values
+    in the order they are sent), and the path is signed once, as S3 does. The
+    caller's `x-amz-date`,
+    `x-amz-content-sha256` and `x-amz-security-token` are replaced, and the
+    `x-amz-copy-source*` family is stripped, since it names a second object
+    the grant's path constraint never saw. Client deposits cannot choose this
+    kind (no scope field); the UI and config can.
 18. **Idempotency canonicalization + bounds.** The MAC input is the canonical
     JSON serialization (serde_json with sorted keys — serialize
     `CreateAccessRequest` to `serde_json::Value`, then a canonical writer that
@@ -688,6 +725,23 @@ These override anything above where they conflict.
     The resolved request page reads the released name off the grant rather than
     the request row, so revisiting a substituted approval shows what was
     actually released, plus the name the client asked for.
+21. **Provisioned secrets and policies.** `secrets:` and `policies:` in the
+    config file are reconciled at startup after `clients:`
+    (`server/src/db/provision.rs`), with every change audited under actor
+    `config`. Rows they create carry `managed_by_config` (migration 0009).
+    A provisioned secret is created, or an existing row of that name adopted;
+    its metadata and tags are set from config; a new version is appended only
+    when the file's bytes differ from the current version (decrypt and
+    constant-time compare), so an unchanged restart writes nothing. It is
+    `operator_vetted`, since the operator chose the bytes. A managed secret no
+    longer in config is deleted through the same path as a UI deletion (its
+    live stored-backed grants are revoked). Policies reconcile by content: a
+    managed row whose fields still match a config entry is left alone; others
+    are deleted, and missing entries inserted. The UI refuses to rotate or
+    delete managed secrets and to delete managed policies (409), because the
+    next restart would undo it. Unmanaged rows are never touched. Rotating a
+    value means changing the mounted file and restarting; the chart lists the
+    source Secrets in its Reloader annotation for that.
 
 ## Definition of done per module
 

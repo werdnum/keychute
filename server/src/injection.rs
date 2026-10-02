@@ -48,6 +48,11 @@ const MAX_INJECTION_FIELD_BYTES: usize = 128;
 /// 0003). 'basic-password' is accepted as an alias for 'basic' (both spellings
 /// are also valid in the DB CHECK since migration 0004).
 ///
+/// Kind 'aws-sigv4' (migration 0009) needs two template fields: the access key
+/// id arrives in `header` (the same "whose account" field basic auth uses) and
+/// is stored in `injection_username`; `scope` is `region/service` and is
+/// stored in `injection_header`. The stored secret is the secret access key.
+///
 /// Errors are `&'static str` so they can be surfaced verbatim by both the UI
 /// (`400` page) and the API (`invalid-request`) without ever embedding
 /// caller-supplied text in the message.
@@ -55,7 +60,11 @@ const MAX_INJECTION_FIELD_BYTES: usize = 128;
 pub fn validate_injection(
     kind: &str,
     header: Option<&str>,
+    scope: Option<&str>,
 ) -> Result<(String, Option<String>, Option<String>), &'static str> {
+    if scope.is_some() && kind != "aws-sigv4" {
+        return Err("a SigV4 scope is only valid for injection kind 'aws-sigv4'");
+    }
     match kind {
         "bearer" => Ok(("bearer".into(), None, None)),
         "header" => {
@@ -105,6 +114,19 @@ pub fn validate_injection(
             // (the proxy still falls back to injection_header for old rows).
             Ok(("basic".into(), None, Some(username.to_owned())))
         }
+        "aws-sigv4" => {
+            let access_key_id =
+                header.ok_or("injection kind 'aws-sigv4' requires an access key id")?;
+            crate::sigv4::validate_access_key_id(access_key_id)?;
+            let scope =
+                scope.ok_or("injection kind 'aws-sigv4' requires a region/service scope")?;
+            crate::sigv4::parse_scope(scope)?;
+            Ok((
+                "aws-sigv4".into(),
+                Some(scope.to_owned()),
+                Some(access_key_id.to_owned()),
+            ))
+        }
         _ => Err("unknown injection kind"),
     }
 }
@@ -117,11 +139,29 @@ mod tests {
     fn injection_fields_are_length_bounded() {
         // Every other client-supplied stored field is bounded; so is this one.
         let long = "a".repeat(MAX_INJECTION_FIELD_BYTES + 1);
-        assert!(validate_injection("header", Some(&long)).is_err());
-        assert!(validate_injection("basic", Some(&long)).is_err());
+        assert!(validate_injection("header", Some(&long), None).is_err());
+        assert!(validate_injection("basic", Some(&long), None).is_err());
         // At the bound it still validates.
         let ok = "a".repeat(MAX_INJECTION_FIELD_BYTES);
-        assert!(validate_injection("header", Some(&ok)).is_ok());
-        assert!(validate_injection("basic", Some(&ok)).is_ok());
+        assert!(validate_injection("header", Some(&ok), None).is_ok());
+        assert!(validate_injection("basic", Some(&ok), None).is_ok());
+    }
+
+    #[test]
+    fn sigv4_template_routes_key_id_and_scope() {
+        assert_eq!(
+            validate_injection("aws-sigv4", Some("lake-media-read"), Some("us-east-1/s3")),
+            Ok((
+                "aws-sigv4".into(),
+                Some("us-east-1/s3".into()),
+                Some("lake-media-read".into())
+            ))
+        );
+        assert!(validate_injection("aws-sigv4", None, Some("us-east-1/s3")).is_err());
+        assert!(validate_injection("aws-sigv4", Some("k"), None).is_err());
+        assert!(validate_injection("aws-sigv4", Some("k/x"), Some("us-east-1/s3")).is_err());
+        assert!(validate_injection("aws-sigv4", Some("k"), Some("us-east-1")).is_err());
+        // A scope never rides along on another kind.
+        assert!(validate_injection("bearer", None, Some("us-east-1/s3")).is_err());
     }
 }
