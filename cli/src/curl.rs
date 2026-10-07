@@ -167,7 +167,9 @@ pub(crate) struct CurlArgs {
     pub url: String,
     /// Name of the Keychute secret to authenticate with. The value stays
     /// server-side; the server attaches it per the secret's injection
-    /// template. Required unless --grant-id names an existing grant.
+    /// template. Required unless --grant-id names an existing grant. If you
+    /// do not know the exact name, pick a plausible one: when nothing is
+    /// stored under it, the approver can substitute the right stored secret.
     #[arg(long)]
     pub secret: Option<String>,
     /// HTTP method (default GET, or POST when a body is supplied).
