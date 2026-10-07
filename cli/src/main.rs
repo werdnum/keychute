@@ -87,7 +87,9 @@ enum Cmd {
 
 #[derive(clap::Args)]
 struct RequestArgs {
-    /// Name of the secret to request.
+    /// Name of the secret to request. If you do not know the exact name, pick
+    /// a plausible one (e.g. `github-token`): when nothing is stored under it,
+    /// the approver can release the right stored secret instead.
     secret_name: String,
     /// Human-readable reason, shown verbatim on the approval page.
     #[arg(long, default_value = "")]
