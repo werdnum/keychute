@@ -453,7 +453,7 @@ async fn a_deposit_cannot_satisfy_a_standing_auto_approve_policy() {
             .unwrap()
             .to_string();
     assert!(
-        secrets_page.contains("Review value"),
+        secrets_page.contains(&format!("/ui/secrets/{secret_id}/review\"")),
         "the secrets page offers the review action"
     );
 
