@@ -2500,6 +2500,16 @@ async fn policies_page(
                             }
                         }
                     }
+                    // Visible, not under "More conditions": the handler refuses a
+                    // brokered auto-approve or notify-only rule without one.
+                    label {
+                        "Origins " span .muted { "(host[:port], one per line)" }
+                        span .sub {
+                            "Required for a brokered auto-approve or notify-only policy."
+                        }
+                        textarea name="origins" rows="2"
+                            autocapitalize="off" autocorrect="off" spellcheck="false" {}
+                    }
                     details .more {
                         summary { "More conditions" }
                         div .field-grid {
@@ -2512,11 +2522,6 @@ async fn policies_page(
                                 "Priority"
                                 input type="number" name="priority" value="0" inputmode="numeric";
                             }
-                        }
-                        label {
-                            "Origins " span .muted { "(host[:port], one per line)" }
-                            textarea name="origins" rows="3"
-                                autocapitalize="off" autocorrect="off" spellcheck="false" {}
                         }
                         label {
                             "Methods " span .muted { "(comma/space separated, blank = unconstrained)" }
