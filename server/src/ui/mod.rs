@@ -886,8 +886,9 @@ fn duration_label(secs: u64) -> String {
     let Some(first) = units.iter().position(|(n, _)| *n > 0) else {
         return "0s".to_owned();
     };
-    // The largest unit and the one below it: "1h 30m", never "1h 30s".
-    units[first..units.len().min(first + 2)]
+    // Exact, never rounded: these label limits the server enforces, and
+    // showing a stricter one than the real limit would mislead.
+    units[first..]
         .iter()
         .filter(|(n, _)| *n > 0)
         .map(|(n, unit)| format!("{n}{unit}"))
@@ -2246,6 +2247,9 @@ async fn deny(
 async fn grants_page(State(state): State<AppState>, headers: HeaderMap) -> UiResult<Html<String>> {
     let op = operator(&state, &headers).await?;
     let now = Utc::now();
+    // Database clock for the expiry label: grant liveness is decided by SQL
+    // now(), and `now` above is the process clock the CSRF tokens need.
+    let db_now = db::db_now(&state.db).await?;
     let grants =
         db::ui_ext::list_active_grants(&state.db, state.config.limits.replay_window_seconds)
             .await?;
@@ -2272,7 +2276,7 @@ async fn grants_page(State(state): State<AppState>, headers: HeaderMap) -> UiRes
                                     td data-label="Client" { b { (g.client_name) } }
                                     td data-label="Secret" { span .mono { (g.secret_name) } }
                                     td data-label="Mechanism" { (mechanism_badge(&g.mechanism)) }
-                                    td data-label="Expires" { (relative_time(g.not_after, now)) }
+                                    td data-label="Expires" { (relative_time(g.not_after, db_now)) }
                                     td .numeric data-label="Uses" {
                                         (g.use_count)
                                         @if let Some(m) = g.max_uses { " / " (m) }
@@ -2408,7 +2412,7 @@ async fn policies_page(
                         }
                         tbody {
                             @for p in &policies {
-                                tr title={ "Created by " (p.created_by) } {
+                                tr {
                                     td data-label="Client" {
                                         @match &p.client_name {
                                             Some(c) => { b { (c) } }
@@ -2424,8 +2428,10 @@ async fn policies_page(
                                     td data-label="Outcome" { (policy_outcome_badge(&p.outcome)) }
                                     td data-label="Conditions" {
                                         @let conditions = policy_conditions(p);
-                                        @if conditions.is_empty() { span .muted { "—" } }
-                                        @else { span .muted { (conditions.join(" · ")) } }
+                                        span .muted {
+                                            @if !conditions.is_empty() { (conditions.join(" · ")) }
+                                            span .sub { "by " (p.created_by) }
+                                        }
                                     }
                                     td .actions data-label="" {
                                         @if p.managed_by_config {
@@ -3990,14 +3996,14 @@ mod tests {
     }
 
     #[test]
-    fn duration_label_keeps_the_two_largest_units() {
+    fn duration_label_is_exact() {
         assert_eq!(duration_label(0), "0s");
         assert_eq!(duration_label(45), "45s");
         assert_eq!(duration_label(600), "10m");
         assert_eq!(duration_label(3600), "1h");
-        assert_eq!(duration_label(3630), "1h");
+        assert_eq!(duration_label(3630), "1h 30s");
         assert_eq!(duration_label(5400), "1h 30m");
-        assert_eq!(duration_label(2 * 86_400 + 4 * 3600 + 59), "2d 4h");
+        assert_eq!(duration_label(2 * 86_400 + 4 * 3600 + 59), "2d 4h 59s");
     }
 
     #[test]
