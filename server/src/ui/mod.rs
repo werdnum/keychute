@@ -488,7 +488,6 @@ a { color: var(--accent); text-underline-offset: 2px; }
 .stat:hover, .stat:focus-visible { border-color: var(--accent); }
 .stat-name { font-weight: 650; font-size: 0.95rem; color: var(--accent); }
 .stat-value { font-size: 1.4rem; font-weight: 700; letter-spacing: -0.02em; line-height: 1.2; }
-.stat-desc { font-size: 0.87rem; color: var(--text-muted); }
 .stat-alert .stat-value { color: var(--warn); }
 
 /* ---- badges ---- */
@@ -713,6 +712,10 @@ button.primary:hover { background: var(--accent-hover); border-color: var(--acce
 button.danger { color: var(--danger); border-color: var(--danger-border); background: var(--danger-bg); }
 button.danger:hover { border-color: var(--danger); color: var(--danger); }
 
+/* A row's Delete is rarely used and leads to a confirmation step, so it
+   should not shout as loud as the action the page exists for. */
+button.danger.quiet { background: transparent; border-color: var(--border); }
+
 button.small, .btn.small { min-height: 2.25rem; padding: 0.3rem 0.8rem; font-size: 0.88rem; }
 
 .btn-link {
@@ -723,6 +726,42 @@ button.small, .btn.small { min-height: 2.25rem; padding: 0.3rem 0.8rem; font-siz
   text-decoration: none;
 }
 .btn-link:hover { text-decoration: underline; }
+
+/* ---- disclosure ----
+   Rarely used controls and long explanations live behind <details>, which
+   needs no script: the CSP allows none. */
+
+details { margin: 0 0 1rem; }
+details > :last-child { margin-bottom: 0; }
+
+summary {
+  cursor: pointer;
+  font-weight: 600;
+  color: var(--accent);
+  min-height: 2.25rem;
+  padding: 0.35rem 0;
+}
+
+details[open] > summary { margin-bottom: 0.5rem; }
+details.more > summary { color: var(--text-muted); font-size: 0.92rem; font-weight: 550; }
+details.more > summary:hover { color: var(--text); }
+
+details.panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 0 1.1rem;
+  margin: 0 0 1.25rem;
+}
+details.panel > summary { font-size: 1.05rem; padding: 0.8rem 0; }
+details.panel[open] { padding-bottom: 1.1rem; }
+
+.kv details, fieldset > details:last-child { margin: 0.2rem 0 0; }
+
+.sub { display: block; font-size: 0.87rem; color: var(--text-muted); font-weight: 400; }
+.badges { display: flex; flex-wrap: wrap; gap: 0.3rem; }
+.reason { font-size: 1.05rem; }
 
 /* ---- misc ---- */
 
@@ -808,21 +847,63 @@ fn html_page_at(title: &str, current: &str, body: Markup) -> Html<String> {
     Html(layout_at(title, Some(current), body).into_string())
 }
 
-/// Short badge for a tier: the long [`Tier::human_label`] belongs in the
-/// grant block, not in a table cell that has to fit on a phone.
-fn tier_badge(tier: Tier) -> Markup {
-    let class = match tier {
+fn tier_badge_class(tier: Tier) -> &'static str {
+    match tier {
         Tier::Brokered => "badge badge-ok",
         Tier::TrustedClient => "badge",
         Tier::CooperatingClient => "badge badge-warn",
         Tier::Direct => "badge badge-danger",
-    };
-    html! { span class=(class) title=(tier.human_label()) { (tier.as_str()) } }
+    }
+}
+
+/// Short badge for a tier: the long [`Tier::human_label`] belongs in the
+/// grant block, not in a table cell that has to fit on a phone.
+fn tier_badge(tier: Tier) -> Markup {
+    html! { span class=(tier_badge_class(tier)) title=(tier.human_label()) { (tier.as_str()) } }
 }
 
 /// Badge for a mechanism string as stored (may be an unknown legacy value).
+/// A mechanism fixes its tier, so the badge carries the tier's colour and
+/// label rather than spending a second table column on it.
 fn mechanism_badge(mechanism: &str) -> Markup {
-    html! { span .badge .mono { (mechanism) } }
+    match Mechanism::from_str_opt(mechanism).map(|m| m.tier()) {
+        Some(tier) => html! {
+            span class=(tier_badge_class(tier)) title=(tier.human_label()) { (mechanism) }
+        },
+        None => html! { span .badge .mono { (mechanism) } },
+    }
+}
+
+/// Compact duration for display, e.g. `45s`, `10m`, `1h 30m`, `2d 4h`.
+fn duration_label(secs: u64) -> String {
+    let (d, h, m, s) = (
+        secs / 86_400,
+        secs % 86_400 / 3600,
+        secs % 3600 / 60,
+        secs % 60,
+    );
+    let units = [(d, "d"), (h, "h"), (m, "m"), (s, "s")];
+    let Some(first) = units.iter().position(|(n, _)| *n > 0) else {
+        return "0s".to_owned();
+    };
+    // The largest unit and the one below it: "1h 30m", never "1h 30s".
+    units[first..units.len().min(first + 2)]
+        .iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, unit)| format!("{n}{unit}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// "in 23m" / "5m ago", with the absolute time for a hover.
+fn relative_time(at: DateTime<Utc>, now: DateTime<Utc>) -> Markup {
+    let secs = (at - now).num_seconds();
+    let label = if secs >= 0 {
+        format!("in {}", duration_label(secs.unsigned_abs()))
+    } else {
+        format!("{} ago", duration_label(secs.unsigned_abs()))
+    };
+    html! { span title=(at.format("%Y-%m-%d %H:%M:%S UTC")) { (label) } }
 }
 
 fn policy_outcome_badge(outcome: &str) -> Markup {
@@ -885,59 +966,76 @@ fn parse_mechanism(s: &str) -> UiResult<Mechanism> {
 /// stored, validated constraints — never the client's narration.
 fn grant_block(mechanism: Mechanism, constraints: &Constraints, secret_line: Markup) -> Markup {
     let tier = mechanism.tier();
+    // Origins, methods and paths are what a brokered grant is scoped by, so
+    // there an empty list is itself worth seeing. Other mechanisms only carry
+    // the ones they use, and a column of "(none)" rows is noise.
+    let show_scope = |empty: bool| !empty || mechanism == Mechanism::Brokered;
     html! {
         section .grant-block {
             span .block-label { "What the server will enforce" }
             h2 { "What you are approving" }
             table .kv {
                 tr { th { "Secret" } td { (secret_line) } }
-                tr { th { "Mechanism" } td { (mechanism_badge(mechanism.as_str())) } }
-                tr { th { "Tier" } td { (tier.human_label()) } }
-                tr { th { "Origins" }
-                    td {
-                        @if constraints.origins.is_empty() { span .muted { "(none)" } }
-                        @else {
-                            ul .list-plain {
-                                @for o in &constraints.origins { li .mono { (o.to_display()) } }
+                tr { th { "Mechanism" }
+                    td { (mechanism_badge(mechanism.as_str())) " " span .muted { (tier.human_label()) } }
+                }
+                @if show_scope(constraints.origins.is_empty()) {
+                    tr { th { "Origins" }
+                        td {
+                            @if constraints.origins.is_empty() { span .muted { "(none)" } }
+                            @else {
+                                ul .list-plain {
+                                    @for o in &constraints.origins { li .mono { (o.to_display()) } }
+                                }
                             }
                         }
                     }
                 }
-                tr { th { "Methods" }
-                    td {
-                        @if constraints.methods.is_empty() { span .muted { "(none)" } }
-                        @else { span .mono { (constraints.methods.join(", ")) } }
+                @if show_scope(constraints.methods.is_empty()) {
+                    tr { th { "Methods" }
+                        td {
+                            @if constraints.methods.is_empty() { span .muted { "(none)" } }
+                            @else { span .mono { (constraints.methods.join(", ")) } }
+                        }
                     }
                 }
-                tr { th { "Path prefixes" }
-                    td {
-                        @if constraints.path_prefixes.is_empty() { span .muted { "(none)" } }
-                        @else {
-                            ul .list-plain {
-                                @for p in &constraints.path_prefixes { li .mono { (p) } }
-                            }
-                            // Stored canonical (`api/requests.rs` canonicalizes
-                            // every submitted prefix), and the proxy matches the
-                            // canonicalized request path against these. Say so:
-                            // a client is free to display `/users/%7Ealice`
-                            // while the path actually sent is `/users/~alice`,
-                            // and the line below is the one that decides.
-                            p .muted {
-                                "Canonical form: percent-escapes are decoded once. "
-                                "The request is matched and forwarded using these "
-                                "paths, whatever spelling the client shows below."
+                @if show_scope(constraints.path_prefixes.is_empty()) {
+                    tr { th { "Path prefixes" }
+                        td {
+                            @if constraints.path_prefixes.is_empty() { span .muted { "(none)" } }
+                            @else {
+                                ul .list-plain {
+                                    @for p in &constraints.path_prefixes { li .mono { (p) } }
+                                }
+                                // Stored canonical (`api/requests.rs` canonicalizes
+                                // every submitted prefix), and the proxy matches the
+                                // canonicalized request path against these. Say so:
+                                // a client is free to display `/users/%7Ealice`
+                                // while the path actually sent is `/users/~alice`,
+                                // and the line below is the one that decides.
+                                details .more {
+                                    summary { "How paths are matched" }
+                                    p .muted {
+                                        "Canonical form: percent-escapes are decoded once. "
+                                        "The request is matched and forwarded using these "
+                                        "paths, whatever spelling the client shows below."
+                                    }
+                                }
                             }
                         }
                     }
                 }
-                tr { th { "Requested TTL" } td { (constraints.ttl_seconds) " seconds" } }
-                tr { th { "Requested max uses" }
+                tr { th { "Lasts" }
                     td {
+                        span title={ (constraints.ttl_seconds) " seconds" } {
+                            (duration_label(constraints.ttl_seconds))
+                        }
+                        " · "
                         @match constraints.max_uses {
-                            Some(n) => { (n) }
+                            Some(n) => { "at most " (n) @if n == 1 { " use" } @else { " uses" } }
                             None => {
-                                @if mechanism.is_releasing() { "1 (releasing default)" }
-                                @else { "unlimited within TTL" }
+                                @if mechanism.is_releasing() { "1 use (releasing default)" }
+                                @else { "unlimited uses within TTL" }
                             }
                         }
                     }
@@ -964,10 +1062,9 @@ fn context_block(context: Option<&RequestContext>, mechanism: Mechanism) -> Mark
     html! {
         section .context-block {
             span .block-label { "What the client claims" }
-            h2 { "Context supplied by the client" }
             p .muted {
-                "An agent under prompt injection can put anything here. None of it "
-                "is checked, and none of it changes what the server enforces."
+                "Unchecked: an agent under prompt injection can write anything here, "
+                "and none of it changes what the server enforces."
             }
             @if mechanism == Mechanism::CliRead {
                 p .caveat {
@@ -980,7 +1077,7 @@ fn context_block(context: Option<&RequestContext>, mechanism: Mechanism) -> Mark
                 Some(ctx) => {
                     h3 { "Reason" }
                     @if ctx.reason.is_empty() { p .muted { "(no reason given)" } }
-                    @else { p { (ctx.reason) } }
+                    @else { p .reason { (ctx.reason) } }
                     // Brokered only. The caveat below describes what a BROKERED
                     // grant constrains — an origin, a method, a canonical path,
                     // and a query string forwarded as written. No other
@@ -996,17 +1093,17 @@ fn context_block(context: Option<&RequestContext>, mechanism: Mechanism) -> Mark
                         h3 { "Target claimed by the client" }
                         p .mono { (target) }
                         p .caveat {
-                            "A claim, not a constraint. What the server enforces is the "
-                            "origin, method and canonical path above; a query string is "
-                            "forwarded as written and is not constrained at all. Read this "
-                            "line for intent, and the block above for what it can do."
+                            "A claim, not a constraint: only the origin, method and path "
+                            "above are enforced. A query string is forwarded as written."
                         }
                     }
                     @if let Some(structured) = &ctx.structured {
-                        h3 { "Structured context" }
-                        pre {
-                            (serde_json::to_string_pretty(structured)
-                                .unwrap_or_else(|_| "(unrenderable)".to_owned()))
+                        details .more {
+                            summary { "Structured context" }
+                            pre {
+                                (serde_json::to_string_pretty(structured)
+                                    .unwrap_or_else(|_| "(unrenderable)".to_owned()))
+                            }
                         }
                     }
                 }
@@ -1079,12 +1176,7 @@ async fn overview_page(
         "Overview",
         "/",
         html! {
-            (page_head("Keychute", html! {
-                "Secrets broker for AI agents. You pick the risk tier of every "
-                "delivery path; every release is either matched by a standing policy "
-                "or approved here, by you."
-            }))
-            p .muted { "Signed in as " span .mono { (op.subject) } "." }
+            div .page-head { h1 { "Overview" } }
 
             @if pending > 0 {
                 div .callout .callout-attention {
@@ -1111,34 +1203,28 @@ async fn overview_page(
                     a .stat .stat-alert[pending > 0] href="/ui/requests" {
                         span .stat-name { "Requests" }
                         span .stat-value { (pending) " pending" }
-                        span .stat-desc { "Access requests awaiting approval or denial." }
                     }
                 }
                 li {
                     a .stat href="/ui/grants" {
                         span .stat-name { "Grants" }
                         span .stat-value { (grants) " active" }
-                        span .stat-desc { "Live grants; revoke one to cut off access immediately." }
                     }
                 }
                 li {
                     a .stat href="/ui/policies" {
                         span .stat-name { "Policies" }
                         span .stat-value { (policies) }
-                        // Not "auto-approve": a policy row's outcome is any of
-                        // auto-approve, notify-only, require-approval or deny,
-                        // and the count (like /ui/policies itself) covers all.
-                        span .stat-desc { "Standing rules applied to a request before you see it." }
                     }
                 }
                 li {
                     a .stat href="/ui/secrets" {
                         span .stat-name { "Secrets" }
                         span .stat-value { (secrets) " stored" }
-                        span .stat-desc { "Stored credentials, their max tier and injection style." }
                     }
                 }
             }
+            p .muted { "Signed in as " span .mono { (op.subject) } "." }
         },
     ))
 }
@@ -1165,10 +1251,7 @@ async fn requests_page(
         "Pending requests",
         "/ui/requests",
         html! {
-            (page_head("Pending access requests", html! {
-                "Each row is an agent waiting on you. Open one to see exactly what "
-                "it would get."
-            }))
+            div .page-head { h1 { "Pending requests" } }
             @if rows.is_empty() { (empty_state("No pending requests.")) }
             @else {
                 div .table-wrap .stack-wrap {
@@ -1176,7 +1259,7 @@ async fn requests_page(
                         thead {
                             tr {
                                 th { "Client" } th { "Secret" } th { "Mechanism" }
-                                th { "Tier" } th .numeric { "Age" } th { span .muted { "Action" } }
+                                th .numeric { "Age" } th { span .muted { "Action" } }
                             }
                         }
                         tbody {
@@ -1185,12 +1268,6 @@ async fn requests_page(
                                     td data-label="Client" { b { (r.client_name) } }
                                     td data-label="Secret" { span .mono { (r.secret_name) } }
                                     td data-label="Mechanism" { (mechanism_badge(&r.mechanism)) }
-                                    td data-label="Tier" {
-                                        @match Mechanism::from_str_opt(&r.mechanism) {
-                                            Some(m) => { (tier_badge(m.tier())) }
-                                            None => { span .badge .muted { "unknown" } }
-                                        }
-                                    }
                                     td .numeric data-label="Age" { (age_label(r.created_at, now)) }
                                     td .actions data-label="" {
                                         a .btn .small href={ "/ui/requests/" (r.id) } { "Review" }
@@ -1449,39 +1526,22 @@ async fn render_request_detail(
                 form method="post" action={ "/ui/requests/" (id) "/approve" } {
                     input type="hidden" name="csrf_token" value=(approve_token);
                     input type="hidden" name=(F_SECRET_PRESENT) value=(secret_present);
-                    fieldset {
-                        legend { "Narrow the grant (optional)" }
-                        p .muted { "Either value can only shrink what was requested." }
-                        div .field-grid {
-                            label {
-                                "TTL seconds (≤ " (constraints.ttl_seconds) ")"
-                                input type="number" name="ttl_seconds" min="1" inputmode="numeric"
-                                    max=(constraints.ttl_seconds) placeholder=(constraints.ttl_seconds);
-                            }
-                            label {
-                                "Max uses"
-                                input type="number" name="max_uses" min="1" inputmode="numeric";
-                            }
-                        }
-                    }
                     @if secret.is_none() {
                         fieldset {
-                            legend { "Release a secret you already have" }
-                            p .muted {
-                                "Keychute has nothing stored under "
-                                span .mono { (row.secret_name) }
-                                ". If the client guessed the name wrong, pick the secret it "
-                                "actually needs — the grant is issued against the secret you "
-                                "pick, and everything below is ignored."
-                            }
+                            legend { "This secret isn't stored yet" }
                             @if substitutes.is_empty() {
-                                p .caveat {
-                                    "No stored secret can serve this tier, so the value has to "
-                                    "be entered below."
+                                p .muted {
+                                    "No stored secret can serve this tier, so enter the "
+                                    "value to release."
                                 }
                             } @else {
                                 label {
-                                    "Stored secret"
+                                    "Release a stored secret instead"
+                                    span .sub {
+                                        "If the client guessed the name wrong. The grant is "
+                                        "issued against the secret you pick, and the value "
+                                        "field is ignored."
+                                    }
                                     select name=(F_SUBSTITUTE) {
                                         option value="" selected {
                                             "— none: enter the value below —"
@@ -1506,11 +1566,8 @@ async fn render_request_detail(
                                     }
                                 }
                             }
-                        }
-                        fieldset {
-                            legend { "Or enter the secret value (not yet stored)" }
                             label {
-                                "Secret value"
+                                @if substitutes.is_empty() { "Secret value" } @else { "Or enter the secret value" }
                                 input type="password" name="secret_value" autocomplete="off"
                                     autocapitalize="off" autocorrect="off" spellcheck="false";
                             }
@@ -1518,50 +1575,65 @@ async fn render_request_detail(
                                 input type="checkbox" name="store_secret" value="on";
                                 span {
                                     "Store this secret in Keychute"
-                                    br;
-                                    span .muted { "Otherwise it is released once, to this grant only." }
+                                    span .sub { "Otherwise it is released once, to this grant only." }
                                 }
                             }
-                            label {
-                                "Max tier when stored: " b { (default_tier.as_str()) }
+                            details .more {
+                                summary { "Storage options" }
+                                p .muted {
+                                    "Max tier when stored: " b { (default_tier.as_str()) }
+                                    ", the tier you are approving. Widen it later from the "
+                                    "secrets page if you mean to."
+                                }
                                 input type="hidden" name="store_max_tier" value=(default_tier.as_str());
-                                span .muted {
-                                    " — fixed to the tier you are approving. Widen it later from "
-                                    "the secrets page if you mean to."
-                                }
-                            }
-                            div .field-grid {
-                                label {
-                                    "Injection kind"
-                                    select name="injection_kind" {
-                                        option value="bearer" selected { "bearer (Authorization: Bearer …)" }
-                                        option value="header" { "header (named header)" }
-                                        option value="basic" { "basic-password (Authorization: Basic)" }
+                                div .field-grid {
+                                    label {
+                                        "Injection kind"
+                                        select name="injection_kind" {
+                                            option value="bearer" selected { "bearer (Authorization: Bearer …)" }
+                                            option value="header" { "header (named header)" }
+                                            option value="basic" { "basic-password (Authorization: Basic)" }
+                                        }
+                                    }
+                                    label {
+                                        "Header name / basic-auth username"
+                                        span .sub { "Only for header and basic-password." }
+                                        input type="text" name="injection_header"
+                                            autocapitalize="off" autocorrect="off" spellcheck="false";
                                     }
                                 }
                                 label {
-                                    "Header name / basic-auth username"
-                                    input type="text" name="injection_header"
-                                        autocapitalize="off" autocorrect="off" spellcheck="false";
-                                    span .muted { "Only for kinds " b { "header" } " and " b { "basic-password" } "." }
+                                    "Description"
+                                    input type="text" name="store_description";
                                 }
                             }
+                        }
+                    }
+                    details .more {
+                        summary { "Narrow the grant" }
+                        p .muted { "Either value can only shrink what was requested." }
+                        div .field-grid {
                             label {
-                                "Description"
-                                input type="text" name="store_description";
+                                "TTL seconds (≤ " (constraints.ttl_seconds) ")"
+                                input type="number" name="ttl_seconds" min="1" inputmode="numeric"
+                                    max=(constraints.ttl_seconds) placeholder=(constraints.ttl_seconds);
+                            }
+                            label {
+                                "Max uses"
+                                input type="number" name="max_uses" min="1" inputmode="numeric";
                             }
                         }
                     }
                     div .actions-bar {
                         button .primary type="submit" { "Approve" }
+                        // Submits the deny form below: forms cannot nest, and
+                        // this keeps both decisions on one row.
+                        button .danger type="submit" form="deny-form" { "Deny" }
+                        a .btn-link href="/ui/requests" { "Decide later" }
                     }
                 }
-                div .actions-bar {
-                    form method="post" action={ "/ui/requests/" (id) "/deny" } .inline {
-                        input type="hidden" name="csrf_token" value=(deny_token);
-                        button .danger type="submit" { "Deny" }
-                    }
-                    a .btn-link href="/ui/requests" { "Decide later" }
+                form #deny-form method="post" action={ "/ui/requests/" (id) "/deny" } {
+                    input type="hidden" name="csrf_token" value=(deny_token);
                 }
             }
         },
@@ -2182,8 +2254,7 @@ async fn grants_page(State(state): State<AppState>, headers: HeaderMap) -> UiRes
         "/ui/grants",
         html! {
             (page_head("Active grants", html! {
-                "Live access a client is holding right now. Revoking one cuts it "
-                "off immediately."
+                "Revoking a grant cuts the client off immediately."
             }))
             @if grants.is_empty() { (empty_state("No active grants.")) }
             @else {
@@ -2201,13 +2272,11 @@ async fn grants_page(State(state): State<AppState>, headers: HeaderMap) -> UiRes
                                     td data-label="Client" { b { (g.client_name) } }
                                     td data-label="Secret" { span .mono { (g.secret_name) } }
                                     td data-label="Mechanism" { (mechanism_badge(&g.mechanism)) }
-                                    td data-label="Expires" { (g.not_after.format("%Y-%m-%d %H:%M:%S UTC")) }
+                                    td data-label="Expires" { (relative_time(g.not_after, now)) }
                                     td .numeric data-label="Uses" {
-                                        (g.use_count) " / "
-                                        @match g.max_uses {
-                                            Some(m) => { (m) }
-                                            None => { "unlimited" }
-                                        }
+                                        (g.use_count)
+                                        @if let Some(m) = g.max_uses { " / " (m) }
+                                        @else { span .muted { " / unlimited" } }
                                     }
                                     td .actions data-label="" {
                                         form method="post" action={ "/ui/grants/" (g.id) "/revoke" } .inline {
@@ -2257,6 +2326,48 @@ async fn revoke(
 // ---------------------------------------------------------------------------
 // Policies
 
+/// Everything a policy row narrows or caps, as short phrases for one table
+/// cell. Empty when the row matches on client, secret and mechanism alone.
+fn policy_conditions(p: &db::PolicyRow) -> Vec<String> {
+    let mut out = Vec::new();
+    match serde_json::from_value::<Vec<Origin>>(p.origins.clone()) {
+        Ok(origins) if origins.is_empty() => {}
+        Ok(origins) => out.push(
+            origins
+                .iter()
+                .map(|o| match o.port {
+                    Some(port) => format!("{}:{port}", o.host),
+                    None => o.host.clone(),
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+        Err(_) => out.push("(unreadable origins)".to_owned()),
+    }
+    if !p.methods.is_empty() {
+        out.push(p.methods.join(", "));
+    }
+    if !p.path_prefixes.is_empty() {
+        out.push(p.path_prefixes.join(", "));
+    }
+    if let Some(ttl) = p.max_ttl_seconds {
+        out.push(format!(
+            "ttl ≤ {}",
+            duration_label(ttl.max(0).unsigned_abs())
+        ));
+    }
+    if let Some(u) = p.max_uses {
+        out.push(format!("uses ≤ {u}"));
+    }
+    if let Some(t) = p.not_after {
+        out.push(format!("until {}", t.format("%Y-%m-%d %H:%M UTC")));
+    }
+    if p.priority != 0 {
+        out.push(format!("priority {}", p.priority));
+    }
+    out
+}
+
 async fn policies_page(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2275,11 +2386,16 @@ async fn policies_page(
         "/ui/policies",
         html! {
             (page_head("Standing policies", html! {
-                "Applied before a request ever reaches you. A matching deny wins "
-                "outright; otherwise the most specific match does — naming a client, "
-                "then a secret, outranks a wildcard, and Priority only breaks ties "
-                "between rows of equal specificity."
+                "Rules applied to a request before it reaches you."
             }))
+            details .more {
+                summary { "How a request is matched" }
+                p .muted {
+                    "A matching deny wins outright; otherwise the most specific match "
+                    "does — naming a client, then a secret, outranks a wildcard, and "
+                    "Priority only breaks ties between rows of equal specificity."
+                }
+            }
             @if policies.is_empty() { (empty_state("No policy rows.")) }
             @else {
                 div .table-wrap .stack-wrap {
@@ -2287,13 +2403,12 @@ async fn policies_page(
                         thead {
                             tr {
                                 th { "Client" } th { "Secret" } th { "Mechanism" } th { "Outcome" }
-                                th .numeric { "Priority" } th { "Limits" } th { "Not after" }
-                                th { "By" } th { span .muted { "Action" } }
+                                th { "Conditions" } th { span .muted { "Action" } }
                             }
                         }
                         tbody {
                             @for p in &policies {
-                                tr {
+                                tr title={ "Created by " (p.created_by) } {
                                     td data-label="Client" {
                                         @match &p.client_name {
                                             Some(c) => { b { (c) } }
@@ -2307,22 +2422,11 @@ async fn policies_page(
                                     }
                                     td data-label="Mechanism" { (mechanism_badge(&p.mechanism)) }
                                     td data-label="Outcome" { (policy_outcome_badge(&p.outcome)) }
-                                    td .numeric data-label="Priority" { (p.priority) }
-                                    td data-label="Limits" {
-                                        @if p.max_ttl_seconds.is_none() && p.max_uses.is_none() {
-                                            span .muted { "—" }
-                                        }
-                                        @if let Some(ttl) = p.max_ttl_seconds { "ttl ≤ " (ttl) "s" }
-                                        @if p.max_ttl_seconds.is_some() && p.max_uses.is_some() { " · " }
-                                        @if let Some(u) = p.max_uses { "uses ≤ " (u) }
+                                    td data-label="Conditions" {
+                                        @let conditions = policy_conditions(p);
+                                        @if conditions.is_empty() { span .muted { "—" } }
+                                        @else { span .muted { (conditions.join(" · ")) } }
                                     }
-                                    td data-label="Not after" {
-                                        @match p.not_after {
-                                            Some(t) => { (t.format("%Y-%m-%d %H:%M UTC")) }
-                                            None => { span .muted { "—" } }
-                                        }
-                                    }
-                                    td data-label="By" { span .muted { (p.created_by) } }
                                     td .actions data-label="" {
                                         @if p.managed_by_config {
                                             span .badge .muted title="Provisioned from config; edit it there" { "config" }
@@ -2330,7 +2434,7 @@ async fn policies_page(
                                         form method="post" action={ "/ui/policies/" (p.id) "/delete" } .inline {
                                             input type="hidden" name="csrf_token"
                                                 value=(csrf::issue_token(&state.keyset, R_POLICY_DELETE, &p.id.to_string(), &op.subject, "", now));
-                                            button .danger .small type="submit" { "Delete" }
+                                            button .danger .quiet .small type="submit" { "Delete" }
                                         }
                                         }
                                     }
@@ -2340,8 +2444,8 @@ async fn policies_page(
                     }
                 }
             }
-            div .card {
-                h2 { "Create policy" }
+            details .panel open[policies.is_empty()] {
+                summary { "New policy" }
                 @if !unvetted.is_empty() {
                     div .callout .callout-attention {
                         p {
@@ -2360,55 +2464,49 @@ async fn policies_page(
                 }
                 form method="post" action="/ui/policies" {
                     input type="hidden" name="csrf_token" value=(create_token);
-                    fieldset {
-                        legend { "What it matches" }
-                        div .field-grid {
-                            label {
-                                "Client name " span .muted { "(blank = any)" }
-                                input type="text" name="client_name"
-                                    autocapitalize="off" autocorrect="off" spellcheck="false";
+                    div .field-grid {
+                        label {
+                            "Client name " span .muted { "(blank = any)" }
+                            input type="text" name="client_name"
+                                autocapitalize="off" autocorrect="off" spellcheck="false";
+                        }
+                        label {
+                            "Secret name " span .muted { "(blank = any)" }
+                            input type="text" name="secret_name"
+                                autocapitalize="off" autocorrect="off" spellcheck="false";
+                        }
+                        label {
+                            "Mechanism"
+                            select name="mechanism" {
+                                option value="brokered" { "brokered" }
+                                option value="autofill" { "autofill" }
+                                option value="cli-read" { "cli-read" }
+                                option value="direct-read" { "direct-read" }
                             }
-                            label {
-                                "Secret name " span .muted { "(blank = any)" }
-                                input type="text" name="secret_name"
-                                    autocapitalize="off" autocorrect="off" spellcheck="false";
-                            }
-                            label {
-                                "…or secret tag"
-                                input type="text" name="secret_tag"
-                                    autocapitalize="off" autocorrect="off" spellcheck="false";
-                            }
-                            label {
-                                "Mechanism"
-                                select name="mechanism" {
-                                    option value="brokered" { "brokered" }
-                                    option value="autofill" { "autofill" }
-                                    option value="cli-read" { "cli-read" }
-                                    option value="direct-read" { "direct-read" }
-                                }
+                        }
+                        label {
+                            "Outcome"
+                            select name="outcome" {
+                                option value="require-approval" { "require-approval" }
+                                option value="notify-only" { "notify-only" }
+                                option value="auto-approve" { "auto-approve" }
+                                option value="deny" { "deny" }
                             }
                         }
                     }
-                    fieldset {
-                        legend { "What it does" }
+                    details .more {
+                        summary { "More conditions" }
                         div .field-grid {
                             label {
-                                "Outcome"
-                                select name="outcome" {
-                                    option value="require-approval" { "require-approval" }
-                                    option value="notify-only" { "notify-only" }
-                                    option value="auto-approve" { "auto-approve" }
-                                    option value="deny" { "deny" }
-                                }
+                                "Secret tag " span .muted { "(instead of a name)" }
+                                input type="text" name="secret_tag"
+                                    autocapitalize="off" autocorrect="off" spellcheck="false";
                             }
                             label {
                                 "Priority"
                                 input type="number" name="priority" value="0" inputmode="numeric";
                             }
                         }
-                    }
-                    fieldset {
-                        legend { "Constraints" }
                         label {
                             "Origins " span .muted { "(host[:port], one per line)" }
                             textarea name="origins" rows="3"
@@ -2669,17 +2767,14 @@ async fn secrets_page(State(state): State<AppState>, headers: HeaderMap) -> UiRe
         "/ui/secrets",
         html! {
             (page_head("Stored secrets", html! {
-                "Credentials Keychute holds. Each one is capped at the broadest tier "
-                "it can ever be released through."
+                "Each secret is capped at the broadest tier it can ever be released through."
             }))
             @if secrets.iter().any(|s| !s.operator_vetted) {
                 div .callout .callout-attention {
                     p {
-                        "Some secrets below were deposited by a client and nobody has "
-                        "reviewed them. Until you do, every release of them needs your "
-                        "approval — a standing auto-approve or notify-only policy will "
-                        "NOT release a secret you have never seen. "
-                        "\"Review value\" shows you the credential the client stored."
+                        "Some secrets were deposited by a client and nobody has reviewed "
+                        "them. Until you do, every release needs your approval, even "
+                        "under an auto-approve or notify-only policy."
                     }
                 }
             }
@@ -2689,20 +2784,22 @@ async fn secrets_page(State(state): State<AppState>, headers: HeaderMap) -> UiRe
                     table .stack {
                         thead {
                             tr {
-                                th { "Name" } th { "Description" } th .numeric { "Version" }
-                                th { "Max tier" } th { "Injection" } th { "Enabled" }
-                                th { "Reviewed" } th { "" }
+                                th { "Name" } th { "Max tier" } th { "Injection" }
+                                th { "Status" } th { "" }
                             }
                         }
                         tbody {
                             @for s in &secrets {
                                 tr {
-                                    td data-label="Name" { b .mono { (s.name) } }
-                                    td data-label="Description" {
-                                        @if s.description.is_empty() { span .muted { "—" } }
-                                        @else { (s.description) }
+                                    td data-label="Name" {
+                                        span {
+                                            b .mono { (s.name) }
+                                            " " span .muted title="Version" { "v" (s.current_version) }
+                                            @if !s.description.is_empty() {
+                                                span .sub { (s.description) }
+                                            }
+                                        }
                                     }
-                                    td .numeric data-label="Version" { (s.current_version) }
                                     td data-label="Max tier" {
                                         @match Tier::from_int(s.max_tier) {
                                             Some(t) => { (tier_badge(t)) }
@@ -2721,23 +2818,21 @@ async fn secrets_page(State(state): State<AppState>, headers: HeaderMap) -> UiRe
                                             @if let Some(u) = &s.injection_username { " (user: " (u) ")" }
                                         }
                                     }
-                                    td data-label="Enabled" {
-                                        @if s.enabled { span .badge .badge-ok { "yes" } }
-                                        @else { span .badge .badge-danger { "no" } }
-                                    }
-                                    td data-label="Reviewed" {
-                                        @if s.operator_vetted { span .badge .badge-ok { "yes" } }
-                                        @else {
-                                            span .badge .badge-warn { "not yet" }
+                                    td data-label="Status" {
+                                        span .badges {
+                                            @if !s.enabled { span .badge .badge-danger { "disabled" } }
+                                            @if !s.operator_vetted { span .badge .badge-warn { "not reviewed" } }
+                                            @if s.enabled && s.operator_vetted { span .badge .badge-ok { "ready" } }
                                         }
                                     }
                                     td .actions data-label="" {
+                                        div .row-actions {
                                         @if !s.operator_vetted {
                                             form method="post"
                                                 action={ "/ui/secrets/" (s.id) "/review" } .inline {
                                                 input type="hidden" name="csrf_token"
                                                     value=(csrf::issue_token(&state.keyset, R_SECRET_REVEAL, &s.id.to_string(), &op.subject, "", now));
-                                                button .small type="submit" { "Review value" }
+                                                button .small type="submit" { "Review" }
                                             }
                                         }
                                         // Goes to a confirmation page, never
@@ -2751,7 +2846,8 @@ async fn secrets_page(State(state): State<AppState>, headers: HeaderMap) -> UiRe
                                             action={ "/ui/secrets/" (s.id) "/delete" } .inline {
                                             input type="hidden" name="csrf_token"
                                                 value=(csrf::issue_token(&state.keyset, R_SECRET_DELETE, &s.id.to_string(), &op.subject, "", now));
-                                            button .small .danger type="submit" { "Delete" }
+                                            button .danger .quiet .small type="submit" { "Delete" }
+                                        }
                                         }
                                         }
                                     }
@@ -2761,11 +2857,11 @@ async fn secrets_page(State(state): State<AppState>, headers: HeaderMap) -> UiRe
                     }
                 }
             }
-            div .card {
-                h2 { "Create or rotate a secret" }
+            details .panel open[secrets.is_empty()] {
+                summary { "Add or rotate a secret" }
                 p .muted {
-                    "If the name matches an existing secret the value is rotated in as a "
-                    "new version (other fields are ignored); otherwise a new secret is created."
+                    "If the name matches an existing secret, the value is rotated in as a "
+                    "new version. Otherwise a new secret is created."
                 }
                 form method="post" action="/ui/secrets" {
                     input type="hidden" name="csrf_token" value=(token);
@@ -2780,38 +2876,44 @@ async fn secrets_page(State(state): State<AppState>, headers: HeaderMap) -> UiRe
                             input type="password" name="secret_value" autocomplete="off" required
                                 autocapitalize="off" autocorrect="off" spellcheck="false";
                         }
-                        label {
-                            "Description"
-                            input type="text" name="description";
-                        }
-                        label {
-                            "Max tier"
-                            select name="max_tier" {
-                                @for t in [Tier::Brokered, Tier::TrustedClient, Tier::CooperatingClient, Tier::Direct] {
-                                    option value=(t.as_str()) selected[t == Tier::Brokered] { (t.as_str()) }
+                    }
+                    details .more {
+                        summary { "Settings for a new secret" }
+                        p .muted { "Ignored when rotating an existing secret." }
+                        div .field-grid {
+                            label {
+                                "Description"
+                                input type="text" name="description";
+                            }
+                            label {
+                                "Max tier"
+                                select name="max_tier" {
+                                    @for t in [Tier::Brokered, Tier::TrustedClient, Tier::CooperatingClient, Tier::Direct] {
+                                        option value=(t.as_str()) selected[t == Tier::Brokered] { (t.as_str()) }
+                                    }
                                 }
                             }
-                        }
-                        label {
-                            "Injection kind"
-                            select name="injection_kind" {
-                                option value="bearer" selected { "bearer" }
-                                option value="header" { "header" }
-                                option value="basic" { "basic-password" }
-                                option value="aws-sigv4" { "aws-sigv4" }
+                            label {
+                                "Injection kind"
+                                select name="injection_kind" {
+                                    option value="bearer" selected { "bearer" }
+                                    option value="header" { "header" }
+                                    option value="basic" { "basic-password" }
+                                    option value="aws-sigv4" { "aws-sigv4" }
+                                }
                             }
-                        }
-                        label {
-                            "Header name / basic-auth username / SigV4 access key id"
-                            input type="text" name="injection_header"
-                                autocapitalize="off" autocorrect="off" spellcheck="false";
-                            span .muted { "Only for kinds " b { "header" } ", " b { "basic-password" } " and " b { "aws-sigv4" } "." }
-                        }
-                        label {
-                            "SigV4 scope"
-                            input type="text" name="injection_scope" placeholder="us-east-1/s3"
-                                autocapitalize="off" autocorrect="off" spellcheck="false";
-                            span .muted { "Only for " b { "aws-sigv4" } ": region/s3 (S3 only). The value is the secret access key." }
+                            label {
+                                "Header name / basic-auth username / SigV4 access key id"
+                                span .sub { "Only for header, basic-password and aws-sigv4." }
+                                input type="text" name="injection_header"
+                                    autocapitalize="off" autocorrect="off" spellcheck="false";
+                            }
+                            label {
+                                "SigV4 scope"
+                                span .sub { "Only for aws-sigv4: region/s3. The value is the secret access key." }
+                                input type="text" name="injection_scope" placeholder="us-east-1/s3"
+                                    autocapitalize="off" autocorrect="off" spellcheck="false";
+                            }
                         }
                     }
                     div .actions-bar {
@@ -3682,7 +3784,7 @@ mod tests {
         assert!(rendered.contains("GET, POST"));
         assert!(rendered.contains("/v1"));
         assert!(rendered.contains("3600"));
-        assert!(rendered.contains("unlimited within TTL"));
+        assert!(rendered.contains("unlimited uses within TTL"));
         assert!(rendered.contains("the client never sees the secret"));
         // The prefixes shown are the canonical ones the proxy matches, and the
         // page says so — that is what lets a client display an escaped
@@ -3885,6 +3987,17 @@ mod tests {
         assert!(validate_injection("basic", Some("user:name"), None).is_err());
         assert!(validate_injection("basic", None, None).is_err());
         assert!(validate_injection("nonsense", None, None).is_err());
+    }
+
+    #[test]
+    fn duration_label_keeps_the_two_largest_units() {
+        assert_eq!(duration_label(0), "0s");
+        assert_eq!(duration_label(45), "45s");
+        assert_eq!(duration_label(600), "10m");
+        assert_eq!(duration_label(3600), "1h");
+        assert_eq!(duration_label(3630), "1h");
+        assert_eq!(duration_label(5400), "1h 30m");
+        assert_eq!(duration_label(2 * 86_400 + 4 * 3600 + 59), "2d 4h");
     }
 
     #[test]

@@ -252,7 +252,7 @@ async fn unstored_request_released_from_an_existing_secret() {
         .await
         .unwrap();
     assert!(
-        page.contains("Release a secret you already have"),
+        page.contains("Release a stored secret instead"),
         "picker offered for an unstored name"
     );
     let option = extract_option_value(&page, "real-api-key")
