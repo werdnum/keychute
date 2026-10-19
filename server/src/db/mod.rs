@@ -157,6 +157,6 @@ pub use requests::{
 pub use secrets::{
     client_deposit_origin, count_secrets, create_secret, create_secret_from_client,
     get_secret_by_name, get_secret_version, get_secret_version_by_id, get_tags_for_secret,
-    insert_secret_version, list_secrets, list_unvetted_secret_names, mark_secret_vetted,
-    set_secret_tags, DepositOutcome, DepositRate, SecretRow, SecretVersionRow,
+    insert_secret_version, list_secret_tags, list_secrets, list_unvetted_secret_names,
+    mark_secret_vetted, set_secret_tags, DepositOutcome, DepositRate, SecretRow, SecretVersionRow,
 };

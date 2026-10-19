@@ -24,7 +24,7 @@ use crate::db::requests::{AccessRequestRow, GrantParams, PassthroughPayload};
 use crate::db::ui_ext::StoreSecretParams;
 use crate::policy;
 use crate::state::AppState;
-use axum::extract::{Path, Request, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{Html, IntoResponse, Redirect, Response};
@@ -1412,6 +1412,11 @@ async fn render_request_detail(
                 }
                 (grant_block(mechanism, &constraints, secret_line))
                 (context_block(context.as_ref(), mechanism))
+                p {
+                    a .btn-link href=(new_policy_href(&row.client_name, &released, mechanism, &constraints)) {
+                        "Create a policy for requests like this"
+                    }
+                }
                 p { a .btn-link href="/ui/requests" { "← Back to pending requests" } }
             },
         ));
@@ -1635,6 +1640,13 @@ async fn render_request_detail(
                 }
                 form #deny-form method="post" action={ "/ui/requests/" (id) "/deny" } {
                     input type="hidden" name="csrf_token" value=(deny_token);
+                }
+            }
+            // A GET to a pre-filled form: it decides nothing about this
+            // request, which stays pending until approved or denied above.
+            p {
+                a .btn-link href=(new_policy_href(&row.client_name, &row.secret_name, mechanism, &constraints)) {
+                    "Create a policy for requests like this"
                 }
             }
         },
@@ -2339,10 +2351,7 @@ fn policy_conditions(p: &db::PolicyRow) -> Vec<String> {
         Ok(origins) => out.push(
             origins
                 .iter()
-                .map(|o| match o.port {
-                    Some(port) => format!("{}:{port}", o.host),
-                    None => o.host.clone(),
-                })
+                .map(origin_field)
                 .collect::<Vec<_>>()
                 .join(", "),
         ),
@@ -2372,13 +2381,159 @@ fn policy_conditions(p: &db::PolicyRow) -> Vec<String> {
     out
 }
 
+/// An origin as the policy form's Origins field spells it: `host[:port]`,
+/// which is what [`Origin::parse`] reads back.
+fn origin_field(o: &Origin) -> String {
+    match o.port {
+        Some(port) => format!("{}:{port}", o.host),
+        None => o.host.clone(),
+    }
+}
+
+/// Values for the "New policy" form, from the query string. The request page
+/// links here with a request's client, secret, mechanism and scope so the
+/// operator can turn a decision into a standing rule without retyping it.
+/// Nothing here is trusted: it only pre-fills fields the operator still
+/// reviews and submits, and `create_policy` validates the submission.
+#[derive(Deserialize, Default)]
+struct PolicyPrefill {
+    #[serde(default)]
+    client: Option<String>,
+    #[serde(default)]
+    secret: Option<String>,
+    #[serde(default)]
+    mechanism: Option<String>,
+    /// One `host[:port]` per line.
+    #[serde(default)]
+    origins: Option<String>,
+    #[serde(default)]
+    methods: Option<String>,
+    /// One prefix per line.
+    #[serde(default)]
+    paths: Option<String>,
+    #[serde(default)]
+    max_ttl: Option<String>,
+    #[serde(default)]
+    max_uses: Option<String>,
+}
+
+impl PolicyPrefill {
+    fn is_empty(&self) -> bool {
+        [
+            &self.client,
+            &self.secret,
+            &self.mechanism,
+            &self.origins,
+            &self.methods,
+            &self.paths,
+            &self.max_ttl,
+            &self.max_uses,
+        ]
+        .iter()
+        .all(|v| non_empty(v).is_none())
+    }
+}
+
+/// Link to the policy form pre-filled from a request: the rule that would
+/// have matched exactly this request.
+fn new_policy_href(
+    client: &str,
+    secret: &str,
+    mechanism: Mechanism,
+    constraints: &Constraints,
+) -> String {
+    let mut q = url::form_urlencoded::Serializer::new(String::new());
+    q.append_pair("client", client);
+    q.append_pair("secret", secret);
+    q.append_pair("mechanism", mechanism.as_str());
+    let lines = |v: Vec<String>| v.join("\n");
+    if !constraints.origins.is_empty() {
+        q.append_pair(
+            "origins",
+            &lines(constraints.origins.iter().map(origin_field).collect()),
+        );
+    }
+    if !constraints.methods.is_empty() {
+        q.append_pair("methods", &constraints.methods.join(", "));
+    }
+    if !constraints.path_prefixes.is_empty() {
+        q.append_pair("paths", &lines(constraints.path_prefixes.clone()));
+    }
+    // The request's limits too: left blank, the rule would also match
+    // requests for longer-lived or unlimited-use grants than this one.
+    q.append_pair("max_ttl", &constraints.ttl_seconds.to_string());
+    if let Some(n) = constraints.max_uses {
+        q.append_pair("max_uses", &n.to_string());
+    }
+    format!("/ui/policies?{}#new-policy", q.finish())
+}
+
+/// A picker over the values a policy field can usefully name.
+/// `selected` is kept even when it is not among `options` (a pre-filled name
+/// for a client since removed from config, or a secret not stored yet), so a
+/// pre-fill is never silently widened to "any"; `absent_note` says why it is
+/// not a known value.
+fn policy_picker(
+    name: &str,
+    blank_label: &str,
+    options: &[(String, String)],
+    selected: Option<&str>,
+    absent_note: &str,
+) -> Markup {
+    let absent = selected.filter(|v| !options.iter().any(|(o, _)| o == v));
+    html! {
+        select name=(name) {
+            option value="" selected[selected.is_none()] { (blank_label) }
+            @for (value, label) in options {
+                option value=(value) selected[selected == Some(value.as_str())] { (label) }
+            }
+            @if let Some(v) = absent {
+                option value=(v) selected { (v) " (" (absent_note) ")" }
+            }
+        }
+    }
+}
+
 async fn policies_page(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(prefill): Query<PolicyPrefill>,
 ) -> UiResult<Html<String>> {
     let op = operator(&state, &headers).await?;
     let now = Utc::now();
     let policies = db::list_policies(&state.db).await?;
+    // The pickers' options. Clients come from config, so the set is closed;
+    // a disabled client is one config no longer names, and a rule for it can
+    // never match.
+    let clients: Vec<(String, String)> = db::list_clients(&state.db)
+        .await?
+        .into_iter()
+        .filter(|c| c.enabled)
+        .map(|c| (c.name.clone(), c.name))
+        .collect();
+    let secrets: Vec<(String, String)> = db::list_secrets(&state.db)
+        .await?
+        .into_iter()
+        .map(|s| {
+            let label = if s.operator_vetted {
+                s.name.clone()
+            } else {
+                format!("{} (not reviewed)", s.name)
+            };
+            (s.name, label)
+        })
+        .collect();
+    let tags: Vec<(String, String)> = db::list_secret_tags(&state.db)
+        .await?
+        .into_iter()
+        .map(|t| (t.clone(), t))
+        .collect();
+    let prefilled = !prefill.is_empty();
+    let pre_mechanism = non_empty(&prefill.mechanism).and_then(Mechanism::from_str_opt);
+    let pre_methods = non_empty(&prefill.methods).unwrap_or("");
+    let pre_paths = non_empty(&prefill.paths).unwrap_or("");
+    let pre_ttl = non_empty(&prefill.max_ttl).unwrap_or("");
+    let pre_uses = non_empty(&prefill.max_uses).unwrap_or("");
     // Named on this page because it is where consent gets expressed: a client
     // can squat a name BEFORE the operator writes the matching rule, and the
     // unvetted clamp is what makes that harmless. Saying so here is what makes
@@ -2450,8 +2605,14 @@ async fn policies_page(
                     }
                 }
             }
-            details .panel open[policies.is_empty()] {
+            details #new-policy .panel open[policies.is_empty() || prefilled] {
                 summary { "New policy" }
+                @if prefilled {
+                    p .muted {
+                        "Pre-filled from a request. Review every field, and pick an "
+                        "outcome, before creating the rule."
+                    }
+                }
                 @if !unvetted.is_empty() {
                     div .callout .callout-attention {
                         p {
@@ -2472,22 +2633,19 @@ async fn policies_page(
                     input type="hidden" name="csrf_token" value=(create_token);
                     div .field-grid {
                         label {
-                            "Client name " span .muted { "(blank = any)" }
-                            input type="text" name="client_name"
-                                autocapitalize="off" autocorrect="off" spellcheck="false";
+                            "Client"
+                            (policy_picker("client_name", "— any client —", &clients, non_empty(&prefill.client), "not a configured client"))
                         }
                         label {
-                            "Secret name " span .muted { "(blank = any)" }
-                            input type="text" name="secret_name"
-                                autocapitalize="off" autocorrect="off" spellcheck="false";
+                            "Secret"
+                            (policy_picker("secret_name", "— any secret —", &secrets, non_empty(&prefill.secret), "not stored yet"))
                         }
                         label {
                             "Mechanism"
                             select name="mechanism" {
-                                option value="brokered" { "brokered" }
-                                option value="autofill" { "autofill" }
-                                option value="cli-read" { "cli-read" }
-                                option value="direct-read" { "direct-read" }
+                                @for m in [Mechanism::Brokered, Mechanism::Autofill, Mechanism::CliRead, Mechanism::DirectRead] {
+                                    option value=(m.as_str()) selected[pre_mechanism == Some(m)] { (m.as_str()) }
+                                }
                             }
                         }
                         label {
@@ -2508,15 +2666,21 @@ async fn policies_page(
                             "Required for a brokered auto-approve or notify-only policy."
                         }
                         textarea name="origins" rows="2"
-                            autocapitalize="off" autocorrect="off" spellcheck="false" {}
+                            autocapitalize="off" autocorrect="off" spellcheck="false" {
+                            (non_empty(&prefill.origins).unwrap_or(""))
+                        }
                     }
-                    details .more {
+                    // Opened when pre-filled scope lands in it, so nothing the
+                    // rule will carry is hidden from the operator creating it.
+                    details .more open[[pre_methods, pre_paths, pre_ttl, pre_uses].iter().any(|v| !v.is_empty())] {
                         summary { "More conditions" }
                         div .field-grid {
                             label {
                                 "Secret tag " span .muted { "(instead of a name)" }
-                                input type="text" name="secret_tag"
-                                    autocapitalize="off" autocorrect="off" spellcheck="false";
+                                @if tags.is_empty() {
+                                    span .sub { "No stored secret carries a tag." }
+                                }
+                                (policy_picker("secret_tag", "— none —", &tags, None, ""))
                             }
                             label {
                                 "Priority"
@@ -2525,22 +2689,26 @@ async fn policies_page(
                         }
                         label {
                             "Methods " span .muted { "(comma/space separated, blank = unconstrained)" }
-                            input type="text" name="methods"
+                            input type="text" name="methods" value=(pre_methods)
                                 autocapitalize="characters" autocorrect="off" spellcheck="false";
                         }
                         label {
                             "Path prefixes " span .muted { "(one per line, blank = unconstrained)" }
                             textarea name="path_prefixes" rows="3"
-                                autocapitalize="off" autocorrect="off" spellcheck="false" {}
+                                autocapitalize="off" autocorrect="off" spellcheck="false" {
+                                (pre_paths)
+                            }
                         }
                         div .field-grid {
                             label {
                                 "Max TTL seconds"
-                                input type="number" name="max_ttl_seconds" min="1" inputmode="numeric";
+                                input type="number" name="max_ttl_seconds" min="1" inputmode="numeric"
+                                    value=(pre_ttl);
                             }
                             label {
                                 "Max uses"
-                                input type="number" name="max_uses" min="1" inputmode="numeric";
+                                input type="number" name="max_uses" min="1" inputmode="numeric"
+                                    value=(pre_uses);
                             }
                             label {
                                 "Not after (UTC)"
@@ -2879,8 +3047,13 @@ async fn secrets_page(State(state): State<AppState>, headers: HeaderMap) -> UiRe
                     div .field-grid {
                         label {
                             "Name"
-                            input type="text" name="name" required
+                            // Suggestions, not a picker: a new name is just as
+                            // valid as an existing one (which rotates it).
+                            input type="text" name="name" required list="secret-names"
                                 autocapitalize="off" autocorrect="off" spellcheck="false";
+                            datalist #secret-names {
+                                @for s in &secrets { option value=(s.name) {} }
+                            }
                         }
                         label {
                             "Value"
