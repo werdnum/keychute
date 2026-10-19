@@ -364,6 +364,16 @@ pub async fn list_unvetted_secret_names(db: &PgPool) -> anyhow::Result<Vec<Strin
     )
 }
 
+/// Every tag currently on some secret: the values a tag-scoped policy can
+/// usefully name, for the policy form's picker.
+pub async fn list_secret_tags(db: &PgPool) -> anyhow::Result<Vec<String>> {
+    Ok(
+        sqlx::query_scalar("SELECT DISTINCT tag FROM secret_tags ORDER BY tag")
+            .fetch_all(db)
+            .await?,
+    )
+}
+
 /// Replace the tag set for a secret.
 pub async fn set_secret_tags(db: &PgPool, secret_id: Uuid, tags: &[String]) -> anyhow::Result<()> {
     let mut tx = db.begin().await?;
