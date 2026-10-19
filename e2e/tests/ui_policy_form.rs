@@ -83,6 +83,10 @@ async fn request_page_links_a_prefilled_policy() {
     );
     assert!(page.contains(r#"value="GET, POST""#), "{page}");
     assert!(page.contains("/v1\n/v2</textarea>"), "{page}");
+    assert!(
+        page.contains(r#"name="max_ttl_seconds" min="1" inputmode="numeric" value="600""#),
+        "{page}"
+    );
 
     // The request is untouched by following the link.
     let detail = env.ui_get(&format!("/ui/requests/{id}")).await.unwrap();

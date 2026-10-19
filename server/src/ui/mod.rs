@@ -2411,6 +2411,10 @@ struct PolicyPrefill {
     /// One prefix per line.
     #[serde(default)]
     paths: Option<String>,
+    #[serde(default)]
+    max_ttl: Option<String>,
+    #[serde(default)]
+    max_uses: Option<String>,
 }
 
 impl PolicyPrefill {
@@ -2422,6 +2426,8 @@ impl PolicyPrefill {
             &self.origins,
             &self.methods,
             &self.paths,
+            &self.max_ttl,
+            &self.max_uses,
         ]
         .iter()
         .all(|v| non_empty(v).is_none())
@@ -2452,6 +2458,12 @@ fn new_policy_href(
     }
     if !constraints.path_prefixes.is_empty() {
         q.append_pair("paths", &lines(constraints.path_prefixes.clone()));
+    }
+    // The request's limits too: left blank, the rule would also match
+    // requests for longer-lived or unlimited-use grants than this one.
+    q.append_pair("max_ttl", &constraints.ttl_seconds.to_string());
+    if let Some(n) = constraints.max_uses {
+        q.append_pair("max_uses", &n.to_string());
     }
     format!("/ui/policies?{}#new-policy", q.finish())
 }
@@ -2520,6 +2532,8 @@ async fn policies_page(
     let pre_mechanism = non_empty(&prefill.mechanism).and_then(Mechanism::from_str_opt);
     let pre_methods = non_empty(&prefill.methods).unwrap_or("");
     let pre_paths = non_empty(&prefill.paths).unwrap_or("");
+    let pre_ttl = non_empty(&prefill.max_ttl).unwrap_or("");
+    let pre_uses = non_empty(&prefill.max_uses).unwrap_or("");
     // Named on this page because it is where consent gets expressed: a client
     // can squat a name BEFORE the operator writes the matching rule, and the
     // unvetted clamp is what makes that harmless. Saying so here is what makes
@@ -2658,7 +2672,7 @@ async fn policies_page(
                     }
                     // Opened when pre-filled scope lands in it, so nothing the
                     // rule will carry is hidden from the operator creating it.
-                    details .more open[!pre_methods.is_empty() || !pre_paths.is_empty()] {
+                    details .more open[[pre_methods, pre_paths, pre_ttl, pre_uses].iter().any(|v| !v.is_empty())] {
                         summary { "More conditions" }
                         div .field-grid {
                             label {
@@ -2688,11 +2702,13 @@ async fn policies_page(
                         div .field-grid {
                             label {
                                 "Max TTL seconds"
-                                input type="number" name="max_ttl_seconds" min="1" inputmode="numeric";
+                                input type="number" name="max_ttl_seconds" min="1" inputmode="numeric"
+                                    value=(pre_ttl);
                             }
                             label {
                                 "Max uses"
-                                input type="number" name="max_uses" min="1" inputmode="numeric";
+                                input type="number" name="max_uses" min="1" inputmode="numeric"
+                                    value=(pre_uses);
                             }
                             label {
                                 "Not after (UTC)"
