@@ -11,7 +11,7 @@ type: application
 # Chart version is bumped on chart changes; appVersion tracks the container
 # image and is rewritten by .github/workflows/build.yaml on each push to main.
 version: 0.1.0
-appVersion: "20261008_060041-dcb6a40"
+appVersion: "20261019_022938-f9fdbae"
 keywords:
   - secrets
   - approval
