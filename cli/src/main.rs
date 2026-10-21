@@ -315,6 +315,34 @@ pub(crate) struct StatusResponse {
     pub(crate) grant_id: Option<Uuid>,
     #[serde(default)]
     pub(crate) deny_reason: Option<String>,
+    #[serde(default)]
+    pub(crate) granted_secret_name: Option<String>,
+    #[serde(default)]
+    pub(crate) auto_approved: bool,
+}
+
+/// Tell the caller, on stderr, how an approval differs from an ordinary one:
+/// released under a different secret name than it asked for, or approved by a
+/// standing policy with no operator involved. An agent that does not hear
+/// either keeps guessing the wrong name, or treats a free re-request as
+/// another interruption of a human and avoids it.
+pub(crate) fn report_resolution(requested_secret: &str, st: &StatusResponse) {
+    if let Some(granted) = st
+        .granted_secret_name
+        .as_deref()
+        .filter(|g| *g != requested_secret)
+    {
+        eprintln!(
+            "keychute: no secret is stored as {requested_secret:?}; the operator released \
+             {granted:?} in its place. Request {granted:?} by that name from now on"
+        );
+    }
+    if st.auto_approved {
+        eprintln!(
+            "keychute: approved automatically by a standing policy, without asking an \
+             operator; request it again whenever you need it"
+        );
+    }
 }
 
 /// Derive the grant-read idempotency key from the request's idempotency key.
@@ -558,6 +586,7 @@ async fn run_request(cfg: &Config, http: &reqwest::Client, args: RequestArgs) ->
 
     // Create the access request.
     let mut st = create_access_request(cfg, http, &body).await?;
+    let requested_secret = body.secret_name;
 
     if st.state == RequestState::Pending {
         eprintln!(
@@ -568,7 +597,7 @@ async fn run_request(cfg: &Config, http: &reqwest::Client, args: RequestArgs) ->
     }
 
     match st.state {
-        RequestState::Approved => {}
+        RequestState::Approved => report_resolution(&requested_secret, &st),
         RequestState::Denied => {
             let why = st
                 .deny_reason

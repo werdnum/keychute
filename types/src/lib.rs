@@ -304,7 +304,21 @@ pub struct AccessRequestStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deny_reason: Option<String>,
     pub expires_at: DateTime<Utc>,
+    /// The secret the grant actually releases, once approved. It differs from
+    /// the requested name when the operator approved by substituting a stored
+    /// secret for a name the client got wrong — the client needs the real name
+    /// to ask for it directly next time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub granted_secret_name: Option<String>,
+    /// True when a standing policy approved the request with no operator
+    /// decision, so asking again is cheap rather than another interruption.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_approved: bool,
 }
+
+/// `resolved_by` recorded on an access request a standing policy
+/// approved on creation.
+pub const RESOLVED_BY_POLICY_AUTO: &str = "policy:auto";
 
 /// Non-secret metadata about a grant the calling client owns
 /// (`GET /v1/grants/{id}`).

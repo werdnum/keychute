@@ -267,6 +267,12 @@ async fn unstored_request_released_from_an_existing_secret() {
     let (code, stdout, stderr) = wait_cli(cli);
     assert_eq!(code, 0, "cli failed: {stderr}");
     assert_eq!(stdout, b"real-value-v1");
+    // ...and is told which name to ask for next time.
+    assert!(
+        stderr.contains("the operator released \"real-api-key\" in its place"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("standing policy"), "{stderr}");
 
     // The grant names what was released, and nothing was stored under the name
     // the client asked for.
