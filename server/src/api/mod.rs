@@ -16,7 +16,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::Router;
 use error::ApiFailure;
-use keychute_types::{AccessRequestStatus, Mechanism, RequestState, Tier};
+use keychute_types::{AccessRequestStatus, Mechanism, RequestState, Tier, RESOLVED_BY_POLICY_AUTO};
 use uuid::Uuid;
 
 /// Upper bound on the readiness database probe. Must stay comfortably below a
@@ -119,19 +119,20 @@ pub(crate) async fn status_from_row(
 ) -> Result<AccessRequestStatus, ApiFailure> {
     let request_state = RequestState::from_str_opt(&row.state)
         .ok_or_else(|| ApiFailure::Internal(anyhow::anyhow!("unknown request state")))?;
-    let grant_id = if request_state == RequestState::Approved {
-        db::api_ext::get_grant_by_request(&state.db, row.id)
-            .await?
-            .map(|g| g.id)
+    let grant = if request_state == RequestState::Approved {
+        db::api_ext::get_grant_by_request(&state.db, row.id).await?
     } else {
         None
     };
     Ok(AccessRequestStatus {
         request_id: row.id,
         state: request_state,
-        grant_id,
+        grant_id: grant.as_ref().map(|g| g.id),
         deny_reason: row.deny_reason.clone(),
         expires_at: row.expires_at,
+        granted_secret_name: grant.map(|g| g.secret_name),
+        auto_approved: request_state == RequestState::Approved
+            && row.resolved_by.as_deref() == Some(RESOLVED_BY_POLICY_AUTO),
     })
 }
 

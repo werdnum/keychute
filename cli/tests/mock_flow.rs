@@ -35,6 +35,11 @@ struct MockConfig {
     /// Fail the first creation attempt with 503 (server committed nothing the
     /// client can see) to exercise the creation retry.
     fail_first_create: bool,
+    /// The secret name the approval reports releasing; `None` reports the
+    /// requested name back, as an ordinary approval does.
+    granted_secret_name: Option<&'static str>,
+    /// Approve on creation, as a standing auto-approve policy does.
+    auto_approve: bool,
 }
 
 impl Default for MockConfig {
@@ -43,6 +48,8 @@ impl Default for MockConfig {
             deny: false,
             read_mode: ReadMode::Release,
             fail_first_create: false,
+            granted_secret_name: None,
+            auto_approve: false,
         }
     }
 }
@@ -88,6 +95,18 @@ async fn create_request(
             })),
         );
     }
+    if st.cfg.auto_approve {
+        return (
+            StatusCode::CREATED,
+            Json(serde_json::json!({
+                "request_id": REQUEST_ID,
+                "state": "approved",
+                "grant_id": GRANT_ID,
+                "granted_secret_name": "my-service-api-key",
+                "auto_approved": true,
+            })),
+        );
+    }
     (
         StatusCode::CREATED,
         Json(serde_json::json!({
@@ -121,6 +140,7 @@ async fn wait_request(
             "request_id": REQUEST_ID,
             "state": "approved",
             "grant_id": GRANT_ID,
+            "granted_secret_name": st.cfg.granted_secret_name.unwrap_or("my-service-api-key"),
         }))
     }
 }
@@ -231,6 +251,48 @@ async fn pending_then_approved_prints_exact_secret_bytes() {
     assert!(state.wait_calls.load(Ordering::SeqCst) >= 2);
     assert_eq!(state.read_calls.load(Ordering::SeqCst), 1);
     assert_eq!(state.create_keys.lock().unwrap().len(), 1);
+    // An ordinary operator approval of the requested name says neither.
+    assert!(!stderr.contains("in its place"), "{stderr}");
+    assert!(!stderr.contains("standing policy"), "{stderr}");
+}
+
+#[tokio::test]
+async fn a_substituted_secret_is_named_on_stderr() {
+    let (out, _state) = run_against(MockConfig {
+        granted_secret_name: Some("my-service-token"),
+        ..MockConfig::default()
+    })
+    .await;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr: {stderr}");
+    assert_eq!(out.stdout, SECRET_BYTES);
+    assert!(
+        stderr.contains(
+            "the operator released \"my-service-token\" in its place. \
+             Request \"my-service-token\" by that name from now on"
+        ),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("standing policy"), "{stderr}");
+}
+
+#[tokio::test]
+async fn a_policy_auto_approval_is_announced_on_stderr() {
+    let (out, state) = run_against(MockConfig {
+        auto_approve: true,
+        ..MockConfig::default()
+    })
+    .await;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr: {stderr}");
+    assert_eq!(out.stdout, SECRET_BYTES);
+    assert!(
+        stderr.contains("approved automatically by a standing policy"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("Waiting for approval"), "{stderr}");
+    assert!(!stderr.contains("in its place"), "{stderr}");
+    assert_eq!(state.wait_calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

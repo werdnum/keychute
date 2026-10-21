@@ -1828,7 +1828,7 @@ async fn acquire_grant(
         st = wait_for_resolution(cfg, http, st.request_id, deadline).await?;
     }
     match st.state {
-        RequestState::Approved => {}
+        RequestState::Approved => crate::report_resolution(&body.secret_name, &st),
         RequestState::Denied => {
             let why = st
                 .deny_reason

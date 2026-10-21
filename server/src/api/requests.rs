@@ -476,7 +476,7 @@ pub async fn create(
             resolved_by: "policy",
         },
         (_, Some(grant)) => db::api_ext::InitialResolution::Approved {
-            resolved_by: "policy:auto",
+            resolved_by: keychute_types::RESOLVED_BY_POLICY_AUTO,
             grant,
             // Committed with the approval so a failed immediate FYI push below
             // is durably owed and retried by the sweeper.
@@ -566,6 +566,9 @@ pub async fn create(
                 grant_id: Some(grant_id),
                 deny_reason: None,
                 expires_at: row.expires_at,
+                // `secret` is Some here (checked when the grant was built).
+                granted_secret_name: secret.as_ref().map(|s| s.name.clone()),
+                auto_approved: true,
             };
             Ok((StatusCode::CREATED, Json(status)).into_response())
         }
@@ -642,6 +645,8 @@ pub async fn create(
                 grant_id: None,
                 deny_reason: None,
                 expires_at: row.expires_at,
+                granted_secret_name: None,
+                auto_approved: false,
             };
             Ok((StatusCode::CREATED, Json(status)).into_response())
         }
