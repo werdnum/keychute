@@ -39,7 +39,7 @@ image:
   # keeps the chart out of the `digest: ""` state in git, and it is the digest
   # the k8s-agent image in kube-config lifts the client CLI out of, so server
   # and CLI ship as a matched pair.
-  digest: "sha256:cf1d160c03e93519cbbd5dc9544e45d68893748e69398665a63d4a8dbc50841e"
+  digest: "sha256:ff3a3c6f5b00661898780def2e57d1467fcbff35251c1f9fc3a3a87668671ae2"
   tag: "latest"
   pullPolicy: IfNotPresent
 # imagePullSecrets are mirrored into the namespace out-of-band (e.g. by the
