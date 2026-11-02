@@ -2399,11 +2399,24 @@ fn origin_field(o: &Origin) -> String {
 }
 
 /// A canonical (already percent-decoded) path prefix as the policy form
-/// spells it. The form's parser decodes once more, so a literal `%` must go
-/// back in escaped or a save would re-decode it (`/100%25` stored as `/100%`
-/// would fail to parse; `/%2541` stored as `/%41` would become `/A`).
+/// spells it, such that [`parse_policy_form`] reads back exactly the same
+/// prefix. The parser decodes once more, so a literal `%` goes back in escaped
+/// (`/100%` would otherwise fail to parse, `/%41` would become `/A`); and it
+/// trims each line, so whitespace is escaped too (`/ ` would otherwise save as
+/// `/`, which matches every path).
 fn path_field(canonical: &str) -> String {
-    canonical.replace('%', "%25")
+    let mut out = String::with_capacity(canonical.len());
+    for c in canonical.chars() {
+        if c == '%' || c.is_whitespace() {
+            let mut buf = [0u8; 4];
+            for b in c.encode_utf8(&mut buf).bytes() {
+                out.push_str(&format!("%{b:02X}"));
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Values for the "New policy" form, from the query string. The request page
@@ -4511,7 +4524,13 @@ mod tests {
             ])
             .unwrap(),
             methods: vec!["GET".into(), "POST".into()],
-            path_prefixes: vec!["/v1".into(), "/reports/100%".into(), "/x/%41".into()],
+            path_prefixes: vec![
+                "/v1".into(),
+                "/reports/100%".into(),
+                "/x/%41".into(),
+                "/ ".into(),
+                "/a b\u{a0}".into(),
+            ],
             max_ttl_seconds: Some(600),
             max_uses: Some(3),
             not_after: Some(
