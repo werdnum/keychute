@@ -620,8 +620,12 @@ async fn handle_inner(
             // `header` kind above): defaulting to "" would ship
             // `Basic base64(":" + secret)` upstream, leaking the secret into
             // the upstream's auth-failure log.
-            basic_username = db::api_ext::get_injection_username(&state.db, secret.id)
-                .await?
+            // Read off the same row snapshot as the kind and header, never
+            // re-fetched: an operator editing the template mid-request must
+            // not yield a mix of the old and new templates.
+            basic_username = secret
+                .injection_username
+                .clone()
                 .or_else(|| secret.injection_header.clone())
                 .ok_or(ApiFailure::BadCredentialEncoding)?;
             InjectionSpec::BasicPassword {
@@ -631,8 +635,9 @@ async fn handle_inner(
         "aws-sigv4" => {
             // Access key id in injection_username, `region/service` in
             // injection_header (migration 0009). Either missing fails closed.
-            basic_username = db::api_ext::get_injection_username(&state.db, secret.id)
-                .await?
+            basic_username = secret
+                .injection_username
+                .clone()
                 .ok_or(ApiFailure::BadCredentialEncoding)?;
             let (region, service) = secret
                 .injection_header

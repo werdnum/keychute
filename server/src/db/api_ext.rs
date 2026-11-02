@@ -377,18 +377,3 @@ pub async fn get_clients_by_sa_subject(
             .await?,
     )
 }
-
-/// Username for `basic` credential injection (column added in migration
-/// 0003; not part of the Phase-A `SecretRow`).
-pub async fn get_injection_username(
-    db: &PgPool,
-    secret_id: Uuid,
-) -> anyhow::Result<Option<String>> {
-    Ok(
-        sqlx::query_scalar("SELECT injection_username FROM secrets WHERE id = $1")
-            .bind(secret_id)
-            .fetch_optional(db)
-            .await?
-            .flatten(),
-    )
-}

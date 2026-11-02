@@ -2398,6 +2398,14 @@ fn origin_field(o: &Origin) -> String {
     }
 }
 
+/// A canonical (already percent-decoded) path prefix as the policy form
+/// spells it. The form's parser decodes once more, so a literal `%` must go
+/// back in escaped or a save would re-decode it (`/100%25` stored as `/100%`
+/// would fail to parse; `/%2541` stored as `/%41` would become `/A`).
+fn path_field(canonical: &str) -> String {
+    canonical.replace('%', "%25")
+}
+
 /// Values for the "New policy" form, from the query string. The request page
 /// links here with a request's client, secret, mechanism and scope so the
 /// operator can turn a decision into a standing rule without retyping it.
@@ -2465,7 +2473,16 @@ fn new_policy_href(
         q.append_pair("methods", &constraints.methods.join(", "));
     }
     if !constraints.path_prefixes.is_empty() {
-        q.append_pair("paths", &lines(constraints.path_prefixes.clone()));
+        q.append_pair(
+            "paths",
+            &lines(
+                constraints
+                    .path_prefixes
+                    .iter()
+                    .map(|p| path_field(p))
+                    .collect(),
+            ),
+        );
     }
     // The request's limits too: left blank, the rule would also match
     // requests for longer-lived or unlimited-use grants than this one.
@@ -2596,7 +2613,12 @@ impl PolicyFormValues {
             priority: p.priority.to_string(),
             origins,
             methods: p.methods.join(", "),
-            paths: p.path_prefixes.join("\n"),
+            paths: p
+                .path_prefixes
+                .iter()
+                .map(|p| path_field(p))
+                .collect::<Vec<_>>()
+                .join("\n"),
             max_ttl: p.max_ttl_seconds.map(|v| v.to_string()).unwrap_or_default(),
             max_uses: p.max_uses.map(|v| v.to_string()).unwrap_or_default(),
             not_after: p.not_after.map(datetime_local_value).unwrap_or_default(),
@@ -4489,7 +4511,7 @@ mod tests {
             ])
             .unwrap(),
             methods: vec!["GET".into(), "POST".into()],
-            path_prefixes: vec!["/v1".into(), "/v2/x".into()],
+            path_prefixes: vec!["/v1".into(), "/reports/100%".into(), "/x/%41".into()],
             max_ttl_seconds: Some(600),
             max_uses: Some(3),
             not_after: Some(
