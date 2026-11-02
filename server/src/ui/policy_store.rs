@@ -97,3 +97,81 @@ pub async fn delete_policy_audited(db: &PgPool, id: Uuid, actor: &str) -> anyhow
     tx.commit().await?;
     Ok(true)
 }
+
+/// Outcome of [`update_policy_audited`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdatePolicyOutcome {
+    Updated,
+    /// No row with that id (deleted by someone else meanwhile).
+    NotFound,
+    /// The row is provisioned from config; the UI does not edit it.
+    Managed,
+}
+
+/// Replace every rule field of an existing, UI-owned policy row and write its
+/// `policy-updated` audit row in one transaction. `created_by` is left as it
+/// was — the audit row records who made the edit. Like deletion, an edit does
+/// not retro-change grants already issued under the old rule.
+pub async fn update_policy_audited(
+    db: &PgPool,
+    id: Uuid,
+    p: &NewPolicy,
+    actor: &str,
+) -> anyhow::Result<UpdatePolicyOutcome> {
+    let mut tx = db.begin().await?;
+    let before: Option<(bool, String)> =
+        sqlx::query_as("SELECT managed_by_config, outcome FROM policies WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some((managed, previous_outcome)) = before else {
+        tx.rollback().await?;
+        return Ok(UpdatePolicyOutcome::NotFound);
+    };
+    if managed {
+        tx.rollback().await?;
+        return Ok(UpdatePolicyOutcome::Managed);
+    }
+    sqlx::query(
+        "UPDATE policies SET client_name = $2, secret_name = $3, secret_tag = $4, \
+         mechanism = $5, outcome = $6, priority = $7, origins = $8, methods = $9, \
+         path_prefixes = $10, max_ttl_seconds = $11, max_uses = $12, not_after = $13 \
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(&p.client_name)
+    .bind(&p.secret_name)
+    .bind(&p.secret_tag)
+    .bind(&p.mechanism)
+    .bind(&p.outcome)
+    .bind(p.priority)
+    .bind(&p.origins)
+    .bind(&p.methods)
+    .bind(&p.path_prefixes)
+    .bind(p.max_ttl_seconds)
+    .bind(p.max_uses)
+    .bind(p.not_after)
+    .execute(&mut *tx)
+    .await?;
+
+    insert_audit(
+        &mut *tx,
+        &AuditEvent {
+            kind: kinds::POLICY_UPDATED,
+            client_name: p.client_name.clone(),
+            secret_name: p.secret_name.clone(),
+            actor: Some(actor.to_owned()),
+            detail: Some(serde_json::json!({
+                "policy_id": id,
+                "mechanism": p.mechanism,
+                "outcome": p.outcome,
+                "previous_outcome": previous_outcome,
+            })),
+            ..Default::default()
+        },
+    )
+    .await?;
+
+    tx.commit().await?;
+    Ok(UpdatePolicyOutcome::Updated)
+}

@@ -44,7 +44,10 @@ const R_DENY: &str = "/ui/requests/deny";
 const R_REVOKE: &str = "/ui/grants/revoke";
 const R_POLICY_CREATE: &str = "/ui/policies/create";
 const R_POLICY_DELETE: &str = "/ui/policies/delete";
+const R_POLICY_UPDATE: &str = "/ui/policies/update";
 const R_SECRET_SAVE: &str = "/ui/secrets/save";
+const R_SECRET_UPDATE: &str = "/ui/secrets/update";
+const R_SECRET_ROTATE: &str = "/ui/secrets/rotate";
 const R_SECRET_REVEAL: &str = "/ui/secrets/reveal";
 const R_SECRET_VET: &str = "/ui/secrets/vet";
 const R_SECRET_DELETE: &str = "/ui/secrets/delete";
@@ -66,9 +69,14 @@ pub fn router(state: AppState) -> Router {
         .route("/ui/grants/{id}/revoke", post(revoke))
         .route("/ui/policies", get(policies_page))
         .route("/ui/policies", post(create_policy))
+        .route("/ui/policies/{id}", post(update_policy))
+        .route("/ui/policies/{id}/edit", get(edit_policy_page))
         .route("/ui/policies/{id}/delete", post(delete_policy))
         .route("/ui/secrets", get(secrets_page))
         .route("/ui/secrets", post(save_secret))
+        .route("/ui/secrets/{id}", post(update_secret))
+        .route("/ui/secrets/{id}/edit", get(edit_secret_page))
+        .route("/ui/secrets/{id}/rotate", post(rotate_secret))
         .route("/ui/secrets/{id}/review", post(review_secret))
         .route("/ui/secrets/{id}/reviewed", post(mark_reviewed))
         .route("/ui/secrets/{id}/delete", post(delete_secret_page))
@@ -1718,7 +1726,7 @@ fn parse_narrow_u64(input: Option<&str>, requested: u64, what: &str) -> UiResult
 const MANAGED_SECRET: &str = "this secret is provisioned from Keychute's config (GitOps): \
      change or remove it there. An edit here would be reverted on the next restart.";
 const MANAGED_POLICY: &str = "this policy is provisioned from Keychute's config (GitOps): \
-     change or remove it there. A deletion here would be reverted on the next restart.";
+     change or remove it there. An edit here would be reverted on the next restart.";
 
 /// Operator-facing wrapper around [`crate::injection::validate_injection`]
 /// (shared with the client deposit endpoint): same rules, UI error shape.
@@ -2494,24 +2502,23 @@ fn policy_picker(
     }
 }
 
-async fn policies_page(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(prefill): Query<PolicyPrefill>,
-) -> UiResult<Html<String>> {
-    let op = operator(&state, &headers).await?;
-    let now = Utc::now();
-    let policies = db::list_policies(&state.db).await?;
-    // The pickers' options. Clients come from config, so the set is closed;
-    // a disabled client is one config no longer names, and a rule for it can
-    // never match.
-    let clients: Vec<(String, String)> = db::list_clients(&state.db)
+/// What the policy form's pickers can offer.
+struct PolicyPickers {
+    clients: Vec<(String, String)>,
+    secrets: Vec<(String, String)>,
+    tags: Vec<(String, String)>,
+}
+
+async fn policy_pickers(state: &AppState) -> UiResult<PolicyPickers> {
+    // Clients come from config, so the set is closed; a disabled client is one
+    // config no longer names, and a rule for it can never match.
+    let clients = db::list_clients(&state.db)
         .await?
         .into_iter()
         .filter(|c| c.enabled)
         .map(|c| (c.name.clone(), c.name))
         .collect();
-    let secrets: Vec<(String, String)> = db::list_secrets(&state.db)
+    let secrets = db::list_secrets(&state.db)
         .await?
         .into_iter()
         .map(|s| {
@@ -2523,17 +2530,225 @@ async fn policies_page(
             (s.name, label)
         })
         .collect();
-    let tags: Vec<(String, String)> = db::list_secret_tags(&state.db)
+    let tags = db::list_secret_tags(&state.db)
         .await?
         .into_iter()
         .map(|t| (t.clone(), t))
         .collect();
+    Ok(PolicyPickers {
+        clients,
+        secrets,
+        tags,
+    })
+}
+
+/// The values the policy form renders with: from a request pre-fill (new
+/// policy) or from an existing row (edit).
+#[derive(Default)]
+struct PolicyFormValues {
+    client: Option<String>,
+    secret: Option<String>,
+    tag: Option<String>,
+    mechanism: Option<Mechanism>,
+    /// `None` renders the first option, `require-approval`: a pre-fill from a
+    /// request never picks an outcome for the operator.
+    outcome: Option<String>,
+    priority: String,
+    origins: String,
+    methods: String,
+    paths: String,
+    max_ttl: String,
+    max_uses: String,
+    not_after: String,
+}
+
+impl PolicyFormValues {
+    fn from_prefill(p: &PolicyPrefill) -> Self {
+        let s = |v: &Option<String>| non_empty(v).unwrap_or("").to_owned();
+        Self {
+            client: non_empty(&p.client).map(str::to_owned),
+            secret: non_empty(&p.secret).map(str::to_owned),
+            tag: None,
+            mechanism: non_empty(&p.mechanism).and_then(Mechanism::from_str_opt),
+            outcome: None,
+            priority: "0".to_owned(),
+            origins: s(&p.origins),
+            methods: s(&p.methods),
+            paths: s(&p.paths),
+            max_ttl: s(&p.max_ttl),
+            max_uses: s(&p.max_uses),
+            not_after: String::new(),
+        }
+    }
+
+    /// The row as the form spells it, so submitting it unchanged writes the
+    /// same rule back.
+    fn from_row(p: &db::PolicyRow) -> Self {
+        let origins = serde_json::from_value::<Vec<Origin>>(p.origins.clone())
+            .map(|o| o.iter().map(origin_field).collect::<Vec<_>>().join("\n"))
+            .unwrap_or_default();
+        Self {
+            client: p.client_name.clone(),
+            secret: p.secret_name.clone(),
+            tag: p.secret_tag.clone(),
+            mechanism: Mechanism::from_str_opt(&p.mechanism),
+            outcome: Some(p.outcome.clone()),
+            priority: p.priority.to_string(),
+            origins,
+            methods: p.methods.join(", "),
+            paths: p.path_prefixes.join("\n"),
+            max_ttl: p.max_ttl_seconds.map(|v| v.to_string()).unwrap_or_default(),
+            max_uses: p.max_uses.map(|v| v.to_string()).unwrap_or_default(),
+            not_after: p.not_after.map(datetime_local_value).unwrap_or_default(),
+        }
+    }
+
+    /// Whether anything lives under "More conditions", which then renders
+    /// open so nothing the rule carries is hidden from the operator.
+    fn has_more_conditions(&self) -> bool {
+        self.tag.is_some()
+            || (!self.priority.is_empty() && self.priority != "0")
+            || [
+                &self.methods,
+                &self.paths,
+                &self.max_ttl,
+                &self.max_uses,
+                &self.not_after,
+            ]
+            .iter()
+            .any(|v| !v.is_empty())
+    }
+}
+
+/// A UTC instant as an `<input type="datetime-local">` value, keeping seconds
+/// only when there are any (the parser accepts both spellings).
+fn datetime_local_value(t: DateTime<Utc>) -> String {
+    use chrono::Timelike as _;
+    if t.second() == 0 {
+        t.format("%Y-%m-%dT%H:%M").to_string()
+    } else {
+        t.format("%Y-%m-%dT%H:%M:%S").to_string()
+    }
+}
+
+const POLICY_OUTCOMES: [&str; 4] = ["require-approval", "notify-only", "auto-approve", "deny"];
+
+/// The policy form, shared by "New policy" and the edit page. `create_policy`
+/// and `update_policy` both read it through [`parse_policy_form`].
+fn policy_form(
+    action: &str,
+    csrf_token: &str,
+    submit_label: &str,
+    v: &PolicyFormValues,
+    pickers: &PolicyPickers,
+    cancel_href: Option<&str>,
+) -> Markup {
+    html! {
+        form method="post" action=(action) {
+            input type="hidden" name="csrf_token" value=(csrf_token);
+            div .field-grid {
+                label {
+                    "Client"
+                    (policy_picker("client_name", "— any client —", &pickers.clients, v.client.as_deref(), "not a configured client"))
+                }
+                label {
+                    "Secret"
+                    (policy_picker("secret_name", "— any secret —", &pickers.secrets, v.secret.as_deref(), "not stored yet"))
+                }
+                label {
+                    "Mechanism"
+                    select name="mechanism" {
+                        @for m in [Mechanism::Brokered, Mechanism::Autofill, Mechanism::CliRead, Mechanism::DirectRead] {
+                            option value=(m.as_str()) selected[v.mechanism == Some(m)] { (m.as_str()) }
+                        }
+                    }
+                }
+                label {
+                    "Outcome"
+                    select name="outcome" {
+                        @for o in POLICY_OUTCOMES {
+                            option value=(o) selected[v.outcome.as_deref() == Some(o)] { (o) }
+                        }
+                    }
+                }
+            }
+            // Visible, not under "More conditions": the handler refuses a
+            // brokered auto-approve or notify-only rule without one.
+            label {
+                "Origins " span .muted { "(host[:port], one per line)" }
+                span .sub {
+                    "Required for a brokered auto-approve or notify-only policy."
+                }
+                textarea name="origins" rows="2"
+                    autocapitalize="off" autocorrect="off" spellcheck="false" {
+                    (v.origins)
+                }
+            }
+            details .more open[v.has_more_conditions()] {
+                summary { "More conditions" }
+                div .field-grid {
+                    label {
+                        "Secret tag " span .muted { "(instead of a name)" }
+                        @if pickers.tags.is_empty() {
+                            span .sub { "No stored secret carries a tag." }
+                        }
+                        (policy_picker("secret_tag", "— none —", &pickers.tags, v.tag.as_deref(), "no secret carries it"))
+                    }
+                    label {
+                        "Priority"
+                        input type="number" name="priority" value=(v.priority) inputmode="numeric";
+                    }
+                }
+                label {
+                    "Methods " span .muted { "(comma/space separated, blank = unconstrained)" }
+                    input type="text" name="methods" value=(v.methods)
+                        autocapitalize="characters" autocorrect="off" spellcheck="false";
+                }
+                label {
+                    "Path prefixes " span .muted { "(one per line, blank = unconstrained)" }
+                    textarea name="path_prefixes" rows="3"
+                        autocapitalize="off" autocorrect="off" spellcheck="false" {
+                        (v.paths)
+                    }
+                }
+                div .field-grid {
+                    label {
+                        "Max TTL seconds"
+                        input type="number" name="max_ttl_seconds" min="1" inputmode="numeric"
+                            value=(v.max_ttl);
+                    }
+                    label {
+                        "Max uses"
+                        input type="number" name="max_uses" min="1" inputmode="numeric"
+                            value=(v.max_uses);
+                    }
+                    label {
+                        "Not after (UTC)"
+                        input type="datetime-local" name="not_after" step="1" value=(v.not_after);
+                    }
+                }
+            }
+            div .actions-bar {
+                button .primary type="submit" { (submit_label) }
+                @if let Some(href) = cancel_href {
+                    a .btn href=(href) { "Cancel" }
+                }
+            }
+        }
+    }
+}
+
+async fn policies_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(prefill): Query<PolicyPrefill>,
+) -> UiResult<Html<String>> {
+    let op = operator(&state, &headers).await?;
+    let now = Utc::now();
+    let policies = db::list_policies(&state.db).await?;
+    let pickers = policy_pickers(&state).await?;
     let prefilled = !prefill.is_empty();
-    let pre_mechanism = non_empty(&prefill.mechanism).and_then(Mechanism::from_str_opt);
-    let pre_methods = non_empty(&prefill.methods).unwrap_or("");
-    let pre_paths = non_empty(&prefill.paths).unwrap_or("");
-    let pre_ttl = non_empty(&prefill.max_ttl).unwrap_or("");
-    let pre_uses = non_empty(&prefill.max_uses).unwrap_or("");
+    let values = PolicyFormValues::from_prefill(&prefill);
     // Named on this page because it is where consent gets expressed: a client
     // can squat a name BEFORE the operator writes the matching rule, and the
     // unvetted clamp is what makes that harmless. Saying so here is what makes
@@ -2592,10 +2807,13 @@ async fn policies_page(
                                         @if p.managed_by_config {
                                             span .badge .muted title="Provisioned from config; edit it there" { "config" }
                                         } @else {
-                                        form method="post" action={ "/ui/policies/" (p.id) "/delete" } .inline {
-                                            input type="hidden" name="csrf_token"
-                                                value=(csrf::issue_token(&state.keyset, R_POLICY_DELETE, &p.id.to_string(), &op.subject, "", now));
-                                            button .danger .quiet .small type="submit" { "Delete" }
+                                        div .row-actions {
+                                            a .btn .small href={ "/ui/policies/" (p.id) "/edit" } { "Edit" }
+                                            form method="post" action={ "/ui/policies/" (p.id) "/delete" } .inline {
+                                                input type="hidden" name="csrf_token"
+                                                    value=(csrf::issue_token(&state.keyset, R_POLICY_DELETE, &p.id.to_string(), &op.subject, "", now));
+                                                button .danger .quiet .small type="submit" { "Delete" }
+                                            }
                                         }
                                         }
                                     }
@@ -2613,113 +2831,86 @@ async fn policies_page(
                         "outcome, before creating the rule."
                     }
                 }
-                @if !unvetted.is_empty() {
-                    div .callout .callout-attention {
-                        p {
-                            "Heads up: these secrets were deposited by a client and "
-                            "nobody has reviewed them — "
-                            @for (i, name) in unvetted.iter().enumerate() {
-                                @if i > 0 { ", " }
-                                span .mono { (name) }
-                            }
-                            ". A rule you write now will not auto-release them until "
-                            "you review each one on the secrets page, so a client "
-                            "cannot claim a name ahead of a policy you are about to "
-                            "write."
-                        }
+                (unvetted_callout(&unvetted))
+                (policy_form("/ui/policies", &create_token, "Create policy", &values, &pickers, None))
+            }
+        },
+    ))
+}
+
+/// The policy forms' warning about client deposits nobody has reviewed yet.
+fn unvetted_callout(unvetted: &[String]) -> Markup {
+    html! {
+        @if !unvetted.is_empty() {
+            div .callout .callout-attention {
+                p {
+                    "Heads up: these secrets were deposited by a client and "
+                    "nobody has reviewed them — "
+                    @for (i, name) in unvetted.iter().enumerate() {
+                        @if i > 0 { ", " }
+                        span .mono { (name) }
                     }
+                    ". A rule you write now will not auto-release them until "
+                    "you review each one on the secrets page, so a client "
+                    "cannot claim a name ahead of a policy you are about to "
+                    "write."
                 }
-                form method="post" action="/ui/policies" {
-                    input type="hidden" name="csrf_token" value=(create_token);
-                    div .field-grid {
-                        label {
-                            "Client"
-                            (policy_picker("client_name", "— any client —", &clients, non_empty(&prefill.client), "not a configured client"))
-                        }
-                        label {
-                            "Secret"
-                            (policy_picker("secret_name", "— any secret —", &secrets, non_empty(&prefill.secret), "not stored yet"))
-                        }
-                        label {
-                            "Mechanism"
-                            select name="mechanism" {
-                                @for m in [Mechanism::Brokered, Mechanism::Autofill, Mechanism::CliRead, Mechanism::DirectRead] {
-                                    option value=(m.as_str()) selected[pre_mechanism == Some(m)] { (m.as_str()) }
-                                }
-                            }
-                        }
-                        label {
-                            "Outcome"
-                            select name="outcome" {
-                                option value="require-approval" { "require-approval" }
-                                option value="notify-only" { "notify-only" }
-                                option value="auto-approve" { "auto-approve" }
-                                option value="deny" { "deny" }
-                            }
-                        }
-                    }
-                    // Visible, not under "More conditions": the handler refuses a
-                    // brokered auto-approve or notify-only rule without one.
-                    label {
-                        "Origins " span .muted { "(host[:port], one per line)" }
-                        span .sub {
-                            "Required for a brokered auto-approve or notify-only policy."
-                        }
-                        textarea name="origins" rows="2"
-                            autocapitalize="off" autocorrect="off" spellcheck="false" {
-                            (non_empty(&prefill.origins).unwrap_or(""))
-                        }
-                    }
-                    // Opened when pre-filled scope lands in it, so nothing the
-                    // rule will carry is hidden from the operator creating it.
-                    details .more open[[pre_methods, pre_paths, pre_ttl, pre_uses].iter().any(|v| !v.is_empty())] {
-                        summary { "More conditions" }
-                        div .field-grid {
-                            label {
-                                "Secret tag " span .muted { "(instead of a name)" }
-                                @if tags.is_empty() {
-                                    span .sub { "No stored secret carries a tag." }
-                                }
-                                (policy_picker("secret_tag", "— none —", &tags, None, ""))
-                            }
-                            label {
-                                "Priority"
-                                input type="number" name="priority" value="0" inputmode="numeric";
-                            }
-                        }
-                        label {
-                            "Methods " span .muted { "(comma/space separated, blank = unconstrained)" }
-                            input type="text" name="methods" value=(pre_methods)
-                                autocapitalize="characters" autocorrect="off" spellcheck="false";
-                        }
-                        label {
-                            "Path prefixes " span .muted { "(one per line, blank = unconstrained)" }
-                            textarea name="path_prefixes" rows="3"
-                                autocapitalize="off" autocorrect="off" spellcheck="false" {
-                                (pre_paths)
-                            }
-                        }
-                        div .field-grid {
-                            label {
-                                "Max TTL seconds"
-                                input type="number" name="max_ttl_seconds" min="1" inputmode="numeric"
-                                    value=(pre_ttl);
-                            }
-                            label {
-                                "Max uses"
-                                input type="number" name="max_uses" min="1" inputmode="numeric"
-                                    value=(pre_uses);
-                            }
-                            label {
-                                "Not after (UTC)"
-                                input type="datetime-local" name="not_after";
-                            }
-                        }
-                    }
-                    div .actions-bar {
-                        button .primary type="submit" { "Create policy" }
-                    }
-                }
+            }
+        }
+    }
+}
+
+/// A UI-owned policy row by id: 404 when absent, 409 when config owns it.
+async fn editable_policy(state: &AppState, id: Uuid) -> UiResult<db::PolicyRow> {
+    let policy = db::list_policies(&state.db)
+        .await?
+        .into_iter()
+        .find(|p| p.id == id)
+        .ok_or_else(|| UiError::new(StatusCode::NOT_FOUND, "no such policy"))?;
+    if policy.managed_by_config {
+        return Err(UiError::new(StatusCode::CONFLICT, MANAGED_POLICY));
+    }
+    Ok(policy)
+}
+
+async fn edit_policy_page(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+) -> UiResult<Html<String>> {
+    let op = operator(&state, &headers).await?;
+    let now = Utc::now();
+    let policy = editable_policy(&state, id).await?;
+    let pickers = policy_pickers(&state).await?;
+    let unvetted = db::list_unvetted_secret_names(&state.db).await?;
+    let token = csrf::issue_token(
+        &state.keyset,
+        R_POLICY_UPDATE,
+        &id.to_string(),
+        &op.subject,
+        "",
+        now,
+    );
+    Ok(html_page_at(
+        "Edit policy",
+        "/ui/policies",
+        html! {
+            (page_head("Edit policy", html! {
+                "Created by " (policy.created_by) " "
+                (relative_time(policy.created_at, now)) ". "
+                "Saving replaces the rule for new requests; grants already issued "
+                "under it keep the limits they were issued with."
+            }))
+            div .card {
+                (unvetted_callout(&unvetted))
+                (policy_form(
+                    &format!("/ui/policies/{id}"),
+                    &token,
+                    "Save changes",
+                    &PolicyFormValues::from_row(&policy),
+                    &pickers,
+                    Some("/ui/policies"),
+                ))
             }
         },
     ))
@@ -2773,22 +2964,11 @@ fn parse_methods_field(raw: &str) -> UiResult<Vec<String>> {
     Ok(methods)
 }
 
-async fn create_policy(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Form(form): Form<PolicyForm>,
-) -> UiResult<Response> {
-    let op = operator(&state, &headers).await?;
-    check_post(
-        &state,
-        &headers,
-        R_POLICY_CREATE,
-        "",
-        &op.subject,
-        "",
-        &form.csrf_token,
-    )?;
-
+/// Validate a submitted policy form into a row. Creating and editing go
+/// through this one function, so an edit can never write a rule creation
+/// would have refused (e.g. flipping a brokered row to auto-approve without
+/// naming an origin).
+fn parse_policy_form(form: &PolicyForm, created_by: &str) -> UiResult<db::NewPolicy> {
     let secret_name = non_empty(&form.secret_name).map(str::to_owned);
     let secret_tag = non_empty(&form.secret_tag).map(str::to_owned);
     if secret_name.is_some() && secret_tag.is_some() {
@@ -2799,10 +2979,7 @@ async fn create_policy(
     let mechanism = Mechanism::from_str_opt(form.mechanism.trim())
         .ok_or_else(|| UiError::bad_request("invalid mechanism"))?;
     let outcome = form.outcome.trim();
-    if !matches!(
-        outcome,
-        "auto-approve" | "notify-only" | "require-approval" | "deny"
-    ) {
+    if !POLICY_OUTCOMES.contains(&outcome) {
         return Err(UiError::bad_request("invalid outcome"));
     }
     let priority: i32 = match non_empty(&form.priority) {
@@ -2877,7 +3054,7 @@ async fn create_policy(
         ),
     };
 
-    let policy = db::NewPolicy {
+    Ok(db::NewPolicy {
         client_name: non_empty(&form.client_name).map(str::to_owned),
         secret_name,
         secret_tag,
@@ -2890,12 +3067,61 @@ async fn create_policy(
         max_ttl_seconds,
         max_uses,
         not_after,
-        created_by: op.subject.clone(),
-    };
+        created_by: created_by.to_owned(),
+    })
+}
+
+async fn create_policy(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<PolicyForm>,
+) -> UiResult<Response> {
+    let op = operator(&state, &headers).await?;
+    check_post(
+        &state,
+        &headers,
+        R_POLICY_CREATE,
+        "",
+        &op.subject,
+        "",
+        &form.csrf_token,
+    )?;
+    let policy = parse_policy_form(&form, &op.subject)?;
     // The policy row and its audit row commit together: a crash between them
     // would otherwise leave an active authorization rule with no audit record.
     policy_store::insert_policy_audited(&state.db, &policy, &op.subject).await?;
     Ok(Redirect::to("/ui/policies").into_response())
+}
+
+async fn update_policy(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    Form(form): Form<PolicyForm>,
+) -> UiResult<Response> {
+    let op = operator(&state, &headers).await?;
+    check_post(
+        &state,
+        &headers,
+        R_POLICY_UPDATE,
+        &id.to_string(),
+        &op.subject,
+        "",
+        &form.csrf_token,
+    )?;
+    let policy = parse_policy_form(&form, &op.subject)?;
+    match policy_store::update_policy_audited(&state.db, id, &policy, &op.subject).await? {
+        policy_store::UpdatePolicyOutcome::Updated => {
+            Ok(Redirect::to("/ui/policies").into_response())
+        }
+        policy_store::UpdatePolicyOutcome::Managed => {
+            Err(UiError::new(StatusCode::CONFLICT, MANAGED_POLICY))
+        }
+        policy_store::UpdatePolicyOutcome::NotFound => Err(UiError::new(
+            StatusCode::CONFLICT,
+            "policy no longer exists",
+        )),
+    }
 }
 
 async fn delete_policy(
@@ -2940,6 +3166,11 @@ async fn secrets_page(State(state): State<AppState>, headers: HeaderMap) -> UiRe
     let op = operator(&state, &headers).await?;
     let now = Utc::now();
     let secrets = db::list_secrets(&state.db).await?;
+    let mut tags_by_secret: std::collections::HashMap<Uuid, Vec<String>> =
+        std::collections::HashMap::new();
+    for (secret_id, tag) in db::list_tag_assignments(&state.db).await? {
+        tags_by_secret.entry(secret_id).or_default().push(tag);
+    }
     let token = csrf::issue_token(&state.keyset, R_SECRET_SAVE, "", &op.subject, "", now);
     Ok(html_page_at(
         "Secrets",
@@ -2976,6 +3207,9 @@ async fn secrets_page(State(state): State<AppState>, headers: HeaderMap) -> UiRe
                                             " " span .muted title="Version" { "v" (s.current_version) }
                                             @if !s.description.is_empty() {
                                                 span .sub { (s.description) }
+                                            }
+                                            @if let Some(tags) = tags_by_secret.get(&s.id) {
+                                                span .sub .mono { @for t in tags { "tag:" (t) " " } }
                                             }
                                         }
                                     }
@@ -3021,6 +3255,7 @@ async fn secrets_page(State(state): State<AppState>, headers: HeaderMap) -> UiRe
                                         @if s.managed_by_config {
                                             span .badge .muted title="Provisioned from config; edit it there" { "config" }
                                         } @else {
+                                        a .btn .small href={ "/ui/secrets/" (s.id) "/edit" } { "Edit" }
                                         form method="post"
                                             action={ "/ui/secrets/" (s.id) "/delete" } .inline {
                                             input type="hidden" name="csrf_token"
@@ -3063,7 +3298,7 @@ async fn secrets_page(State(state): State<AppState>, headers: HeaderMap) -> UiRe
                     }
                     details .more {
                         summary { "Settings for a new secret" }
-                        p .muted { "Ignored when rotating an existing secret." }
+                        p .muted { "Ignored when rotating an existing secret: use its Edit page to change those." }
                         div .field-grid {
                             label {
                                 "Description"
@@ -3773,6 +4008,315 @@ async fn delete_secret(
     }
 }
 
+/// A UI-owned secret by id: 404 when absent, 409 when config owns it.
+async fn editable_secret(state: &AppState, id: Uuid) -> UiResult<db::SecretRow> {
+    let secret = db::list_secrets(&state.db)
+        .await?
+        .into_iter()
+        .find(|s| s.id == id)
+        .ok_or_else(|| UiError::new(StatusCode::NOT_FOUND, "no such secret"))?;
+    if secret.managed_by_config {
+        return Err(UiError::new(StatusCode::CONFLICT, MANAGED_SECRET));
+    }
+    Ok(secret)
+}
+
+/// A stored injection template as the secret form spells it:
+/// `(kind option, header/username/access-key field, SigV4 scope field)` —
+/// the inverse of [`validate_injection`], so saving unchanged round-trips.
+fn injection_form_fields(s: &db::SecretRow) -> (&'static str, String, String) {
+    let header = s.injection_header.clone().unwrap_or_default();
+    let username = s.injection_username.clone();
+    match s.injection_kind.as_str() {
+        "header" => ("header", header, String::new()),
+        // Pre-0003 'basic' rows keep the username in injection_header; the
+        // proxy falls back to it, and so does the form.
+        "basic" | "basic-password" => ("basic", username.unwrap_or(header), String::new()),
+        "aws-sigv4" => ("aws-sigv4", username.unwrap_or_default(), header),
+        _ => ("bearer", String::new(), String::new()),
+    }
+}
+
+/// Parse the secret form's tag list (comma/space separated) into the sorted,
+/// deduplicated set the row will carry.
+fn parse_tags_field(raw: &str) -> UiResult<Vec<String>> {
+    let mut tags: Vec<String> = Vec::new();
+    for t in raw.split(|c: char| c == ',' || c.is_whitespace()) {
+        if t.is_empty() {
+            continue;
+        }
+        if t.len() > 128 || t.chars().any(char::is_control) {
+            return Err(UiError::bad_request("invalid tag"));
+        }
+        tags.push(t.to_owned());
+    }
+    tags.sort();
+    tags.dedup();
+    Ok(tags)
+}
+
+async fn edit_secret_page(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+) -> UiResult<Html<String>> {
+    let op = operator(&state, &headers).await?;
+    let now = Utc::now();
+    let secret = editable_secret(&state, id).await?;
+    let tags = db::get_tags_for_secret(&state.db, id).await?;
+    let (kind, header_field, scope_field) = injection_form_fields(&secret);
+    let current_tier = Tier::from_int(secret.max_tier);
+    let id_str = id.to_string();
+    let settings_token = csrf::issue_token(
+        &state.keyset,
+        R_SECRET_UPDATE,
+        &id_str,
+        &op.subject,
+        "",
+        now,
+    );
+    let rotate_token = csrf::issue_token(
+        &state.keyset,
+        R_SECRET_ROTATE,
+        &id_str,
+        &op.subject,
+        "",
+        now,
+    );
+    Ok(html_page_at(
+        "Edit secret",
+        "/ui/secrets",
+        html! {
+            (page_head("Edit secret", html! {
+                span .mono { (secret.name) } " · v" (secret.current_version)
+            }))
+            @if !secret.operator_vetted {
+                div .callout .callout-attention {
+                    p {
+                        "This secret was deposited by a client and nobody has reviewed "
+                        "its value. Editing its settings does not count as a review; "
+                        "rotating in a value of your own does."
+                    }
+                }
+            }
+            div .card {
+                h2 { "Settings" }
+                p .muted {
+                    "Changes apply at once, including to live grants: each use is "
+                    "rechecked against the secret's tier and enabled flag, and brokered "
+                    "calls use the current injection template. Tags decide which "
+                    "tag-scoped policies select this secret. The name cannot be changed, "
+                    "since grants, requests and policies refer to it."
+                }
+                form method="post" action={ "/ui/secrets/" (id) } {
+                    input type="hidden" name="csrf_token" value=(settings_token);
+                    div .field-grid {
+                        label {
+                            "Description"
+                            input type="text" name="description" value=(secret.description);
+                        }
+                        label {
+                            "Max tier"
+                            select name="max_tier" {
+                                @for t in [Tier::Brokered, Tier::TrustedClient, Tier::CooperatingClient, Tier::Direct] {
+                                    option value=(t.as_str()) selected[current_tier == Some(t)] { (t.as_str()) }
+                                }
+                            }
+                        }
+                        label {
+                            "Injection kind"
+                            select name="injection_kind" {
+                                @for (value, label) in [("bearer", "bearer"), ("header", "header"), ("basic", "basic-password"), ("aws-sigv4", "aws-sigv4")] {
+                                    option value=(value) selected[kind == value] { (label) }
+                                }
+                            }
+                        }
+                        label {
+                            "Header name / basic-auth username / SigV4 access key id"
+                            span .sub { "Only for header, basic-password and aws-sigv4." }
+                            input type="text" name="injection_header" value=(header_field)
+                                autocapitalize="off" autocorrect="off" spellcheck="false";
+                        }
+                        label {
+                            "SigV4 scope"
+                            span .sub { "Only for aws-sigv4: region/s3." }
+                            input type="text" name="injection_scope" value=(scope_field) placeholder="us-east-1/s3"
+                                autocapitalize="off" autocorrect="off" spellcheck="false";
+                        }
+                        label {
+                            "Tags " span .muted { "(comma/space separated)" }
+                            input type="text" name="tags" value=(tags.join(", "))
+                                autocapitalize="off" autocorrect="off" spellcheck="false";
+                        }
+                    }
+                    label .check {
+                        input type="checkbox" name="enabled" value="on" checked[secret.enabled];
+                        span {
+                            "Enabled"
+                            span .sub { "A disabled secret is never released, and its live grants stop working until it is re-enabled." }
+                        }
+                    }
+                    div .actions-bar {
+                        button .primary type="submit" { "Save settings" }
+                        a .btn href="/ui/secrets" { "Cancel" }
+                    }
+                }
+            }
+            div .card {
+                h2 { "Rotate value" }
+                p .muted {
+                    "Stores a new version; the settings above are unchanged. Grants "
+                    "release the current version on their next use."
+                }
+                form method="post" action={ "/ui/secrets/" (id) "/rotate" } {
+                    input type="hidden" name="csrf_token" value=(rotate_token);
+                    label {
+                        "New value"
+                        input type="password" name="secret_value" autocomplete="off" required
+                            autocapitalize="off" autocorrect="off" spellcheck="false";
+                    }
+                    div .actions-bar {
+                        button .primary type="submit" { "Rotate" }
+                    }
+                }
+            }
+        },
+    ))
+}
+
+#[derive(Deserialize)]
+struct SecretSettingsForm {
+    csrf_token: String,
+    #[serde(default)]
+    description: Option<String>,
+    max_tier: String,
+    injection_kind: String,
+    #[serde(default)]
+    injection_header: Option<String>,
+    #[serde(default)]
+    injection_scope: Option<String>,
+    #[serde(default)]
+    tags: Option<String>,
+    /// An unchecked checkbox is simply absent.
+    #[serde(default)]
+    enabled: Option<String>,
+}
+
+async fn update_secret(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    Form(form): Form<SecretSettingsForm>,
+) -> UiResult<Response> {
+    let op = operator(&state, &headers).await?;
+    check_post(
+        &state,
+        &headers,
+        R_SECRET_UPDATE,
+        &id.to_string(),
+        &op.subject,
+        "",
+        &form.csrf_token,
+    )?;
+    let max_tier = tier_from_str(form.max_tier.trim())
+        .ok_or_else(|| UiError::bad_request("invalid max_tier"))?;
+    let (injection_kind, injection_header, injection_username) = validate_injection(
+        form.injection_kind.trim(),
+        non_empty(&form.injection_header),
+        non_empty(&form.injection_scope),
+    )?;
+    let settings = db::ui_ext::SecretSettings {
+        description: form.description.as_deref().unwrap_or("").trim().to_owned(),
+        max_tier: max_tier.as_int(),
+        injection_kind,
+        injection_header,
+        injection_username,
+        enabled: form.enabled.is_some(),
+        tags: parse_tags_field(form.tags.as_deref().unwrap_or(""))?,
+    };
+    match db::ui_ext::update_secret_settings_audited(&state.db, id, &settings, &op.subject).await? {
+        db::ui_ext::UpdateSecretOutcome::Updated => Ok(Redirect::to("/ui/secrets").into_response()),
+        db::ui_ext::UpdateSecretOutcome::Managed => {
+            Err(UiError::new(StatusCode::CONFLICT, MANAGED_SECRET))
+        }
+        db::ui_ext::UpdateSecretOutcome::NotFound => Err(UiError::new(
+            StatusCode::CONFLICT,
+            "that secret was deleted while you were editing it",
+        )),
+    }
+}
+
+#[derive(Deserialize)]
+struct RotateForm {
+    csrf_token: String,
+    /// Wiped on drop, as [`SecretForm`].
+    #[serde(default)]
+    secret_value: Option<String>,
+}
+
+impl Drop for RotateForm {
+    fn drop(&mut self) {
+        if let Some(v) = &mut self.secret_value {
+            v.zeroize();
+        }
+    }
+}
+
+/// Rotate a secret picked by id, from its edit page. Unlike the by-name form
+/// on the list page, a secret deleted meanwhile is a 409 here, never a
+/// silent re-create under default settings.
+async fn rotate_secret(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    Form(mut form): Form<RotateForm>,
+) -> UiResult<Response> {
+    let op = operator(&state, &headers).await?;
+    check_post(
+        &state,
+        &headers,
+        R_SECRET_ROTATE,
+        &id.to_string(),
+        &op.subject,
+        "",
+        &form.csrf_token,
+    )?;
+    let value = {
+        let mut raw = form
+            .secret_value
+            .take()
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| UiError::bad_request("secret value is required"))?;
+        let boxed: Box<[u8]> = raw.as_bytes().into();
+        raw.zeroize();
+        SecretBox::new(boxed)
+    };
+    let secret = editable_secret(&state, id).await?;
+    let rotated = db::ui_ext::rotate_secret_version(
+        &state.db,
+        secret.id,
+        &secret.name,
+        &op.subject,
+        |version| {
+            state.keyset.seal(
+                &value,
+                AadContext::SecretVersion {
+                    secret_id: secret.id,
+                    version,
+                },
+            )
+        },
+    )
+    .await?;
+    if rotated.is_none() {
+        return Err(UiError::new(
+            StatusCode::CONFLICT,
+            "that secret was deleted while you were editing it; nothing was stored",
+        ));
+    }
+    Ok(Redirect::to("/ui/secrets").into_response())
+}
+
 async fn save_secret(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3926,6 +4470,110 @@ mod tests {
         // Bad usernames still rejected.
         assert!(validate_injection("basic", Some("a:b"), None).is_err());
         assert!(validate_injection("basic", None, None).is_err());
+    }
+
+    /// The edit page's values, submitted unchanged, parse back to the row.
+    #[test]
+    fn policy_form_round_trips_a_row() {
+        let row = db::PolicyRow {
+            id: Uuid::new_v4(),
+            client_name: Some("family-assistant".into()),
+            secret_name: None,
+            secret_tag: Some("prod".into()),
+            mechanism: "brokered".into(),
+            outcome: "notify-only".into(),
+            priority: 7,
+            origins: serde_json::to_value(vec![
+                Origin::parse("api.example.com").unwrap(),
+                Origin::parse("api.example.com:8443").unwrap(),
+            ])
+            .unwrap(),
+            methods: vec!["GET".into(), "POST".into()],
+            path_prefixes: vec!["/v1".into(), "/v2/x".into()],
+            max_ttl_seconds: Some(600),
+            max_uses: Some(3),
+            not_after: Some(
+                chrono::NaiveDateTime::parse_from_str("2027-01-02T03:04:05", "%Y-%m-%dT%H:%M:%S")
+                    .unwrap()
+                    .and_utc(),
+            ),
+            created_by: "alice".into(),
+            created_at: Utc::now(),
+            managed_by_config: false,
+        };
+        let v = PolicyFormValues::from_row(&row);
+        assert!(v.has_more_conditions());
+        let form = PolicyForm {
+            csrf_token: String::new(),
+            client_name: v.client.clone(),
+            secret_name: v.secret.clone(),
+            secret_tag: v.tag.clone(),
+            mechanism: v.mechanism.unwrap().as_str().to_owned(),
+            outcome: v.outcome.clone().unwrap(),
+            priority: Some(v.priority.clone()),
+            origins: Some(v.origins.clone()),
+            methods: Some(v.methods.clone()),
+            path_prefixes: Some(v.paths.clone()),
+            max_ttl_seconds: Some(v.max_ttl.clone()),
+            max_uses: Some(v.max_uses.clone()),
+            not_after: Some(v.not_after.clone()),
+        };
+        let Ok(p) = parse_policy_form(&form, "bob") else {
+            panic!("unchanged edit form should parse");
+        };
+        assert_eq!(p.client_name, row.client_name);
+        assert_eq!(p.secret_name, row.secret_name);
+        assert_eq!(p.secret_tag, row.secret_tag);
+        assert_eq!(p.mechanism, row.mechanism);
+        assert_eq!(p.outcome, row.outcome);
+        assert_eq!(p.priority, row.priority);
+        assert_eq!(p.origins, row.origins);
+        assert_eq!(p.methods, row.methods);
+        assert_eq!(p.path_prefixes, row.path_prefixes);
+        assert_eq!(p.max_ttl_seconds, row.max_ttl_seconds);
+        assert_eq!(p.max_uses, row.max_uses);
+        assert_eq!(p.not_after, row.not_after);
+    }
+
+    #[test]
+    fn injection_form_fields_invert_validation() {
+        for (kind, header, scope) in [
+            ("bearer", "", ""),
+            ("header", "X-Api-Key", ""),
+            ("basic", "svc", ""),
+            ("aws-sigv4", "AKIAIOSFODNN7EXAMPLE", "us-east-1/s3"),
+        ] {
+            let opt = |v: &'static str| (!v.is_empty()).then_some(v);
+            let Ok((k, h, u)) = validate_injection(kind, opt(header), opt(scope)) else {
+                panic!("{kind} should validate");
+            };
+            let row = db::SecretRow {
+                id: Uuid::new_v4(),
+                name: "s".into(),
+                description: String::new(),
+                max_tier: 0,
+                injection_kind: k,
+                injection_header: h,
+                injection_username: u,
+                current_version: 1,
+                enabled: true,
+                operator_vetted: true,
+                managed_by_config: false,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            };
+            let (fk, fh, fs) = injection_form_fields(&row);
+            assert_eq!((fk, fh.as_str(), fs.as_str()), (kind, header, scope));
+        }
+    }
+
+    #[test]
+    fn tags_field_is_split_sorted_and_deduplicated() {
+        let Ok(tags) = parse_tags_field(" web, prod web,,") else {
+            panic!("tags should parse");
+        };
+        assert_eq!(tags, ["prod", "web"]);
+        assert!(parse_tags_field(&"x".repeat(129)).is_err());
     }
 
     #[test]
