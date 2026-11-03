@@ -359,6 +359,118 @@ pub async fn rotate_secret_version(
     Ok(Some(row))
 }
 
+/// An operator's edit of a stored secret's settings — everything except its
+/// name (grants, requests and audit rows refer to a secret by name) and its
+/// value (rotation is [`rotate_secret_version`]).
+pub struct SecretSettings {
+    pub description: String,
+    pub max_tier: i32,
+    /// Already normalized by [`crate::injection::validate_injection`].
+    pub injection_kind: String,
+    pub injection_header: Option<String>,
+    pub injection_username: Option<String>,
+    pub enabled: bool,
+    /// Sorted, deduplicated.
+    pub tags: Vec<String>,
+}
+
+/// Outcome of [`update_secret_settings_audited`]. Every variant but
+/// `Updated` means nothing was written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateSecretOutcome {
+    Updated,
+    /// Deleted by someone else meanwhile.
+    NotFound,
+    /// Provisioned from config; the UI does not edit it.
+    Managed,
+}
+
+/// Replace a UI-owned secret's settings and tags and audit `secret-updated`,
+/// in one transaction. The new tier, template and enabled flag take effect at
+/// once for live grants too: every grant use revalidates them against the
+/// row (`api::revalidate_grant`, addendum #15). The vetting flag is left
+/// alone — editing the template is not reviewing the value.
+pub async fn update_secret_settings_audited(
+    db: &PgPool,
+    secret_id: Uuid,
+    s: &SecretSettings,
+    actor: &str,
+) -> anyhow::Result<UpdateSecretOutcome> {
+    let mut tx = db.begin().await?;
+    let before =
+        sqlx::query_as::<_, crate::db::SecretRow>("SELECT * FROM secrets WHERE id = $1 FOR UPDATE")
+            .bind(secret_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some(prev) = before else {
+        tx.rollback().await?;
+        return Ok(UpdateSecretOutcome::NotFound);
+    };
+    if prev.managed_by_config {
+        tx.rollback().await?;
+        return Ok(UpdateSecretOutcome::Managed);
+    }
+    let prev_tags: Vec<String> =
+        sqlx::query_scalar("SELECT tag FROM secret_tags WHERE secret_id = $1 ORDER BY tag")
+            .bind(secret_id)
+            .fetch_all(&mut *tx)
+            .await?;
+    sqlx::query(
+        "UPDATE secrets SET description = $2, max_tier = $3, injection_kind = $4, \
+         injection_header = $5, injection_username = $6, enabled = $7, updated_at = now() \
+         WHERE id = $1",
+    )
+    .bind(secret_id)
+    .bind(&s.description)
+    .bind(s.max_tier)
+    .bind(&s.injection_kind)
+    .bind(&s.injection_header)
+    .bind(&s.injection_username)
+    .bind(s.enabled)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM secret_tags WHERE secret_id = $1")
+        .bind(secret_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "INSERT INTO secret_tags (secret_id, tag) SELECT $1, unnest($2::text[]) \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(secret_id)
+    .bind(&s.tags)
+    .execute(&mut *tx)
+    .await?;
+    let injection_changed = prev.injection_kind != s.injection_kind
+        || prev.injection_header != s.injection_header
+        || prev.injection_username != s.injection_username;
+    insert_audit(
+        &mut *tx,
+        &AuditEvent {
+            kind: kinds::SECRET_UPDATED,
+            secret_name: Some(prev.name),
+            actor: Some(actor.to_owned()),
+            // Server vocabulary only: tier ints, flags and operator-chosen
+            // tags. The template's header/username are left out, as in the
+            // config reconciler's row.
+            detail: Some(serde_json::json!({
+                "max_tier": s.max_tier,
+                "previous_max_tier": prev.max_tier,
+                "enabled": s.enabled,
+                "previous_enabled": prev.enabled,
+                "injection_kind": s.injection_kind,
+                "injection_changed": injection_changed,
+                "tags": s.tags,
+                "previous_tags": prev_tags,
+            })),
+            ..Default::default()
+        },
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(UpdateSecretOutcome::Updated)
+}
+
 /// Outcome of [`delete_secret_audited`]. `Stale` means nothing at all was
 /// written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

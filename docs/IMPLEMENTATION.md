@@ -311,9 +311,20 @@ or Envoy-forwarded JWT in oidc mode):
 - `POST /ui/requests/{id}/deny`.
 - `GET /ui/grants` + `POST /ui/grants/{id}/revoke`.
 - `GET /ui/policies` + `POST /ui/policies` (create standing grant row) +
-  `POST /ui/policies/{id}/delete`.
+  `POST /ui/policies/{id}/delete`. Edit in place: `GET /ui/policies/{id}/edit`
+  (the create form, pre-filled from the row) + `POST /ui/policies/{id}`, which
+  validates through the same parser as creation, rewrites every rule field
+  but `created_by`, and audits `policy-updated` (`detail.previous_outcome`) in
+  the same transaction. Like deletion, an edit does not retro-change issued
+  grants.
 - Admin secret management (human-auth too): `POST /ui/secrets` (create/rotate:
   name, value, max_tier, injection template), `GET /ui/secrets`,
+  `GET /ui/secrets/{id}/edit` + `POST /ui/secrets/{id}` (settings: description,
+  max_tier, injection template, tags, enabled — not the name, which grants and
+  policies refer to; audits `secret-updated`; leaves `operator_vetted` alone,
+  and takes effect for live grants through access-time revalidation),
+  `POST /ui/secrets/{id}/rotate` (rotate by id from the edit page: a secret
+  deleted meanwhile is refused rather than re-created),
   `POST /ui/secrets/{id}/review` (the decision page for a client deposit:
   depositing client, injection template, tier, and which standing policies would
   begin releasing it with no human once vetted — with the plaintext shown only
@@ -737,8 +748,8 @@ These override anything above where they conflict.
     longer in config is deleted through the same path as a UI deletion (its
     live stored-backed grants are revoked). Policies reconcile by content: a
     managed row whose fields still match a config entry is left alone; others
-    are deleted, and missing entries inserted. The UI refuses to rotate or
-    delete managed secrets and to delete managed policies (409), because the
+    are deleted, and missing entries inserted. The UI refuses to edit, rotate or
+    delete managed secrets and to edit or delete managed policies (409), because the
     next restart would undo it. Unmanaged rows are never touched. Rotating a
     value means changing the mounted file and restarting; the chart lists the
     source Secrets in its Reloader annotation for that.

@@ -402,3 +402,12 @@ pub async fn get_tags_for_secret(db: &PgPool, secret_id: Uuid) -> anyhow::Result
             .await?,
     )
 }
+
+/// Every (secret, tag) pair, for showing tags on the secrets list in one query.
+pub async fn list_tag_assignments(db: &PgPool) -> anyhow::Result<Vec<(Uuid, String)>> {
+    Ok(
+        sqlx::query_as("SELECT secret_id, tag FROM secret_tags ORDER BY tag")
+            .fetch_all(db)
+            .await?,
+    )
+}

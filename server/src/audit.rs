@@ -35,6 +35,8 @@ pub mod kinds {
     pub const SECRET_REVEALED: &str = "secret-revealed";
     pub const POLICY_CREATED: &str = "policy-created";
     pub const POLICY_DELETED: &str = "policy-deleted";
+    /// An operator edited a policy row in place (outcome, scope, limits…).
+    pub const POLICY_UPDATED: &str = "policy-updated";
 }
 
 /// One audit_log row. `at` is assigned by the database (`now()`).
