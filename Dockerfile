@@ -125,7 +125,7 @@ RUN set -eux; \
 # text: /etc/passwd and /etc/group are byte-identical across the arches of
 # this same base image apart from the two entries added here, and the
 # ca-certificates payload is PEM.
-FROM --platform=$BUILDPLATFORM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS rootfs
+FROM --platform=$BUILDPLATFORM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc AS rootfs
 RUN set -eux; \
     apt-get update; \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates; \
@@ -151,7 +151,7 @@ RUN set -eux; \
 #
 # No RUN in this stage: it is the only per-target stage, and keeping it
 # COPY-only is what lets the arm64 leg build on an amd64 runner without QEMU.
-FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS runtime
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc AS runtime
 COPY --from=rootfs /etc/passwd /etc/passwd
 COPY --from=rootfs /etc/group /etc/group
 COPY --from=rootfs /usr/share/ca-certificates /usr/share/ca-certificates
