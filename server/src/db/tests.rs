@@ -7,7 +7,7 @@ use crate::audit;
 use crate::config::{ClientAuthConfig, ClientConfig, ServiceAccountAuth};
 use chrono::{Duration, Utc};
 use keychute_types::{Mechanism, Tier};
-use sqlx::PgPool;
+use sqlx::{Connection, PgPool};
 use uuid::Uuid;
 
 struct TestDb {
@@ -96,6 +96,44 @@ fn new_request(client: &str, idem_key: &str, mac: &[u8]) -> NewAccessRequest {
         idem_key: idem_key.to_owned(),
         idem_mac: mac.to_vec(),
     }
+}
+
+#[tokio::test]
+async fn connect_refuses_a_read_only_server() -> anyhow::Result<()> {
+    let Some(t) = setup().await? else {
+        return Ok(());
+    };
+    let (base, _) = t.admin_url.rsplit_once('/').unwrap();
+    let url = format!("{base}/{}", t.name);
+
+    // A writable server is accepted and can be written to.
+    let db = connect(&url, 2).await?;
+    sqlx::query("CREATE TABLE rw_probe (i int)")
+        .execute(&db)
+        .await?;
+    db.close().await;
+
+    // New sessions on this database now start read-only, as on a standby.
+    // (Checked on a bare connection: through the pool, sqlx retries the
+    // refusal until the acquire timeout and reports only PoolTimedOut.)
+    sqlx::query(&format!(
+        "ALTER DATABASE {} SET default_transaction_read_only = on",
+        t.name
+    ))
+    .execute(&t.pool)
+    .await?;
+    let mut conn = sqlx::PgConnection::connect(&url).await?;
+    let err = refuse_read_only(&mut conn)
+        .await
+        .expect_err("read-only server accepted");
+    assert!(
+        err.to_string().contains("read-only PostgreSQL server"),
+        "unexpected error: {err}"
+    );
+    conn.close().await?;
+
+    t.teardown().await;
+    Ok(())
 }
 
 #[tokio::test]

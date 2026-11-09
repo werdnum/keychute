@@ -131,6 +131,36 @@ pub async fn verify_no_references(db: &sqlx::PgPool, kek_id: &str) -> anyhow::Re
     Ok(count == 0)
 }
 
+/// Opens the server's pool, refusing any connection to a read-only server.
+///
+/// During a Postgres failover the database Service can keep routing to the old
+/// primary after it has demoted itself; a pool that connects then fills with
+/// read-only connections and every write fails until restart. libpq's
+/// `target_session_attrs=read-write` would prevent that, but sqlx ignores the
+/// parameter, so the same check runs here on each new connection. sqlx retries
+/// a refused connection until the acquire timeout (then `PoolTimedOut`), so
+/// the pool keeps trying until the Service routes to the real primary.
+pub async fn connect(url: &str, max_connections: u32) -> anyhow::Result<sqlx::PgPool> {
+    Ok(sqlx::postgres::PgPoolOptions::new()
+        .max_connections(max_connections)
+        .after_connect(|conn, _meta| Box::pin(refuse_read_only(conn)))
+        .connect(url)
+        .await?)
+}
+
+/// Fails if `conn` is to a read-only server (a standby, or a demoted primary).
+async fn refuse_read_only(conn: &mut sqlx::PgConnection) -> Result<(), sqlx::Error> {
+    let read_only: String = sqlx::query_scalar("SHOW transaction_read_only")
+        .fetch_one(&mut *conn)
+        .await?;
+    if read_only != "off" {
+        return Err(sqlx::Error::Protocol(
+            "connected to a read-only PostgreSQL server; refusing the connection".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// The database clock. Persisted deadlines (request expiry, grant
 /// `not_after`) are derived from this rather than the process clock: every
 /// predicate that later enforces them runs on SQL `now()`, so a skewed server
