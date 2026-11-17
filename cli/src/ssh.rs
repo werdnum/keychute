@@ -54,6 +54,8 @@ const AGENT_READY_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MIN_AGENT_KEY_LIFETIME_SECONDS: u64 = 60;
 const MAX_AGENT_KEY_LIFETIME_SECONDS: u64 = 300;
 const AGENT_HANDSHAKE_GRACE_SECONDS: u64 = 30;
+const MAX_CONNECT_TIMEOUT_SECONDS: u64 =
+    MAX_AGENT_KEY_LIFETIME_SECONDS - AGENT_HANDSHAKE_GRACE_SECONDS;
 
 fn agent_key_lifetime_seconds(connect_timeout: Option<u64>) -> u64 {
     match connect_timeout {
@@ -147,13 +149,13 @@ pub(crate) struct SshArgs {
     /// Verbose mode (`-v`, repeatable up to `-vvv`).
     #[arg(short = 'v', long, action = clap::ArgAction::Count, conflicts_with = "quiet")]
     pub verbose: u8,
-    /// SSH connection timeout in seconds (`-o ConnectTimeout=N`).
+    /// SSH connection timeout in seconds (`-o ConnectTimeout=N`, 1..=270).
     #[arg(long, value_name = "SECONDS")]
     pub connect_timeout: Option<u64>,
     /// StrictHostKeyChecking policy: `accept-new` (default) or `yes`.
     #[arg(long, default_value = "accept-new", value_name = "MODE")]
     pub strict_host_key_checking: String,
-    /// Custom known_hosts file (`-o UserKnownHostsFile=PATH`). Refuses `/dev/null`.
+    /// Custom known_hosts file (`-o UserKnownHostsFile=PATH`). Refuses `/dev/null` and `none`.
     #[arg(long, value_name = "PATH")]
     pub known_hosts_file: Option<PathBuf>,
     /// Optional remote command and arguments. Pass `--` before the command if
@@ -486,8 +488,15 @@ fn validate_options(args: &SshArgs, parsed: &ParsedDestination) -> CliResult<()>
     if args.port == Some(0) {
         return Err(fail(EXIT_CONFIG, "--port must be between 1 and 65535"));
     }
-    if args.connect_timeout == Some(0) {
-        return Err(fail(EXIT_CONFIG, "--connect-timeout must be at least 1"));
+    if let Some(ct) = args.connect_timeout {
+        if ct == 0 || ct > MAX_CONNECT_TIMEOUT_SECONDS {
+            return Err(fail(
+                EXIT_CONFIG,
+                format!(
+                    "--connect-timeout must be between 1 and {MAX_CONNECT_TIMEOUT_SECONDS} seconds"
+                ),
+            ));
+        }
     }
     for spec in &args.local_forwards {
         validate_simple_token("-L", spec, &[])?;
@@ -943,12 +952,18 @@ async fn load_key_into_agent(
         .arg("-")
         .env("SSH_AUTH_SOCK", sock)
         .env("SSH_ASKPASS", "/bin/false")
-        .env("SSH_ASKPASS_REQUIRE", "never")
+        .env("SSH_ASKPASS_REQUIRE", "force")
         .env_remove("DISPLAY")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    #[cfg(unix)]
+    {
+        // Detach from the foreground terminal process group as belt-and-suspenders
+        // alongside SSH_ASKPASS_REQUIRE=force so ssh-add can never block reading /dev/tty.
+        cmd.process_group(0);
+    }
 
     let mut child = cmd.spawn().map_err(|e| {
         fail(
@@ -1063,6 +1078,33 @@ fn build_ssh_argv(parsed: &ParsedDestination, args: &SshArgs) -> Vec<String> {
     argv
 }
 
+#[cfg(unix)]
+fn forward_sigint_to_child(child: &mut tokio::process::Child) {
+    let Some(pid) = child.id() else {
+        return;
+    };
+    let pid_str = pid.to_string();
+    let sent = std::process::Command::new("/bin/kill")
+        .args(["-INT", &pid_str])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .or_else(|_| {
+            std::process::Command::new("kill")
+                .args(["-INT", &pid_str])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+        })
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !sent {
+        let _ = child.start_kill();
+    }
+}
+
 async fn run_ssh_child(
     bins: &OpenSshBins,
     sock: &Path,
@@ -1091,7 +1133,9 @@ async fn run_ssh_child(
                     return res.map_err(|e| fail(EXIT_OTHER, format!("failed waiting for ssh: {e}")));
                 }
                 _ = signals.sigint.recv() => {
-                    // Let the foreground ssh child handle interactive Ctrl-C.
+                    // Forward PID-targeted SIGINT too (e.g. `kill -INT <keychute_pid>`);
+                    // on terminal Ctrl-C, ssh also receives SIGINT from the TTY.
+                    forward_sigint_to_child(&mut child);
                 }
                 _ = signals.sigterm.recv() => {
                     let _ = child.start_kill();
@@ -1282,7 +1326,7 @@ mod tests {
             EXIT_CONFIG
         );
 
-        // Refuses port 0 and connect_timeout 0.
+        // Refuses port 0 and out-of-range connect_timeout.
         let port0 = parse_ssh(&["grotten", "-p", "0", "--secret", "k"]);
         assert_eq!(
             validate_options(&port0, &parse_destination(&port0.destination).unwrap())
@@ -1290,12 +1334,19 @@ mod tests {
                 .code,
             EXIT_CONFIG
         );
-        let ct0 = parse_ssh(&["grotten", "--connect-timeout", "0", "--secret", "k"]);
-        assert_eq!(
-            validate_options(&ct0, &parse_destination(&ct0.destination).unwrap())
-                .unwrap_err()
-                .code,
-            EXIT_CONFIG
+        for bad_ct in ["0", "271"] {
+            let ct = parse_ssh(&["grotten", "--connect-timeout", bad_ct, "--secret", "k"]);
+            assert_eq!(
+                validate_options(&ct, &parse_destination(&ct.destination).unwrap())
+                    .unwrap_err()
+                    .code,
+                EXIT_CONFIG,
+                "expected --connect-timeout {bad_ct} to be rejected"
+            );
+        }
+        let max_ct = parse_ssh(&["grotten", "--connect-timeout", "270", "--secret", "k"]);
+        assert!(
+            validate_options(&max_ct, &parse_destination(&max_ct.destination).unwrap()).is_ok()
         );
 
         // Refuses empty/oversize idempotency key.
@@ -1486,6 +1537,6 @@ mod tests {
         assert_eq!(agent_key_lifetime_seconds(None), 60);
         assert_eq!(agent_key_lifetime_seconds(Some(5)), 60);
         assert_eq!(agent_key_lifetime_seconds(Some(90)), 120);
-        assert_eq!(agent_key_lifetime_seconds(Some(600)), 300);
+        assert_eq!(agent_key_lifetime_seconds(Some(270)), 300);
     }
 }

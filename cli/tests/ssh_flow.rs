@@ -147,10 +147,16 @@ async fn start_mock(cfg: MockConfig) -> (String, MockState) {
 /// Generate a throwaway Ed25519 keypair using `ssh-keygen`, return
 /// `(private_key_bytes, public_key_line)`, and delete the key files.
 fn generate_ed25519_keypair(dir: &Path) -> (Vec<u8>, String) {
+    generate_ed25519_keypair_with_passphrase(dir, "")
+}
+
+fn generate_ed25519_keypair_with_passphrase(dir: &Path, passphrase: &str) -> (Vec<u8>, String) {
     let key_path = dir.join("test_ed25519");
     let pub_path = dir.join("test_ed25519.pub");
     let out = Command::new("ssh-keygen")
-        .args(["-q", "-t", "ed25519", "-N", "", "-C", "test-key", "-f"])
+        .args([
+            "-q", "-t", "ed25519", "-N", passphrase, "-C", "test-key", "-f",
+        ])
         .arg(&key_path)
         .output()
         .expect("ssh-keygen must be installed");
@@ -617,9 +623,8 @@ async fn preflight_errors_exit_2_with_zero_server_requests() {
 }
 
 #[cfg(unix)]
-#[tokio::test]
-async fn sighup_terminates_ssh_and_cleans_up_ephemeral_agent() {
-    let dir = TempDir::new("kc-ssh-sighup");
+async fn assert_signal_stops_ssh_and_cleans_up(sig_flag: &str, expected_code: i32, prefix: &str) {
+    let dir = TempDir::new(prefix);
     let (priv_bytes, _) = generate_ed25519_keypair(dir.path());
     let (_bin, capture, path_env) = install_fake_ssh(dir.path());
     let sock_tmp = dir.path().join("tmp");
@@ -670,21 +675,74 @@ async fn sighup_terminates_ssh_and_cleans_up_ephemeral_agent() {
     );
 
     let kill_status = Command::new("kill")
-        .args(["-HUP", &child.id().to_string()])
+        .args([sig_flag, &child.id().to_string()])
         .status()
-        .expect("failed running kill -HUP");
+        .expect("failed running kill");
     assert!(kill_status.success());
 
     let out = tokio::task::spawn_blocking(move || child.wait_with_output().unwrap())
         .await
         .unwrap();
-    assert_eq!(out.status.code(), Some(129));
+    assert_eq!(out.status.code(), Some(expected_code));
     assert!(
         !Path::new(&sock_path).exists(),
-        "ephemeral agent socket must be removed on SIGHUP: {sock_path}"
+        "ephemeral agent socket must be removed on {sig_flag}: {sock_path}"
     );
     assert!(
         std::fs::read_dir(&sock_tmp).unwrap().next().is_none(),
-        "agent socket directory must be removed on SIGHUP"
+        "agent socket directory must be removed on {sig_flag}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sighup_terminates_ssh_and_cleans_up_ephemeral_agent() {
+    assert_signal_stops_ssh_and_cleans_up("-HUP", 129, "kc-ssh-sighup").await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sigint_targeted_at_keychute_stops_ssh_and_cleans_up_agent() {
+    assert_signal_stops_ssh_and_cleans_up("-INT", 130, "kc-ssh-sigint").await;
+}
+
+#[tokio::test]
+async fn encrypted_key_fails_fast_without_prompting_and_cleans_up() {
+    let dir = TempDir::new("kc-ssh-enc");
+    let (priv_bytes, _) = generate_ed25519_keypair_with_passphrase(dir.path(), "pass123");
+    let (_bin, capture, path_env) = install_fake_ssh(dir.path());
+    let sock_tmp = dir.path().join("tmp");
+    std::fs::create_dir_all(&sock_tmp).unwrap();
+
+    let (url, _state) = start_mock(MockConfig {
+        secret_payload: priv_bytes,
+        deny: false,
+        granted_secret_name: None,
+        auto_approved: true,
+    })
+    .await;
+
+    let capture_clone = capture.clone();
+    let tmp_clone = sock_tmp.clone();
+    let out = tokio::task::spawn_blocking(move || {
+        run_ssh_cli(
+            &url,
+            &path_env,
+            &capture_clone,
+            &tmp_clone,
+            &[],
+            &["ssh", "ansibleadm@grotten", "--secret", "node-ssh-key"],
+        )
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(out.status.code(), Some(1));
+    assert!(!capture.join("argv").exists());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("ssh-add rejected"), "{stderr}");
+    assert!(
+        std::fs::read_dir(&sock_tmp).unwrap().next().is_none(),
+        "agent socket directory must be removed after encrypted-key failure"
     );
 }
