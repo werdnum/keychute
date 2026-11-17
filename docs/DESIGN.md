@@ -190,7 +190,7 @@ both exist so credentials never have to transit an LLM chat to get into the stor
    constraint — tier 2 releases the key bytes once to the client container).
 4. On approval, the CLI reads the private key into memory, normalizes line
    endings, spawns an isolated ephemeral `ssh-agent` on a `0700` socket
-   directory, feeds the key into `ssh-add -q -` over stdin while wiping its own
+   directory, feeds the key into `ssh-add -q -t <lifetime> -` over stdin while wiping its own
    memory buffers, runs `ssh` against that agent with `-F none`,
    `IdentityFile=none`, `ForwardAgent=no`, and `BatchMode=yes`, then tears down
    the agent and socket directory and propagates `ssh`'s exit code. The key

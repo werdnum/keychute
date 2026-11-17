@@ -188,6 +188,10 @@ ssh-add -L > "${FAKE_SSH_CAPTURE_DIR}/agent_keys"
 for arg in "$@"; do
   printf '%s\n' "$arg" >> "${FAKE_SSH_CAPTURE_DIR}/argv"
 done
+if [ -n "${FAKE_SSH_SLEEP:-}" ]; then
+  : > "${FAKE_SSH_CAPTURE_DIR}/ready"
+  exec sleep "${FAKE_SSH_SLEEP}"
+fi
 if [ -n "${FAKE_SSH_STDOUT:-}" ]; then
   printf '%s' "${FAKE_SSH_STDOUT}"
 fi
@@ -564,6 +568,14 @@ async fn preflight_errors_exit_2_with_zero_server_requests() {
             "--known-hosts-file",
             "/dev/null",
         ],
+        vec![
+            "ssh",
+            "grotten",
+            "--secret",
+            "k",
+            "--known-hosts-file",
+            "none",
+        ],
         vec!["ssh", "u@grotten", "-l", "other", "--secret", "k"],
     ] {
         let u = url.clone();
@@ -601,5 +613,78 @@ async fn preflight_errors_exit_2_with_zero_server_requests() {
     assert!(
         state.create_bodies.lock().unwrap().is_empty(),
         "preflight errors must never send an access request"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sighup_terminates_ssh_and_cleans_up_ephemeral_agent() {
+    let dir = TempDir::new("kc-ssh-sighup");
+    let (priv_bytes, _) = generate_ed25519_keypair(dir.path());
+    let (_bin, capture, path_env) = install_fake_ssh(dir.path());
+    let sock_tmp = dir.path().join("tmp");
+    std::fs::create_dir_all(&sock_tmp).unwrap();
+
+    let (url, _state) = start_mock(MockConfig {
+        secret_payload: priv_bytes,
+        deny: false,
+        granted_secret_name: None,
+        auto_approved: true,
+    })
+    .await;
+
+    let child = Command::new(env!("CARGO_BIN_EXE_keychute"))
+        .args(["ssh", "ansibleadm@grotten", "--secret", "node-ssh-key"])
+        .env("KEYCHUTE_URL", &url)
+        .env("KEYCHUTE_TOKEN", "test-token")
+        .env("PATH", &path_env)
+        .env("TMPDIR", &sock_tmp)
+        .env("FAKE_SSH_CAPTURE_DIR", &capture)
+        .env("FAKE_SSH_SLEEP", "30")
+        .env_remove("KEYCHUTE_TOKEN_FILE")
+        .env_remove("KEYCHUTE_CA_BUNDLE")
+        .env_remove("KEYCHUTE_EXTERNAL_URL")
+        .env_remove("SSH_AUTH_SOCK")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn keychute");
+
+    let ready = capture.join("ready");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !ready.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for fake ssh to start"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    let sock_path = std::fs::read_to_string(capture.join("sock_path"))
+        .unwrap()
+        .trim()
+        .to_string();
+    assert!(
+        Path::new(&sock_path).exists(),
+        "agent socket must exist while ssh runs: {sock_path}"
+    );
+
+    let kill_status = Command::new("kill")
+        .args(["-HUP", &child.id().to_string()])
+        .status()
+        .expect("failed running kill -HUP");
+    assert!(kill_status.success());
+
+    let out = tokio::task::spawn_blocking(move || child.wait_with_output().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(out.status.code(), Some(129));
+    assert!(
+        !Path::new(&sock_path).exists(),
+        "ephemeral agent socket must be removed on SIGHUP: {sock_path}"
+    );
+    assert!(
+        std::fs::read_dir(&sock_tmp).unwrap().next().is_none(),
+        "agent socket directory must be removed on SIGHUP"
     );
 }

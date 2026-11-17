@@ -47,6 +47,52 @@ pub(crate) const MAX_SSH_USER_KEY_BYTES: usize = 124 - (CALL_BINDING_HEX_CHARS +
 const MAX_SOCKET_PATH_BYTES: usize = 100;
 const AGENT_READY_POLL_ATTEMPTS: usize = 500;
 const AGENT_READY_POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// Bounded lifetime (`ssh-agent -t` / `ssh-add -t`) so even an uncatchable
+/// `SIGKILL` cannot leave a decrypted private key resident in an orphaned
+/// `ssh-agent` indefinitely. `ForwardAgent=no` is hardcoded, so the agent is
+/// only consulted during initial connection authentication.
+const MIN_AGENT_KEY_LIFETIME_SECONDS: u64 = 60;
+const MAX_AGENT_KEY_LIFETIME_SECONDS: u64 = 300;
+const AGENT_HANDSHAKE_GRACE_SECONDS: u64 = 30;
+
+fn agent_key_lifetime_seconds(connect_timeout: Option<u64>) -> u64 {
+    match connect_timeout {
+        Some(ct) => ct.saturating_add(AGENT_HANDSHAKE_GRACE_SECONDS).clamp(
+            MIN_AGENT_KEY_LIFETIME_SECONDS,
+            MAX_AGENT_KEY_LIFETIME_SECONDS,
+        ),
+        None => MIN_AGENT_KEY_LIFETIME_SECONDS,
+    }
+}
+
+#[cfg(unix)]
+struct UnixSignals {
+    sigint: tokio::signal::unix::Signal,
+    sigterm: tokio::signal::unix::Signal,
+    sighup: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl UnixSignals {
+    fn register() -> CliResult<Self> {
+        use tokio::signal::unix::{signal, SignalKind};
+        let sigint = signal(SignalKind::interrupt())
+            .map_err(|e| fail(EXIT_OTHER, format!("failed installing SIGINT handler: {e}")))?;
+        let sigterm = signal(SignalKind::terminate()).map_err(|e| {
+            fail(
+                EXIT_OTHER,
+                format!("failed installing SIGTERM handler: {e}"),
+            )
+        })?;
+        let sighup = signal(SignalKind::hangup())
+            .map_err(|e| fail(EXIT_OTHER, format!("failed installing SIGHUP handler: {e}")))?;
+        Ok(UnixSignals {
+            sigint,
+            sigterm,
+            sighup,
+        })
+    }
+}
 
 #[derive(clap::Args)]
 pub(crate) struct SshArgs {
@@ -260,15 +306,46 @@ pub(crate) async fn run_ssh(cfg: &Config, http: &reqwest::Client, args: SshArgs)
     let mut released = read_grant(cfg, http, grant_id, &read_idempotency_key(&idem_key)).await?;
     let mut key_bytes = decode_and_normalize_key(&mut released)?;
 
-    let mut guard = start_ephemeral_agent(&bins).await?;
+    #[cfg(unix)]
+    let mut signals = UnixSignals::register()?;
+    let key_lifetime_secs = agent_key_lifetime_seconds(args.connect_timeout);
+
+    let mut guard = start_ephemeral_agent(&bins, key_lifetime_secs).await?;
     let sock = guard.dir.join("s");
-    let load_res = load_key_into_agent(&bins, &sock, &mut key_bytes).await;
-    key_bytes.zeroize();
-    if let Err(err) = load_res {
-        guard.shutdown().await;
-        return Err(err);
+
+    enum LoadOutcome {
+        Finished(CliResult<()>),
+        Signal(i32),
     }
 
+    #[cfg(unix)]
+    let load_outcome = tokio::select! {
+        res = load_key_into_agent(&bins, &sock, &mut key_bytes, key_lifetime_secs) => LoadOutcome::Finished(res),
+        _ = signals.sigint.recv() => LoadOutcome::Signal(130),
+        _ = signals.sigterm.recv() => LoadOutcome::Signal(143),
+        _ = signals.sighup.recv() => LoadOutcome::Signal(129),
+    };
+    #[cfg(not(unix))]
+    let load_outcome = LoadOutcome::Finished(
+        load_key_into_agent(&bins, &sock, &mut key_bytes, key_lifetime_secs).await,
+    );
+
+    key_bytes.zeroize();
+    match load_outcome {
+        LoadOutcome::Signal(code) => {
+            guard.shutdown().await;
+            return Err(crate::silent_exit(code));
+        }
+        LoadOutcome::Finished(Err(err)) => {
+            guard.shutdown().await;
+            return Err(err);
+        }
+        LoadOutcome::Finished(Ok(())) => {}
+    }
+
+    #[cfg(unix)]
+    let ssh_res = run_ssh_child(&bins, &sock, &parsed, &args, &mut guard, &mut signals).await;
+    #[cfg(not(unix))]
     let ssh_res = run_ssh_child(&bins, &sock, &parsed, &args, &mut guard).await;
     guard.shutdown().await;
     let status = ssh_res?;
@@ -471,6 +548,12 @@ fn validate_known_hosts_path(path: &Path) -> CliResult<()> {
             ),
         ));
     }
+    if raw.eq_ignore_ascii_case("none") {
+        return Err(fail(
+            EXIT_CONFIG,
+            "refusing --known-hosts-file none: disabling host key persistence is not allowed",
+        ));
+    }
     if path == Path::new("/dev/null") {
         return Err(fail(
             EXIT_CONFIG,
@@ -493,6 +576,17 @@ fn validate_known_hosts_path(path: &Path) -> CliResult<()> {
             }
         }
     }
+    if let Ok(meta) = std::fs::metadata(path) {
+        if !meta.is_file() {
+            return Err(fail(
+                EXIT_CONFIG,
+                format!(
+                    "refusing --known-hosts-file {}: existing path is not a regular file",
+                    path.display()
+                ),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -505,10 +599,16 @@ fn resolve_openssh_bins_in(path_var: Option<&std::ffi::OsStr>) -> Result<OpenSsh
     let paths: Vec<PathBuf> = path_var
         .map(|p| std::env::split_paths(p).collect())
         .unwrap_or_default();
+    let cwd = std::env::current_dir().ok();
     let find = |name: &str| -> Result<PathBuf, String> {
         for dir in &paths {
             let candidate = dir.join(name);
             if is_executable_file(&candidate) {
+                if candidate.is_relative() {
+                    if let Some(base) = &cwd {
+                        return Ok(base.join(candidate));
+                    }
+                }
                 return Ok(candidate);
             }
         }
@@ -770,15 +870,21 @@ fn create_socket_dir() -> CliResult<PathBuf> {
     Ok(dir)
 }
 
-async fn start_ephemeral_agent(bins: &OpenSshBins) -> CliResult<AgentGuard> {
+async fn start_ephemeral_agent(
+    bins: &OpenSshBins,
+    key_lifetime_secs: u64,
+) -> CliResult<AgentGuard> {
     let dir = create_socket_dir()?;
     let sock = dir.join("s");
-    let mut guard = AgentGuard::new(dir);
+    let mut guard = AgentGuard::new(dir.clone());
 
     let mut cmd = tokio::process::Command::new(&bins.ssh_agent);
-    cmd.arg("-D")
+    cmd.current_dir(&dir)
+        .arg("-D")
+        .arg("-t")
+        .arg(key_lifetime_secs.to_string())
         .arg("-a")
-        .arg(&sock)
+        .arg("s")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -828,9 +934,12 @@ async fn load_key_into_agent(
     bins: &OpenSshBins,
     sock: &Path,
     key_bytes: &mut Zeroizing<Vec<u8>>,
+    key_lifetime_secs: u64,
 ) -> CliResult<()> {
     let mut cmd = tokio::process::Command::new(&bins.ssh_add);
     cmd.arg("-q")
+        .arg("-t")
+        .arg(key_lifetime_secs.to_string())
         .arg("-")
         .env("SSH_AUTH_SOCK", sock)
         .env("SSH_ASKPASS", "/bin/false")
@@ -838,7 +947,8 @@ async fn load_key_into_agent(
         .env_remove("DISPLAY")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
 
     let mut child = cmd.spawn().map_err(|e| {
         fail(
@@ -959,6 +1069,7 @@ async fn run_ssh_child(
     parsed: &ParsedDestination,
     args: &SshArgs,
     guard: &mut AgentGuard,
+    #[cfg(unix)] signals: &mut UnixSignals,
 ) -> CliResult<ExitStatus> {
     let mut cmd = tokio::process::Command::new(&bins.ssh);
     cmd.env("SSH_AUTH_SOCK", sock)
@@ -966,19 +1077,6 @@ async fn run_ssh_child(
 
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{signal, SignalKind};
-        // Register signal listeners before spawning so keychute stays alive to
-        // reap ssh and clean up ssh-agent. execve resets caught handlers in
-        // ssh back to SIG_DFL.
-        let mut sigint = signal(SignalKind::interrupt())
-            .map_err(|e| fail(EXIT_OTHER, format!("failed installing SIGINT handler: {e}")))?;
-        let mut sigterm = signal(SignalKind::terminate()).map_err(|e| {
-            fail(
-                EXIT_OTHER,
-                format!("failed installing SIGTERM handler: {e}"),
-            )
-        })?;
-
         let _ = std::io::stderr().flush();
         let mut child = cmd.spawn().map_err(|e| {
             fail(
@@ -992,14 +1090,20 @@ async fn run_ssh_child(
                 res = child.wait() => {
                     return res.map_err(|e| fail(EXIT_OTHER, format!("failed waiting for ssh: {e}")));
                 }
-                _ = sigint.recv() => {
+                _ = signals.sigint.recv() => {
                     // Let the foreground ssh child handle interactive Ctrl-C.
                 }
-                _ = sigterm.recv() => {
+                _ = signals.sigterm.recv() => {
                     let _ = child.start_kill();
                     let _ = child.wait().await;
                     guard.shutdown().await;
                     return Err(crate::silent_exit(143));
+                }
+                _ = signals.sighup.recv() => {
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    guard.shutdown().await;
+                    return Err(crate::silent_exit(129));
                 }
             }
         }
@@ -1137,20 +1241,20 @@ mod tests {
         ]);
         assert!(validate_options(&yes, &parse_destination(&yes.destination).unwrap()).is_ok());
 
-        // Refuses /dev/null known_hosts_file.
-        let devnull = parse_ssh(&[
-            "grotten",
-            "--secret",
-            "k",
-            "--known-hosts-file",
-            "/dev/null",
-        ]);
-        assert_eq!(
-            validate_options(&devnull, &parse_destination(&devnull.destination).unwrap())
+        // Refuses /dev/null and OpenSSH's `none` sentinel for known_hosts_file.
+        for bad_kh in ["/dev/null", "none", "NONE", "/tmp"] {
+            let parsed_cmd = parse_ssh(&["grotten", "--secret", "k", "--known-hosts-file", bad_kh]);
+            assert_eq!(
+                validate_options(
+                    &parsed_cmd,
+                    &parse_destination(&parsed_cmd.destination).unwrap()
+                )
                 .unwrap_err()
                 .code,
-            EXIT_CONFIG
-        );
+                EXIT_CONFIG,
+                "expected {bad_kh:?} to be rejected"
+            );
+        }
         // Refuses whitespace/quotes in known_hosts_file.
         let bad_kh = parse_ssh(&[
             "grotten",
@@ -1375,5 +1479,13 @@ mod tests {
             Err(m) => m,
         };
         assert!(msg.contains("not found on PATH"), "{msg}");
+    }
+
+    #[test]
+    fn agent_key_lifetime_bounds_track_connect_timeout() {
+        assert_eq!(agent_key_lifetime_seconds(None), 60);
+        assert_eq!(agent_key_lifetime_seconds(Some(5)), 60);
+        assert_eq!(agent_key_lifetime_seconds(Some(90)), 120);
+        assert_eq!(agent_key_lifetime_seconds(Some(600)), 300);
     }
 }
