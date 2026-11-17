@@ -18,7 +18,7 @@ v1 server-side implementation (design milestones M0–M3) plus packaging:
 - `cli/` — the `keychute` CLI: `keychute curl <url> --secret <name>` to make an
   authenticated HTTP call without ever holding the credential (tier 0 — the
   server attaches it and streams the response back), `keychute ssh
-  [user@]host --secret <name>` to run OpenSSH `ssh` using a Keychute-stored
+  --secret <name> -- [ssh-args...]` to run OpenSSH `ssh` using a Keychute-stored
   private key loaded into an ephemeral local `ssh-agent` without writing key
   bytes to stdout or disk (tier 2, human approval in the loop), `keychute
   request <secret> | consumer…` to get a secret out when a consumer genuinely

@@ -84,8 +84,8 @@ enum Cmd {
     /// SSH to a host using a Keychute-stored private key via an isolated
     /// ephemeral local `ssh-agent` (never written to stdout or disk).
     ///
-    /// Ssh-SHAPED, not an ssh: the flags listed here are the whole surface,
-    /// and anything absent is absent on purpose.
+    /// Passes `SSH_ARGS` directly through to OpenSSH `ssh` while prepending
+    /// safe agent/non-interactive defaults that caller flags can override.
     Ssh(ssh::SshArgs),
     /// Request a secret; once approved, print it to stdout.
     Request(RequestArgs),

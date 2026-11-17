@@ -1,21 +1,14 @@
 //! `keychute ssh` — run OpenSSH `ssh` using a private key stored in Keychute
 //! (CUJ 2c, tier-2 `cli-read`) without ever writing key bytes to stdout or disk.
 //!
-//! Flow: validate all arguments and resolve OpenSSH binaries up front, request
-//! a single-use `cli-read` grant (with the target session attached as
-//! agent-asserted context), load the released private key over stdin into an
-//! isolated ephemeral `ssh-agent` whose Unix socket lives in a `0700`
-//! temporary directory, run `ssh` against that agent with user/system config
-//! bypassed and agent forwarding disabled, then tear down `ssh-agent` and the
-//! socket directory before propagating `ssh`'s exit code.
-//!
-//! # Scope: ssh-SHAPED, not an ssh
-//!
-//! Only the flags defined here are accepted; unknown options fail at the
-//! parser before any approval push is sent.
+//! This subcommand is a thin tier-2 wrapper around OpenSSH `ssh`, not an `ssh`
+//! re-implementation. It requests a single-use `cli-read` grant (attaching the
+//! claimed invocation as context), loads the released key into an isolated
+//! ephemeral `ssh-agent` whose Unix socket lives in a `0700` temp directory,
+//! runs `ssh` with safe default agent/batch options while passing `SSH_ARGS`
+//! through, and tears down `ssh-agent` before propagating `ssh`'s exit code.
 
 use std::io::Write;
-use std::net::Ipv6Addr;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
@@ -38,6 +31,7 @@ const MAX_TTL_SECONDS: u64 = 30 * 24 * 3600;
 const MAX_APPROVAL_WAIT_SECONDS: u64 = MAX_TTL_SECONDS;
 const MAX_SECRET_NAME_BYTES: usize = 256;
 const MAX_REASON_BYTES: usize = 4 * 1024;
+const MAX_SUMMARY_CHARS: usize = 1024;
 /// 32 hex chars of SHA-256 + `-` separator, leaving 91 bytes for caller keys
 /// under the shared 124-byte `validate_idempotency_key` cap.
 const CALL_BINDING_HEX_CHARS: usize = 32;
@@ -47,25 +41,37 @@ pub(crate) const MAX_SSH_USER_KEY_BYTES: usize = 124 - (CALL_BINDING_HEX_CHARS +
 const MAX_SOCKET_PATH_BYTES: usize = 100;
 const AGENT_READY_POLL_ATTEMPTS: usize = 500;
 const AGENT_READY_POLL_INTERVAL: Duration = Duration::from_millis(10);
-/// Bounded lifetime (`ssh-agent -t` / `ssh-add -t`) so even an uncatchable
-/// `SIGKILL` cannot leave a decrypted private key resident in an orphaned
-/// `ssh-agent` indefinitely. `ForwardAgent=no` is hardcoded, so the agent is
-/// only consulted during initial connection authentication.
-const MIN_AGENT_KEY_LIFETIME_SECONDS: u64 = 60;
-const MAX_AGENT_KEY_LIFETIME_SECONDS: u64 = 300;
-const AGENT_HANDSHAKE_GRACE_SECONDS: u64 = 30;
-const DEFAULT_CONNECT_TIMEOUT_SECONDS: u64 = 30;
-const MAX_CONNECT_TIMEOUT_SECONDS: u64 =
-    MAX_AGENT_KEY_LIFETIME_SECONDS - AGENT_HANDSHAKE_GRACE_SECONDS;
+/// Orphan-leak backstop (`ssh-agent -t` / `ssh-add -t`) so uncatchable
+/// `SIGKILL` cannot leave a private key resident in memory indefinitely.
+const AGENT_ORPHAN_BACKSTOP_SECONDS: u64 = 3600;
 
-fn agent_key_lifetime_seconds(connect_timeout: Option<u64>) -> u64 {
-    connect_timeout
-        .unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECONDS)
-        .saturating_add(AGENT_HANDSHAKE_GRACE_SECONDS)
-        .clamp(
-            MIN_AGENT_KEY_LIFETIME_SECONDS,
-            MAX_AGENT_KEY_LIFETIME_SECONDS,
-        )
+/// Single-letter OpenSSH `ssh` options that take a separate argument.
+const SSH_ARG_OPTIONS: &[u8] = b"BbcDEeFIiJLlmOopQRSWw";
+
+#[derive(clap::Args)]
+pub(crate) struct SshArgs {
+    /// Name of the Keychute secret holding the SSH private key. If you do not
+    /// know the exact name, pick a plausible one (e.g. `node-ssh-key`): when
+    /// nothing is stored under it, the approver can release the right stored
+    /// secret instead.
+    #[arg(long)]
+    pub secret: String,
+    /// Human-readable reason, shown verbatim on the approval page.
+    #[arg(long, default_value = "")]
+    pub reason: String,
+    /// Requested grant TTL in seconds.
+    #[arg(long, default_value_t = 300)]
+    pub ttl: u64,
+    /// How long to wait for approval before giving up, in seconds.
+    #[arg(long, default_value_t = 900)]
+    pub timeout: u64,
+    /// Idempotency key for the access request (random UUID if omitted).
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+    /// Arguments passed directly to OpenSSH `ssh` (`[ssh-options] destination [command ...]`).
+    /// Pass `--` before any `ssh` flags or remote command flags starting with `-`.
+    #[arg(required = true, num_args = 1.., value_name = "SSH_ARGS")]
+    pub ssh_args: Vec<String>,
 }
 
 #[cfg(unix)]
@@ -94,112 +100,6 @@ impl UnixSignals {
             sigterm,
             sighup,
         })
-    }
-}
-
-#[derive(clap::Args)]
-pub(crate) struct SshArgs {
-    /// SSH destination (`[user@]host`).
-    pub destination: String,
-    /// Name of the Keychute secret holding the SSH private key. If you do not
-    /// know the exact name, pick a plausible one (e.g. `node-ssh-key`): when
-    /// nothing is stored under it, the approver can release the right stored
-    /// secret instead.
-    #[arg(long)]
-    pub secret: String,
-    /// Human-readable reason, shown verbatim on the approval page.
-    #[arg(long, default_value = "")]
-    pub reason: String,
-    /// Requested grant TTL in seconds.
-    #[arg(long, default_value_t = 300)]
-    pub ttl: u64,
-    /// How long to wait for approval before giving up, in seconds.
-    #[arg(long, default_value_t = 900)]
-    pub timeout: u64,
-    /// Idempotency key for the access request (random UUID if omitted).
-    #[arg(long)]
-    pub idempotency_key: Option<String>,
-    /// Login username on the remote host (cannot be combined with `user@host`).
-    #[arg(short = 'l', long = "login-name", value_name = "USER")]
-    pub login_name: Option<String>,
-    /// Remote SSH port (`-p`).
-    #[arg(short = 'p', long = "port", value_name = "PORT")]
-    pub port: Option<u16>,
-    /// Force pseudo-terminal allocation (`-t`; pass twice `-tt` to force even
-    /// without a local TTY).
-    #[arg(short = 't', action = clap::ArgAction::Count)]
-    pub force_tty: u8,
-    /// Disable pseudo-terminal allocation (`-T`).
-    #[arg(short = 'T', conflicts_with = "force_tty")]
-    pub disable_tty: bool,
-    /// Do not execute a remote command (`-N`, useful with `-L`).
-    #[arg(short = 'N', conflicts_with = "command")]
-    pub no_remote_command: bool,
-    /// Local port forwarding (`-L [bind_address:]port:host:hostport`, repeatable).
-    #[arg(short = 'L', value_name = "SPEC")]
-    pub local_forwards: Vec<String>,
-    /// Force IPv4 addresses only (`-4`).
-    #[arg(short = '4')]
-    pub ipv4: bool,
-    /// Force IPv6 addresses only (`-6`).
-    #[arg(short = '6', conflicts_with = "ipv4")]
-    pub ipv6: bool,
-    /// Quiet mode (`-q`).
-    #[arg(short = 'q', long)]
-    pub quiet: bool,
-    /// Verbose mode (`-v`, repeatable up to `-vvv`).
-    #[arg(short = 'v', long, action = clap::ArgAction::Count, conflicts_with = "quiet")]
-    pub verbose: u8,
-    /// SSH connection timeout in seconds (`-o ConnectTimeout=N`, 1..=270; defaults to 30).
-    #[arg(long, value_name = "SECONDS")]
-    pub connect_timeout: Option<u64>,
-    /// StrictHostKeyChecking policy: `accept-new` (default) or `yes`.
-    #[arg(long, default_value = "accept-new", value_name = "MODE")]
-    pub strict_host_key_checking: String,
-    /// Custom known_hosts file (`-o UserKnownHostsFile=PATH`). Refuses `/dev/null` and `none`.
-    #[arg(long, value_name = "PATH")]
-    pub known_hosts_file: Option<PathBuf>,
-    /// Optional remote command and arguments. Pass `--` before the command if
-    /// it includes flags starting with `-` (or pass a single quoted string).
-    #[arg(value_name = "COMMAND")]
-    pub command: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ParsedDestination {
-    inline_user: Option<String>,
-    host: String,
-}
-
-impl ParsedDestination {
-    fn ssh_target_arg(&self) -> String {
-        match &self.inline_user {
-            Some(user) => format!("{user}@{}", self.host),
-            None => self.host.clone(),
-        }
-    }
-
-    fn effective_user<'a>(&'a self, login_name: Option<&'a str>) -> Option<&'a str> {
-        self.inline_user.as_deref().or(login_name)
-    }
-
-    fn display_target(&self, login_name: Option<&str>) -> String {
-        match self.effective_user(login_name) {
-            Some(user) => {
-                if self.host.contains(':') {
-                    format!("{user}@[{}]", self.host)
-                } else {
-                    format!("{user}@{}", self.host)
-                }
-            }
-            None => {
-                if self.host.contains(':') {
-                    format!("[{}]", self.host)
-                } else {
-                    self.host.clone()
-                }
-            }
-        }
     }
 }
 
@@ -241,28 +141,15 @@ impl Drop for AgentGuard {
 }
 
 pub(crate) async fn run_ssh(cfg: &Config, http: &reqwest::Client, args: SshArgs) -> CliResult<()> {
-    let parsed = parse_destination(&args.destination).map_err(|e| fail(EXIT_CONFIG, e))?;
-    validate_options(&args, &parsed)?;
+    validate_keychute_args(&args)?;
     let bins = resolve_openssh_bins()?;
-    let effective_user = resolve_effective_user(&parsed, args.login_name.as_deref())?;
-    let effective_known_hosts = resolve_effective_known_hosts(
-        args.known_hosts_file.as_deref(),
-        &args.strict_host_key_checking,
-        std::env::var_os("HOME").as_deref(),
-    )?;
-    let structured = build_ssh_context(&parsed, &args, &effective_user)?;
+    let structured = build_ssh_context(&args)?;
 
     let user_key = args
         .idempotency_key
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let idem_key = call_bound_idempotency_key(
-        &user_key,
-        &parsed,
-        &args,
-        &effective_user,
-        effective_known_hosts.as_deref(),
-    );
+    let idem_key = call_bound_idempotency_key(&user_key, &args.secret, &args.ssh_args);
 
     let body = CreateAccessRequest {
         idempotency_key: idem_key.clone(),
@@ -323,7 +210,7 @@ pub(crate) async fn run_ssh(cfg: &Config, http: &reqwest::Client, args: SshArgs)
 
     #[cfg(unix)]
     let mut signals = UnixSignals::register()?;
-    let key_lifetime_secs = agent_key_lifetime_seconds(args.connect_timeout);
+    let key_lifetime_secs = args.ttl.max(AGENT_ORPHAN_BACKSTOP_SECONDS);
 
     let mut guard = start_ephemeral_agent(&bins, key_lifetime_secs).await?;
     let sock = guard.dir.join("s");
@@ -358,29 +245,11 @@ pub(crate) async fn run_ssh(cfg: &Config, http: &reqwest::Client, args: SshArgs)
         LoadOutcome::Finished(Ok(())) => {}
     }
 
+    let ssh_argv = build_ssh_argv(&args.ssh_args);
     #[cfg(unix)]
-    let ssh_res = run_ssh_child(
-        &bins,
-        &sock,
-        &parsed,
-        &args,
-        &effective_user,
-        effective_known_hosts.as_deref(),
-        &mut guard,
-        &mut signals,
-    )
-    .await;
+    let ssh_res = run_ssh_child(&bins, &sock, &ssh_argv, &mut guard, &mut signals).await;
     #[cfg(not(unix))]
-    let ssh_res = run_ssh_child(
-        &bins,
-        &sock,
-        &parsed,
-        &args,
-        &effective_user,
-        effective_known_hosts.as_deref(),
-        &mut guard,
-    )
-    .await;
+    let ssh_res = run_ssh_child(&bins, &sock, &ssh_argv, &mut guard).await;
     guard.shutdown().await;
     let status = ssh_res?;
     if status.success() {
@@ -389,80 +258,7 @@ pub(crate) async fn run_ssh(cfg: &Config, http: &reqwest::Client, args: SshArgs)
     Err(crate::silent_exit(exit_code_from_status(status)))
 }
 
-fn parse_destination(raw: &str) -> Result<ParsedDestination, String> {
-    if raw.is_empty() {
-        return Err("destination must not be empty".into());
-    }
-    if raw
-        .chars()
-        .any(|c| c.is_ascii_control() || c.is_whitespace() || c == '\u{7f}')
-    {
-        return Err(format!(
-            "refusing destination {raw:?}: control characters and whitespace are not allowed"
-        ));
-    }
-    if raw.starts_with("ssh://") {
-        return Err(format!(
-            "ssh:// URI {raw:?} is not supported here: pass `[user@]host` and `-p <port>` instead"
-        ));
-    }
-    if raw.starts_with('-') {
-        return Err(format!("destination {raw:?} must not begin with '-'"));
-    }
-    if raw.contains('/') || raw.contains('\\') || raw.contains('?') || raw.contains('#') {
-        return Err(format!(
-            "invalid destination {raw:?}: expected `[user@]host`"
-        ));
-    }
-
-    let (inline_user, raw_host) = match raw.split_once('@') {
-        Some((user, host)) => {
-            if user.is_empty() {
-                return Err(format!("empty username before '@' in destination {raw:?}"));
-            }
-            if host.is_empty() {
-                return Err(format!("empty host after '@' in destination {raw:?}"));
-            }
-            if host.contains('@') {
-                return Err(format!("multiple '@' characters in destination {raw:?}"));
-            }
-            if user.starts_with('-') {
-                return Err(format!("username {user:?} must not begin with '-'"));
-            }
-            if host.starts_with('-') {
-                return Err(format!("host {host:?} must not begin with '-'"));
-            }
-            (Some(user.to_string()), host)
-        }
-        None => (None, raw),
-    };
-
-    let host = if raw_host.starts_with('[') && raw_host.ends_with(']') {
-        let inner = &raw_host[1..raw_host.len() - 1];
-        if inner.parse::<Ipv6Addr>().is_err() {
-            return Err(format!(
-                "invalid bracketed IPv6 address in destination {raw:?}"
-            ));
-        }
-        inner.to_string()
-    } else if raw_host.contains('[') || raw_host.contains(']') {
-        return Err(format!("invalid brackets in destination {raw:?}"));
-    } else if raw_host.contains(':') {
-        if raw_host.parse::<Ipv6Addr>().is_ok() {
-            raw_host.to_string()
-        } else {
-            return Err(format!(
-                "destination {raw:?} appears to include ':port'; pass `[user@]host` and `-p <port>` instead"
-            ));
-        }
-    } else {
-        raw_host.to_string()
-    };
-
-    Ok(ParsedDestination { inline_user, host })
-}
-
-fn validate_options(args: &SshArgs, parsed: &ParsedDestination) -> CliResult<()> {
+fn validate_keychute_args(args: &SshArgs) -> CliResult<()> {
     if args.secret.is_empty() || args.secret.len() > MAX_SECRET_NAME_BYTES {
         return Err(fail(
             EXIT_CONFIG,
@@ -508,448 +304,7 @@ fn validate_options(args: &SshArgs, parsed: &ParsedDestination) -> CliResult<()>
             ));
         }
     }
-    if let Some(user) = &args.login_name {
-        if parsed.inline_user.is_some() {
-            return Err(fail(
-                EXIT_CONFIG,
-                "cannot combine `-l/--login-name` with `user@host` in destination",
-            ));
-        }
-        validate_simple_token("-l/--login-name", user, &['@', '/', '\\'])?;
-    }
-    if args.port == Some(0) {
-        return Err(fail(EXIT_CONFIG, "--port must be between 1 and 65535"));
-    }
-    if let Some(ct) = args.connect_timeout {
-        if ct == 0 || ct > MAX_CONNECT_TIMEOUT_SECONDS {
-            return Err(fail(
-                EXIT_CONFIG,
-                format!(
-                    "--connect-timeout must be between 1 and {MAX_CONNECT_TIMEOUT_SECONDS} seconds"
-                ),
-            ));
-        }
-    }
-    for spec in &args.local_forwards {
-        validate_local_forward_spec(spec)?;
-    }
-    match args.strict_host_key_checking.as_str() {
-        "accept-new" | "yes" => {}
-        other => {
-            return Err(fail(
-                EXIT_CONFIG,
-                format!(
-                    "refusing --strict-host-key-checking {other:?}: only \"accept-new\" or \"yes\" is allowed"
-                ),
-            ));
-        }
-    }
-    if let Some(path) = &args.known_hosts_file {
-        validate_known_hosts_path(path, &args.strict_host_key_checking)?;
-    }
     Ok(())
-}
-
-fn split_forward_parts(spec: &str) -> Result<Vec<&str>, String> {
-    let mut parts = Vec::new();
-    let mut start = 0;
-    let mut in_brackets = false;
-    for (idx, ch) in spec.char_indices() {
-        match ch {
-            '[' => {
-                if in_brackets {
-                    return Err("nested '[' in forwarding spec".into());
-                }
-                in_brackets = true;
-            }
-            ']' => {
-                if !in_brackets {
-                    return Err("unmatched ']' in forwarding spec".into());
-                }
-                in_brackets = false;
-            }
-            ':' if !in_brackets => {
-                parts.push(&spec[start..idx]);
-                start = idx + 1;
-            }
-            _ => {}
-        }
-    }
-    if in_brackets {
-        return Err("unclosed '[' in forwarding spec".into());
-    }
-    parts.push(&spec[start..]);
-    Ok(parts)
-}
-
-fn validate_port_token(raw: &str, label: &str) -> Result<(), String> {
-    let port: u16 = raw
-        .parse()
-        .map_err(|_| format!("invalid {label} port {raw:?}"))?;
-    if port == 0 {
-        return Err(format!("{label} port must be between 1 and 65535"));
-    }
-    Ok(())
-}
-
-fn validate_forward_host(raw: &str, allow_empty_or_star: bool, label: &str) -> Result<(), String> {
-    if raw.is_empty() {
-        if allow_empty_or_star {
-            return Ok(());
-        }
-        return Err(format!("missing {label} in forwarding spec"));
-    }
-    if raw == "*" {
-        if allow_empty_or_star {
-            return Ok(());
-        }
-        return Err(format!("invalid {label} \"*\" in forwarding spec"));
-    }
-    if raw.starts_with('[') || raw.ends_with(']') {
-        let inner = raw
-            .strip_prefix('[')
-            .and_then(|s| s.strip_suffix(']'))
-            .ok_or_else(|| format!("malformed brackets in {label} {raw:?}"))?;
-        if inner.parse::<Ipv6Addr>().is_err() {
-            return Err(format!("invalid IPv6 address in {label} {raw:?}"));
-        }
-        return Ok(());
-    }
-    if raw.contains(':') || raw.contains('[') || raw.contains(']') || raw.contains('/') {
-        return Err(format!("invalid {label} {raw:?} in forwarding spec"));
-    }
-    Ok(())
-}
-
-fn validate_local_forward_spec(spec: &str) -> CliResult<()> {
-    validate_simple_token("-L", spec, &[])?;
-    let parts = split_forward_parts(spec)
-        .map_err(|msg| fail(EXIT_CONFIG, format!("invalid -L spec {spec:?}: {msg}")))?;
-    let (bind_addr, listen_port, remote_host, host_port) = match parts.as_slice() {
-        [lp, rh, hp] => (None, *lp, *rh, *hp),
-        [ba, lp, rh, hp] => (Some(*ba), *lp, *rh, *hp),
-        _ => {
-            return Err(fail(
-                EXIT_CONFIG,
-                format!("invalid -L spec {spec:?}: expected [bind_address:]port:host:hostport"),
-            ));
-        }
-    };
-    if let Some(ba) = bind_addr {
-        validate_forward_host(ba, true, "bind address")
-            .map_err(|msg| fail(EXIT_CONFIG, format!("invalid -L spec {spec:?}: {msg}")))?;
-    }
-    validate_port_token(listen_port, "listen")
-        .map_err(|msg| fail(EXIT_CONFIG, format!("invalid -L spec {spec:?}: {msg}")))?;
-    validate_forward_host(remote_host, false, "target host")
-        .map_err(|msg| fail(EXIT_CONFIG, format!("invalid -L spec {spec:?}: {msg}")))?;
-    validate_port_token(host_port, "target")
-        .map_err(|msg| fail(EXIT_CONFIG, format!("invalid -L spec {spec:?}: {msg}")))?;
-    Ok(())
-}
-
-fn validate_simple_token(flag: &str, value: &str, extra_forbidden: &[char]) -> CliResult<()> {
-    if value.is_empty() {
-        return Err(fail(EXIT_CONFIG, format!("{flag} must not be empty")));
-    }
-    if value.starts_with('-') {
-        return Err(fail(
-            EXIT_CONFIG,
-            format!("{flag} value {value:?} must not begin with '-'"),
-        ));
-    }
-    if value.chars().any(|c| {
-        c.is_ascii_control() || c.is_whitespace() || c == '\u{7f}' || extra_forbidden.contains(&c)
-    }) {
-        return Err(fail(
-            EXIT_CONFIG,
-            format!("{flag} value {value:?} contains invalid characters"),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_known_hosts_syntax(path: &Path) -> CliResult<()> {
-    let raw = path
-        .to_str()
-        .ok_or_else(|| fail(EXIT_CONFIG, "--known-hosts-file must be valid UTF-8"))?;
-    if raw.is_empty() {
-        return Err(fail(EXIT_CONFIG, "--known-hosts-file must not be empty"));
-    }
-    if raw
-        .chars()
-        .any(|c| c.is_ascii_control() || c.is_whitespace() || c == '\u{7f}' || c == '"')
-    {
-        return Err(fail(
-            EXIT_CONFIG,
-            format!(
-                "--known-hosts-file {raw:?} contains whitespace, quotes, or control characters"
-            ),
-        ));
-    }
-    if raw.starts_with('~') || raw.contains('%') || raw.contains('$') {
-        return Err(fail(
-            EXIT_CONFIG,
-            format!(
-                "--known-hosts-file {raw:?} must not start with '~' or contain '%' or '$' \
-                 (OpenSSH expands tokens and environment variables in UserKnownHostsFile)"
-            ),
-        ));
-    }
-    if raw.eq_ignore_ascii_case("none") {
-        return Err(fail(
-            EXIT_CONFIG,
-            "refusing --known-hosts-file none: disabling host key persistence is not allowed",
-        ));
-    }
-    if path == Path::new("/dev/null") {
-        return Err(fail(
-            EXIT_CONFIG,
-            "refusing --known-hosts-file /dev/null: disabling host key persistence is not allowed",
-        ));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{FileTypeExt, MetadataExt};
-        if let (Ok(meta), Ok(null_meta)) = (std::fs::metadata(path), std::fs::metadata("/dev/null"))
-        {
-            if meta.file_type().is_char_device() && meta.rdev() == null_meta.rdev() {
-                return Err(fail(
-                    EXIT_CONFIG,
-                    format!(
-                        "refusing --known-hosts-file {}: resolves to /dev/null",
-                        path.display()
-                    ),
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate_known_hosts_path(path: &Path, strict_mode: &str) -> CliResult<()> {
-    validate_known_hosts_syntax(path)?;
-    let accept_new = strict_mode == "accept-new";
-    match std::fs::metadata(path) {
-        Ok(meta) => {
-            if !meta.is_file() {
-                return Err(fail(
-                    EXIT_CONFIG,
-                    format!(
-                        "refusing --known-hosts-file {}: existing path is not a regular file",
-                        path.display()
-                    ),
-                ));
-            }
-            let mut opts = std::fs::OpenOptions::new();
-            opts.read(true);
-            if accept_new {
-                opts.write(true);
-            }
-            opts.open(path).map_err(|e| {
-                let need = if accept_new {
-                    "readable and writable"
-                } else {
-                    "readable"
-                };
-                fail(
-                    EXIT_CONFIG,
-                    format!(
-                        "refusing --known-hosts-file {}: not {need} ({e})",
-                        path.display()
-                    ),
-                )
-            })?;
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            if std::fs::symlink_metadata(path).is_ok() {
-                return Err(fail(
-                    EXIT_CONFIG,
-                    format!(
-                        "refusing --known-hosts-file {}: dangling symlink",
-                        path.display()
-                    ),
-                ));
-            }
-            if !accept_new {
-                return Err(fail(
-                    EXIT_CONFIG,
-                    format!(
-                        "refusing --known-hosts-file {}: file does not exist (required with --strict-host-key-checking yes)",
-                        path.display()
-                    ),
-                ));
-            }
-            let parent = match path.parent() {
-                Some(p) if !p.as_os_str().is_empty() => p,
-                _ => Path::new("."),
-            };
-            let parent_meta = std::fs::metadata(parent).map_err(|e| {
-                fail(
-                    EXIT_CONFIG,
-                    format!(
-                        "refusing --known-hosts-file {}: cannot inspect parent directory {} ({e})",
-                        path.display(),
-                        parent.display()
-                    ),
-                )
-            })?;
-            if !parent_meta.is_dir() {
-                return Err(fail(
-                    EXIT_CONFIG,
-                    format!(
-                        "refusing --known-hosts-file {}: parent {} is not a directory",
-                        path.display(),
-                        parent.display()
-                    ),
-                ));
-            }
-            let mut probe_bytes = [0u8; 8];
-            rand::thread_rng().fill_bytes(&mut probe_bytes);
-            let probe = parent.join(format!(".keychute-kh-probe-{}", hex::encode(probe_bytes)));
-            let mut probe_opts = std::fs::OpenOptions::new();
-            probe_opts.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                probe_opts.mode(0o600);
-            }
-            let file = probe_opts.open(&probe).map_err(|e| {
-                fail(
-                    EXIT_CONFIG,
-                    format!(
-                        "refusing --known-hosts-file {}: cannot create files in {} ({e})",
-                        path.display(),
-                        parent.display()
-                    ),
-                )
-            })?;
-            drop(file);
-            let _ = std::fs::remove_file(&probe);
-        }
-        Err(err) => {
-            return Err(fail(
-                EXIT_CONFIG,
-                format!(
-                    "refusing --known-hosts-file {}: cannot inspect path ({err})",
-                    path.display()
-                ),
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn resolve_effective_known_hosts(
-    explicit: Option<&Path>,
-    strict_mode: &str,
-    home_dir: Option<&std::ffi::OsStr>,
-) -> CliResult<Option<PathBuf>> {
-    if let Some(path) = explicit {
-        validate_known_hosts_path(path, strict_mode)?;
-        return Ok(Some(path.to_path_buf()));
-    }
-
-    let non_empty_home = home_dir.filter(|h| !h.is_empty()).map(PathBuf::from);
-
-    if strict_mode == "accept-new" {
-        let home = non_empty_home.ok_or_else(|| {
-            fail(
-                EXIT_CONFIG,
-                "HOME is not set; pass --known-hosts-file so SSH host keys can be persisted",
-            )
-        })?;
-        let ssh_dir = home.join(".ssh");
-        let kh = ssh_dir.join("known_hosts");
-        validate_known_hosts_syntax(&kh)?;
-        if let Err(err) = std::fs::symlink_metadata(&ssh_dir) {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::DirBuilderExt;
-                    std::fs::DirBuilder::new()
-                        .mode(0o700)
-                        .create(&ssh_dir)
-                        .map_err(|e| {
-                            fail(
-                                EXIT_CONFIG,
-                                format!(
-                                    "cannot create {} to persist SSH host keys ({e}); \
-                                     pass a writable --known-hosts-file",
-                                    ssh_dir.display()
-                                ),
-                            )
-                        })?;
-                }
-                #[cfg(not(unix))]
-                {
-                    std::fs::create_dir(&ssh_dir).map_err(|e| {
-                        fail(
-                            EXIT_CONFIG,
-                            format!(
-                                "cannot create {} to persist SSH host keys ({e}); \
-                                 pass a writable --known-hosts-file",
-                                ssh_dir.display()
-                            ),
-                        )
-                    })?;
-                }
-            }
-        }
-        validate_known_hosts_path(&kh, "accept-new")?;
-        return Ok(Some(kh));
-    }
-
-    // StrictHostKeyChecking=yes with no explicit --known-hosts-file: require at least
-    // one standard user or global known_hosts file to exist and be readable.
-    let mut candidates = Vec::new();
-    if let Some(home) = non_empty_home {
-        candidates.push(home.join(".ssh/known_hosts"));
-        candidates.push(home.join(".ssh/known_hosts2"));
-    }
-    candidates.push(PathBuf::from("/etc/ssh/ssh_known_hosts"));
-    candidates.push(PathBuf::from("/etc/ssh/ssh_known_hosts2"));
-    let has_readable = candidates.iter().any(|c| {
-        std::fs::metadata(c).map(|m| m.is_file()).unwrap_or(false) && std::fs::File::open(c).is_ok()
-    });
-    if !has_readable {
-        return Err(fail(
-            EXIT_CONFIG,
-            "--strict-host-key-checking yes requires an existing readable known_hosts file \
-             (~/.ssh/known_hosts or /etc/ssh/ssh_known_hosts), or pass --known-hosts-file",
-        ));
-    }
-    Ok(None)
-}
-
-fn resolve_effective_user(
-    parsed: &ParsedDestination,
-    login_name: Option<&str>,
-) -> CliResult<String> {
-    if let Some(user) = parsed.effective_user(login_name) {
-        return Ok(user.to_string());
-    }
-    for bin in ["/usr/bin/id", "/bin/id", "id"] {
-        if let Ok(out) = std::process::Command::new(bin)
-            .arg("-run")
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
-        {
-            if out.status.success() {
-                let raw = String::from_utf8_lossy(&out.stdout);
-                let user = raw.trim_end_matches(&['\r', '\n'][..]);
-                if !user.is_empty() {
-                    validate_simple_token("local login user", user, &['@', '/', '\\'])?;
-                    return Ok(user.to_string());
-                }
-            }
-        }
-    }
-    Err(fail(
-        EXIT_CONFIG,
-        "could not determine local login username; pass user@host or -l <user>",
-    ))
 }
 
 fn resolve_openssh_bins() -> CliResult<OpenSshBins> {
@@ -1003,84 +358,68 @@ fn is_executable_file(path: &Path) -> bool {
     }
 }
 
-fn format_ssh_summary(parsed: &ParsedDestination, args: &SshArgs, effective_user: &str) -> String {
-    let mut parts = vec!["ssh".to_string()];
-    if let Some(port) = args.port {
-        parts.push("-p".to_string());
-        parts.push(port.to_string());
+fn format_ssh_summary(ssh_args: &[String]) -> String {
+    let mut out = String::from("ssh");
+    for arg in ssh_args {
+        out.push(' ');
+        if arg.is_empty()
+            || arg
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '\'' | '"'))
+        {
+            out.push('\'');
+            for ch in arg.chars() {
+                if ch == '\'' {
+                    out.push_str("'\"'\"'");
+                } else {
+                    out.push(ch);
+                }
+            }
+            out.push('\'');
+        } else {
+            out.push_str(arg);
+        }
     }
-    for spec in &args.local_forwards {
-        parts.push("-L".to_string());
-        parts.push(spec.clone());
+    if out.chars().count() > MAX_SUMMARY_CHARS {
+        let mut truncated: String = out.chars().take(MAX_SUMMARY_CHARS - 1).collect();
+        truncated.push('…');
+        return truncated;
     }
-    if args.no_remote_command {
-        parts.push("-N".to_string());
-    }
-    parts.push(parsed.display_target(Some(effective_user)));
-    if !args.command.is_empty() {
-        parts.push("--".to_string());
-        parts.extend(args.command.iter().cloned());
-    }
-    parts.join(" ")
+    out
 }
 
-fn build_ssh_context(
-    parsed: &ParsedDestination,
-    args: &SshArgs,
-    effective_user: &str,
-) -> CliResult<serde_json::Value> {
+fn build_ssh_context(args: &SshArgs) -> CliResult<serde_json::Value> {
     let mut structured = build_structured_context().unwrap_or(serde_json::json!({}));
-    let summary = format_ssh_summary(parsed, args, effective_user);
+    let summary = format_ssh_summary(&args.ssh_args);
 
     let mut ssh_map = serde_json::Map::new();
     ssh_map.insert("target".to_string(), serde_json::Value::String(summary));
-    ssh_map.insert(
-        "host".to_string(),
-        serde_json::Value::String(parsed.host.clone()),
-    );
-    ssh_map.insert(
-        "user".to_string(),
-        serde_json::Value::String(effective_user.to_string()),
-    );
-    ssh_map.insert(
-        "port".to_string(),
-        serde_json::json!(args.port.unwrap_or(22)),
-    );
-    if !args.command.is_empty() {
-        ssh_map.insert("command".to_string(), serde_json::json!(args.command));
-    }
-    if !args.local_forwards.is_empty() {
-        ssh_map.insert(
-            "local_forwards".to_string(),
-            serde_json::json!(args.local_forwards),
-        );
-    }
+    ssh_map.insert("argv".to_string(), serde_json::json!(args.ssh_args));
 
     if let Some(map) = structured.as_object_mut() {
         map.insert("ssh".to_string(), serde_json::Value::Object(ssh_map));
         shed_structured_to_fit(map);
         let len = serde_json::to_vec(map).map(|v| v.len()).unwrap_or(0);
         if len > MAX_STRUCTURED_BYTES {
-            return Err(fail(
-                EXIT_CONFIG,
-                format!(
-                    "the approval context is {len} bytes, over the server's {MAX_STRUCTURED_BYTES}-byte \
-                     limit, and nothing left in it can be dropped — shorten the remote command or forwards, \
-                     or move details into --reason"
-                ),
-            ));
+            if let Some(ssh_obj) = map.get_mut("ssh").and_then(|v| v.as_object_mut()) {
+                ssh_obj.remove("argv");
+            }
+            let trimmed_len = serde_json::to_vec(map).map(|v| v.len()).unwrap_or(0);
+            if trimmed_len > MAX_STRUCTURED_BYTES {
+                return Err(fail(
+                    EXIT_CONFIG,
+                    format!(
+                        "the approval context is {trimmed_len} bytes, over the server's {MAX_STRUCTURED_BYTES}-byte \
+                         limit — shorten the SSH arguments or move details into --reason"
+                    ),
+                ));
+            }
         }
     }
     Ok(structured)
 }
 
-fn call_bound_idempotency_key(
-    user_key: &str,
-    parsed: &ParsedDestination,
-    args: &SshArgs,
-    effective_user: &str,
-    effective_known_hosts: Option<&Path>,
-) -> String {
+fn call_bound_idempotency_key(user_key: &str, secret: &str, ssh_args: &[String]) -> String {
     use sha2::{Digest, Sha256};
 
     let mut hasher = Sha256::new();
@@ -1088,42 +427,13 @@ fn call_bound_idempotency_key(
         h.update((s.len() as u64).to_be_bytes());
         h.update(s.as_bytes());
     };
-    let update_opt_str = |h: &mut Sha256, opt: Option<&str>| match opt {
-        None => h.update([0u8]),
-        Some(s) => {
-            h.update([1u8]);
-            update_str(h, s);
-        }
-    };
 
     update_str(&mut hasher, "ssh");
-    update_str(&mut hasher, effective_user);
-    update_str(&mut hasher, &parsed.host);
-    hasher.update(args.port.unwrap_or(22).to_be_bytes());
-    hasher.update((args.command.len() as u64).to_be_bytes());
-    for tok in &args.command {
+    update_str(&mut hasher, secret);
+    hasher.update((ssh_args.len() as u64).to_be_bytes());
+    for tok in ssh_args {
         update_str(&mut hasher, tok);
     }
-    hasher.update([args.force_tty.min(2)]);
-    hasher.update([u8::from(args.disable_tty)]);
-    hasher.update([u8::from(args.no_remote_command)]);
-    hasher.update((args.local_forwards.len() as u64).to_be_bytes());
-    for spec in &args.local_forwards {
-        update_str(&mut hasher, spec);
-    }
-    let addr_family = match (args.ipv4, args.ipv6) {
-        (true, false) => 4u8,
-        (false, true) => 6u8,
-        _ => 0u8,
-    };
-    hasher.update([addr_family]);
-    hasher.update(
-        args.connect_timeout
-            .unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECONDS)
-            .to_be_bytes(),
-    );
-    update_str(&mut hasher, &args.strict_host_key_checking);
-    update_opt_str(&mut hasher, effective_known_hosts.and_then(|p| p.to_str()));
 
     let digest = hex::encode(hasher.finalize());
     format!("{user_key}-{}", &digest[..CALL_BINDING_HEX_CHARS])
@@ -1163,7 +473,7 @@ fn normalize_pem_bytes(raw: &[u8]) -> Zeroizing<Vec<u8>> {
     let mut out = Zeroizing::new(Vec::with_capacity(raw.len() + 1));
     let mut i = 0;
     while i < raw.len() {
-        if raw[i] == b'\r' && raw.get(i + 1) == Some(&b'\n') {
+        if i + 1 < raw.len() && raw[i] == b'\r' && raw[i + 1] == b'\n' {
             out.push(b'\n');
             i += 2;
         } else {
@@ -1250,7 +560,7 @@ async fn start_ephemeral_agent(
     #[cfg(unix)]
     {
         // Isolate ssh-agent from terminal SIGINT so interactive Ctrl-C does not
-        // tear down the agent while an SSH session is still active.
+        // tear down the agent before keychute finishes reaping ssh.
         cmd.process_group(0);
     }
 
@@ -1309,8 +619,9 @@ async fn load_key_into_agent(
         .kill_on_drop(true);
     #[cfg(unix)]
     {
-        // Detach from the foreground terminal process group as belt-and-suspenders
-        // alongside SSH_ASKPASS_REQUIRE=force so ssh-add can never block reading /dev/tty.
+        // Detach from the foreground terminal process group alongside
+        // SSH_ASKPASS_REQUIRE=force so encrypted keys fail immediately without
+        // blocking on /dev/tty.
         cmd.process_group(0);
     }
 
@@ -1362,78 +673,105 @@ async fn load_key_into_agent(
     Ok(())
 }
 
-fn build_ssh_argv(
-    parsed: &ParsedDestination,
-    args: &SshArgs,
-    effective_user: &str,
-    effective_known_hosts: Option<&Path>,
-) -> Vec<String> {
-    let mut argv = vec![
-        "-F".to_string(),
-        "none".to_string(),
-        "-o".to_string(),
-        "IdentityAgent=SSH_AUTH_SOCK".to_string(),
-        "-o".to_string(),
-        "IdentityFile=none".to_string(),
-        "-o".to_string(),
-        "IdentitiesOnly=no".to_string(),
-        "-o".to_string(),
-        "ForwardAgent=no".to_string(),
-        "-o".to_string(),
-        "BatchMode=yes".to_string(),
-        "-o".to_string(),
-        format!("StrictHostKeyChecking={}", args.strict_host_key_checking),
-    ];
+#[derive(Default)]
+struct CallerSshOverrides {
+    config_file: bool,
+    identity_file: bool,
+    identities_only: bool,
+    forward_agent: bool,
+    batch_mode: bool,
+    strict_host_key_checking: bool,
+}
 
-    if let Some(kh) = effective_known_hosts {
-        argv.push("-o".to_string());
-        argv.push(format!("UserKnownHostsFile={}", kh.display()));
+impl CallerSshOverrides {
+    fn record_o_value(&mut self, spec: &str) {
+        let key = spec
+            .split(['=', ' ', '\t'])
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        match key.as_str() {
+            "identityfile" => self.identity_file = true,
+            "identitiesonly" => self.identities_only = true,
+            "forwardagent" => self.forward_agent = true,
+            "batchmode" => self.batch_mode = true,
+            "stricthostkeychecking" => self.strict_host_key_checking = true,
+            _ => {}
+        }
     }
-    let connect_timeout = args
-        .connect_timeout
-        .unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECONDS);
-    argv.push("-o".to_string());
-    argv.push(format!("ConnectTimeout={connect_timeout}"));
-    if !args.local_forwards.is_empty() {
-        argv.push("-o".to_string());
-        argv.push("ExitOnForwardFailure=yes".to_string());
+}
+
+/// Scan leading OpenSSH option arguments before the destination token so our
+/// safer defaults never silently clobber an option the caller explicitly passed.
+fn scan_caller_overrides(ssh_args: &[String]) -> CallerSshOverrides {
+    let mut out = CallerSshOverrides::default();
+    let mut i = 0;
+    while i < ssh_args.len() {
+        let arg = &ssh_args[i];
+        if arg == "--" || !arg.starts_with('-') || arg == "-" {
+            break;
+        }
+        let bytes = arg.as_bytes();
+        let mut j = 1;
+        while j < bytes.len() {
+            let opt = bytes[j];
+            if SSH_ARG_OPTIONS.contains(&opt) {
+                let inline_val = (j + 1 < bytes.len()).then(|| &arg[j + 1..]);
+                let val = inline_val.or_else(|| {
+                    i += 1;
+                    ssh_args.get(i).map(String::as_str)
+                });
+                match opt {
+                    b'F' => out.config_file = true,
+                    b'i' => out.identity_file = true,
+                    b'o' => {
+                        if let Some(v) = val {
+                            out.record_o_value(v);
+                        }
+                    }
+                    _ => {}
+                }
+                break;
+            }
+            if opt == b'A' {
+                out.forward_agent = true;
+            }
+            j += 1;
+        }
+        i += 1;
     }
-    if args.ipv4 {
-        argv.push("-4".to_string());
-    } else if args.ipv6 {
-        argv.push("-6".to_string());
+    out
+}
+
+fn build_ssh_argv(ssh_args: &[String]) -> Vec<String> {
+    let seen = scan_caller_overrides(ssh_args);
+    let mut argv = Vec::with_capacity(ssh_args.len() + 14);
+    let push_opt = |v: &mut Vec<String>, opt: &str| {
+        v.push("-o".to_string());
+        v.push(opt.to_string());
+    };
+
+    if !seen.config_file {
+        argv.push("-F".to_string());
+        argv.push("none".to_string());
     }
-    if let Some(port) = args.port {
-        argv.push("-p".to_string());
-        argv.push(port.to_string());
+    push_opt(&mut argv, "IdentityAgent=SSH_AUTH_SOCK");
+    if !seen.identity_file {
+        push_opt(&mut argv, "IdentityFile=none");
+        if !seen.identities_only {
+            push_opt(&mut argv, "IdentitiesOnly=no");
+        }
     }
-    if parsed.inline_user.is_none() {
-        argv.push("-l".to_string());
-        argv.push(effective_user.to_string());
+    if !seen.forward_agent {
+        push_opt(&mut argv, "ForwardAgent=no");
     }
-    match args.force_tty {
-        0 => {}
-        1 => argv.push("-t".to_string()),
-        _ => argv.push("-tt".to_string()),
+    if !seen.batch_mode {
+        push_opt(&mut argv, "BatchMode=yes");
     }
-    if args.disable_tty {
-        argv.push("-T".to_string());
+    if !seen.strict_host_key_checking {
+        push_opt(&mut argv, "StrictHostKeyChecking=accept-new");
     }
-    if args.no_remote_command {
-        argv.push("-N".to_string());
-    }
-    if args.quiet {
-        argv.push("-q".to_string());
-    } else if args.verbose > 0 {
-        argv.push(format!("-{}", "v".repeat(args.verbose.min(3) as usize)));
-    }
-    for spec in &args.local_forwards {
-        argv.push("-L".to_string());
-        argv.push(spec.clone());
-    }
-    argv.push("--".to_string());
-    argv.push(parsed.ssh_target_arg());
-    argv.extend(args.command.iter().cloned());
+    argv.extend(ssh_args.iter().cloned());
     argv
 }
 
@@ -1467,20 +805,12 @@ fn forward_sigint_to_child(child: &mut tokio::process::Child) {
 async fn run_ssh_child(
     bins: &OpenSshBins,
     sock: &Path,
-    parsed: &ParsedDestination,
-    args: &SshArgs,
-    effective_user: &str,
-    effective_known_hosts: Option<&Path>,
+    argv: &[String],
     guard: &mut AgentGuard,
     #[cfg(unix)] signals: &mut UnixSignals,
 ) -> CliResult<ExitStatus> {
     let mut cmd = tokio::process::Command::new(&bins.ssh);
-    cmd.env("SSH_AUTH_SOCK", sock).args(build_ssh_argv(
-        parsed,
-        args,
-        effective_user,
-        effective_known_hosts,
-    ));
+    cmd.env("SSH_AUTH_SOCK", sock).args(argv);
 
     #[cfg(unix)]
     {
@@ -1498,8 +828,6 @@ async fn run_ssh_child(
                     return res.map_err(|e| fail(EXIT_OTHER, format!("failed waiting for ssh: {e}")));
                 }
                 _ = signals.sigint.recv() => {
-                    // Forward PID-targeted SIGINT too (e.g. `kill -INT <keychute_pid>`);
-                    // on terminal Ctrl-C, ssh also receives SIGINT from the TTY.
                     forward_sigint_to_child(&mut child);
                 }
                 _ = signals.sigterm.recv() => {
@@ -1565,305 +893,73 @@ mod tests {
     }
 
     #[test]
-    fn destination_parsing_accepts_valid_forms_and_rejects_ambiguous_ones() {
+    fn cli_accepts_destination_first_and_flags_after_separator() {
+        let a1 = parse_ssh(&[
+            "ansibleadm@grotten",
+            "--secret",
+            "node-ssh-key",
+            "--reason",
+            "check k3s",
+            "--",
+            "sudo",
+            "systemctl",
+            "status",
+            "k3s",
+        ]);
+        assert_eq!(a1.secret, "node-ssh-key");
+        assert_eq!(a1.reason, "check k3s");
         assert_eq!(
-            parse_destination("grotten").unwrap(),
-            ParsedDestination {
-                inline_user: None,
-                host: "grotten".into(),
-            }
-        );
-        assert_eq!(
-            parse_destination("ansibleadm@aachen.cloud.andrewgarrett.dev").unwrap(),
-            ParsedDestination {
-                inline_user: Some("ansibleadm".into()),
-                host: "aachen.cloud.andrewgarrett.dev".into(),
-            }
-        );
-        assert_eq!(
-            parse_destination("ubnt@[::1]").unwrap(),
-            ParsedDestination {
-                inline_user: Some("ubnt".into()),
-                host: "::1".into(),
-            }
-        );
-        assert_eq!(
-            parse_destination("::1").unwrap(),
-            ParsedDestination {
-                inline_user: None,
-                host: "::1".into(),
-            }
+            a1.ssh_args,
+            vec!["ansibleadm@grotten", "sudo", "systemctl", "status", "k3s"]
         );
 
-        for bad in [
-            "",
-            "-oProxyCommand=id",
-            "-grotten",
-            "ssh://ubnt@192.168.124.1",
-            "host:2222",
-            "[::1]:2222",
-            "user@host:2222",
-            "@host",
-            "user@",
-            "a@b@c",
-            "user@-host",
-            "-user@host",
-            "host name",
-            "host\n",
-            "host/path",
-            "host?x=1",
-            "host#frag",
-            "[not-ipv6]",
-            "[::1",
-        ] {
-            assert!(
-                parse_destination(bad).is_err(),
-                "expected {bad:?} to be rejected"
-            );
-        }
+        let a2 = parse_ssh(&[
+            "--secret",
+            "node-ssh-key",
+            "--",
+            "-p",
+            "2222",
+            "-L",
+            "8080:127.0.0.1:80",
+            "-N",
+            "ansibleadm@grotten",
+        ]);
+        assert_eq!(
+            a2.ssh_args,
+            vec![
+                "-p",
+                "2222",
+                "-L",
+                "8080:127.0.0.1:80",
+                "-N",
+                "ansibleadm@grotten"
+            ]
+        );
     }
 
     #[test]
-    fn option_validation_enforces_security_and_server_bounds() {
-        let base = parse_ssh(&["ansibleadm@grotten", "--secret", "node-ssh-key"]);
-        let parsed = parse_destination(&base.destination).unwrap();
-        assert!(validate_options(&base, &parsed).is_ok());
+    fn keychute_arg_validation_enforces_bounds() {
+        let valid = parse_ssh(&["grotten", "--secret", "node-ssh-key"]);
+        assert!(validate_keychute_args(&valid).is_ok());
 
-        // Refuses StrictHostKeyChecking=no / off.
-        for bad_mode in ["no", "off", "ask", ""] {
-            let a = parse_ssh(&[
-                "grotten",
-                "--secret",
-                "k",
-                "--strict-host-key-checking",
-                bad_mode,
-            ]);
-            let p = parse_destination(&a.destination).unwrap();
-            assert_eq!(validate_options(&a, &p).unwrap_err().code, EXIT_CONFIG);
-        }
-        let yes = parse_ssh(&[
-            "grotten",
-            "--secret",
-            "k",
-            "--strict-host-key-checking",
-            "yes",
-        ]);
-        assert!(validate_options(&yes, &parse_destination(&yes.destination).unwrap()).is_ok());
-
-        // Refuses /dev/null, `none`, token/tilde expansions, directories, missing parents, and unusable known_hosts files.
-        for bad_kh in [
-            "/dev/null",
-            "none",
-            "NONE",
-            "~/kh",
-            "/tmp/a%db",
-            "/tmp/${FOO}",
-            "/tmp",
-            "/nonexistent-keychute-dir/kh",
-        ] {
-            let parsed_cmd = parse_ssh(&["grotten", "--secret", "k", "--known-hosts-file", bad_kh]);
-            assert_eq!(
-                validate_options(
-                    &parsed_cmd,
-                    &parse_destination(&parsed_cmd.destination).unwrap()
-                )
-                .unwrap_err()
-                .code,
-                EXIT_CONFIG,
-                "expected {bad_kh:?} to be rejected"
-            );
-        }
-
-        let kh_dir = std::env::temp_dir().join(format!("kc-kh-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&kh_dir).unwrap();
-        let new_kh = kh_dir.join("new_kh");
-        let new_kh_str = new_kh.to_str().unwrap().to_string();
-        let ok_accept_new = parse_ssh(&[
-            "grotten",
-            "--secret",
-            "k",
-            "--known-hosts-file",
-            &new_kh_str,
-        ]);
-        assert!(validate_options(
-            &ok_accept_new,
-            &parse_destination(&ok_accept_new.destination).unwrap()
-        )
-        .is_ok());
-        // Strict `yes` requires the explicit known_hosts file to already exist.
-        let missing_yes = parse_ssh(&[
-            "grotten",
-            "--secret",
-            "k",
-            "--strict-host-key-checking",
-            "yes",
-            "--known-hosts-file",
-            &new_kh_str,
-        ]);
+        let empty_secret = parse_ssh(&["grotten", "--secret", ""]);
         assert_eq!(
-            validate_options(
-                &missing_yes,
-                &parse_destination(&missing_yes.destination).unwrap()
-            )
-            .unwrap_err()
-            .code,
-            EXIT_CONFIG
-        );
-        // Existing read-only known_hosts file is accepted for `yes`, rejected for `accept-new` (for non-root).
-        let ro_kh = kh_dir.join("ro_kh");
-        std::fs::write(&ro_kh, "").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&ro_kh, std::fs::Permissions::from_mode(0o444)).unwrap();
-            let ro_str = ro_kh.to_str().unwrap().to_string();
-            let ro_yes = parse_ssh(&[
-                "grotten",
-                "--secret",
-                "k",
-                "--strict-host-key-checking",
-                "yes",
-                "--known-hosts-file",
-                &ro_str,
-            ]);
-            assert!(
-                validate_options(&ro_yes, &parse_destination(&ro_yes.destination).unwrap()).is_ok()
-            );
-            // If the current process is not UID 0, opening a 0o444 file for write fails.
-            let ro_write_blocked = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&ro_kh)
-                .is_err();
-            if ro_write_blocked {
-                let ro_accept_new =
-                    parse_ssh(&["grotten", "--secret", "k", "--known-hosts-file", &ro_str]);
-                assert_eq!(
-                    validate_options(
-                        &ro_accept_new,
-                        &parse_destination(&ro_accept_new.destination).unwrap()
-                    )
-                    .unwrap_err()
-                    .code,
-                    EXIT_CONFIG
-                );
-            }
-            let dangling = kh_dir.join("dangling_kh");
-            std::os::unix::fs::symlink(kh_dir.join("missing_target"), &dangling).unwrap();
-            let dangling_cmd = parse_ssh(&[
-                "grotten",
-                "--secret",
-                "k",
-                "--known-hosts-file",
-                dangling.to_str().unwrap(),
-            ]);
-            assert_eq!(
-                validate_options(
-                    &dangling_cmd,
-                    &parse_destination(&dangling_cmd.destination).unwrap()
-                )
-                .unwrap_err()
-                .code,
-                EXIT_CONFIG
-            );
-        }
-        let _ = std::fs::remove_dir_all(&kh_dir);
-
-        // Validates -L [bind_address:]port:host:hostport syntax during preflight.
-        for ok_fwd in [
-            "8080:127.0.0.1:80",
-            "127.0.0.1:8080:127.0.0.1:80",
-            "*:8080:localhost:80",
-            "[::1]:8080:[::1]:80",
-            ":8080:localhost:80",
-        ] {
-            let cmd = parse_ssh(&["grotten", "--secret", "k", "-L", ok_fwd]);
-            assert!(
-                validate_options(&cmd, &parse_destination(&cmd.destination).unwrap()).is_ok(),
-                "expected -L {ok_fwd:?} to be accepted"
-            );
-        }
-        for bad_fwd in [
-            "nonsense",
-            "8080:localhost",
-            "a:b:c:d",
-            "0:localhost:80",
-            "65536:localhost:80",
-            "8080:localhost:0",
-            "8080::80",
-            "[bad]:8080:localhost:80",
-            "8080:[not-v6]:80",
-            "a:b:c:d:e",
-        ] {
-            let cmd = parse_ssh(&["grotten", "--secret", "k", "-L", bad_fwd]);
-            assert_eq!(
-                validate_options(&cmd, &parse_destination(&cmd.destination).unwrap())
-                    .unwrap_err()
-                    .code,
-                EXIT_CONFIG,
-                "expected -L {bad_fwd:?} to be rejected"
-            );
-        }
-        // Refuses whitespace/quotes in known_hosts_file.
-        let bad_kh = parse_ssh(&[
-            "grotten",
-            "--secret",
-            "k",
-            "--known-hosts-file",
-            "/tmp/my known_hosts",
-        ]);
-        assert_eq!(
-            validate_options(&bad_kh, &parse_destination(&bad_kh.destination).unwrap())
-                .unwrap_err()
-                .code,
+            validate_keychute_args(&empty_secret).unwrap_err().code,
             EXIT_CONFIG
         );
 
-        // Refuses combining -l with user@host.
-        let both_users = parse_ssh(&["ansibleadm@grotten", "-l", "root", "--secret", "k"]);
+        let zero_ttl = parse_ssh(&["grotten", "--secret", "k", "--ttl", "0"]);
         assert_eq!(
-            validate_options(
-                &both_users,
-                &parse_destination(&both_users.destination).unwrap()
-            )
-            .unwrap_err()
-            .code,
+            validate_keychute_args(&zero_ttl).unwrap_err().code,
             EXIT_CONFIG
         );
 
-        // Refuses port 0 and out-of-range connect_timeout.
-        let port0 = parse_ssh(&["grotten", "-p", "0", "--secret", "k"]);
-        assert_eq!(
-            validate_options(&port0, &parse_destination(&port0.destination).unwrap())
-                .unwrap_err()
-                .code,
-            EXIT_CONFIG
-        );
-        for bad_ct in ["0", "271"] {
-            let ct = parse_ssh(&["grotten", "--connect-timeout", bad_ct, "--secret", "k"]);
-            assert_eq!(
-                validate_options(&ct, &parse_destination(&ct.destination).unwrap())
-                    .unwrap_err()
-                    .code,
-                EXIT_CONFIG,
-                "expected --connect-timeout {bad_ct} to be rejected"
-            );
-        }
-        let max_ct = parse_ssh(&["grotten", "--connect-timeout", "270", "--secret", "k"]);
-        assert!(
-            validate_options(&max_ct, &parse_destination(&max_ct.destination).unwrap()).is_ok()
-        );
-
-        // Refuses empty/oversize idempotency key.
         let empty_key = parse_ssh(&["grotten", "--secret", "k", "--idempotency-key", ""]);
         assert_eq!(
-            validate_options(
-                &empty_key,
-                &parse_destination(&empty_key.destination).unwrap()
-            )
-            .unwrap_err()
-            .code,
+            validate_keychute_args(&empty_key).unwrap_err().code,
             EXIT_CONFIG
         );
+
         let long_key = parse_ssh(&[
             "grotten",
             "--secret",
@@ -1872,61 +968,23 @@ mod tests {
             &"x".repeat(MAX_SSH_USER_KEY_BYTES + 1),
         ]);
         assert_eq!(
-            validate_options(
-                &long_key,
-                &parse_destination(&long_key.destination).unwrap()
-            )
-            .unwrap_err()
-            .code,
+            validate_keychute_args(&long_key).unwrap_err().code,
             EXIT_CONFIG
         );
     }
 
     #[test]
-    fn clap_conflicts_and_unknown_flags_reject() {
-        assert!(
-            Cli::try_parse_from(["keychute", "ssh", "host", "--secret", "k", "-t", "-T"]).is_err()
-        );
-        assert!(
-            Cli::try_parse_from(["keychute", "ssh", "host", "--secret", "k", "-4", "-6"]).is_err()
-        );
-        assert!(
-            Cli::try_parse_from(["keychute", "ssh", "host", "--secret", "k", "-q", "-v"]).is_err()
-        );
-        assert!(
-            Cli::try_parse_from(["keychute", "ssh", "host", "--secret", "k", "-N", "uname"])
-                .is_err()
-        );
-        assert!(Cli::try_parse_from(["keychute", "ssh", "host", "--secret", "k", "-A"]).is_err());
-    }
-
-    #[test]
-    fn ssh_argv_forces_isolated_agent_and_safe_defaults() {
-        let args = parse_ssh(&[
+    fn ssh_argv_applies_safe_defaults_and_honours_caller_overrides() {
+        let default_args = parse_ssh(&[
             "ansibleadm@grotten",
             "--secret",
             "node-ssh-key",
-            "-p",
-            "2222",
-            "-4",
-            "-tt",
-            "-vv",
-            "-L",
-            "8080:127.0.0.1:80",
-            "--connect-timeout",
-            "10",
-            "--known-hosts-file",
-            "/tmp/kh",
             "--",
-            "sudo",
-            "systemctl",
-            "status",
-            "k3s",
+            "ls",
+            "-F",
         ]);
-        let parsed = parse_destination(&args.destination).unwrap();
-        let argv = build_ssh_argv(&parsed, &args, "ansibleadm", Some(Path::new("/tmp/kh")));
         assert_eq!(
-            argv,
+            build_ssh_argv(&default_args.ssh_args),
             vec![
                 "-F",
                 "none",
@@ -1942,88 +1000,52 @@ mod tests {
                 "BatchMode=yes",
                 "-o",
                 "StrictHostKeyChecking=accept-new",
-                "-o",
-                "UserKnownHostsFile=/tmp/kh",
-                "-o",
-                "ConnectTimeout=10",
-                "-o",
-                "ExitOnForwardFailure=yes",
-                "-4",
-                "-p",
-                "2222",
-                "-tt",
-                "-vv",
-                "-L",
-                "8080:127.0.0.1:80",
-                "--",
                 "ansibleadm@grotten",
-                "sudo",
-                "systemctl",
-                "status",
-                "k3s",
+                "ls",
+                "-F",
             ]
         );
 
-        let default_args = parse_ssh(&["grotten", "--secret", "k"]);
-        let default_parsed = parse_destination(&default_args.destination).unwrap();
-        let default_kh = Path::new("/home/tester/.ssh/known_hosts");
-        let default_argv =
-            build_ssh_argv(&default_parsed, &default_args, "tester", Some(default_kh));
-        assert!(default_argv.contains(&"ConnectTimeout=30".to_string()));
-        assert!(
-            default_argv.contains(&"UserKnownHostsFile=/home/tester/.ssh/known_hosts".to_string())
-        );
-        assert!(default_argv.windows(2).any(|w| w == ["-l", "tester"]));
-        assert!(!default_argv
-            .iter()
-            .any(|arg| arg.starts_with("ExitOnForwardFailure")));
-    }
-
-    #[test]
-    fn default_known_hosts_resolution_provisions_or_rejects_unwritable_home() {
-        let dir = std::env::temp_dir().join(format!("kc-home-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let kh = resolve_effective_known_hosts(None, "accept-new", Some(dir.as_os_str()))
-            .unwrap()
-            .expect("accept-new resolves default known_hosts path");
-        assert_eq!(kh, dir.join(".ssh/known_hosts"));
-        assert!(dir.join(".ssh").is_dir());
-
-        assert_eq!(
-            resolve_effective_known_hosts(None, "accept-new", None)
-                .unwrap_err()
-                .code,
-            EXIT_CONFIG
-        );
-        assert_eq!(
-            resolve_effective_known_hosts(None, "accept-new", Some(std::ffi::OsStr::new("")))
-                .unwrap_err()
-                .code,
-            EXIT_CONFIG
-        );
-
-        let not_a_dir = dir.join("regular-file");
-        std::fs::write(&not_a_dir, "x").unwrap();
-        assert_eq!(
-            resolve_effective_known_hosts(None, "accept-new", Some(not_a_dir.as_os_str()))
-                .unwrap_err()
-                .code,
-            EXIT_CONFIG
-        );
-
-        assert_eq!(
-            resolve_effective_known_hosts(
-                None,
-                "accept-new",
-                Some(std::ffi::OsStr::new("/tmp/with space"))
-            )
-            .unwrap_err()
-            .code,
-            EXIT_CONFIG
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
+        let override_args = parse_ssh(&[
+            "--secret",
+            "k",
+            "--",
+            "-F",
+            "/tmp/custom_cfg",
+            "-o",
+            "StrictHostKeyChecking=yes",
+            "-o",
+            "BatchMode no",
+            "-o",
+            "ForwardAgent=yes",
+            "-i",
+            "/tmp/extra_key",
+            "-p",
+            "2222",
+            "grotten",
+        ]);
+        let argv = build_ssh_argv(&override_args.ssh_args);
+        assert!(!argv.windows(2).any(|w| w == ["-F", "none"]));
+        assert!(argv.contains(&"IdentityAgent=SSH_AUTH_SOCK".to_string()));
+        assert!(!argv.contains(&"StrictHostKeyChecking=accept-new".to_string()));
+        assert!(!argv.contains(&"BatchMode=yes".to_string()));
+        assert!(!argv.contains(&"ForwardAgent=no".to_string()));
+        assert!(!argv.contains(&"IdentityFile=none".to_string()));
+        assert!(argv.ends_with(&[
+            "-F".to_string(),
+            "/tmp/custom_cfg".to_string(),
+            "-o".to_string(),
+            "StrictHostKeyChecking=yes".to_string(),
+            "-o".to_string(),
+            "BatchMode no".to_string(),
+            "-o".to_string(),
+            "ForwardAgent=yes".to_string(),
+            "-i".to_string(),
+            "/tmp/extra_key".to_string(),
+            "-p".to_string(),
+            "2222".to_string(),
+            "grotten".to_string(),
+        ]));
     }
 
     #[test]
@@ -2037,40 +1059,34 @@ mod tests {
     }
 
     #[test]
-    fn idempotency_key_binds_session_parameters() {
-        let a1 = parse_ssh(&["ansibleadm@grotten", "--secret", "k", "--", "uptime"]);
-        let a2 = parse_ssh(&["ansibleadm@grotten", "--secret", "k", "--", "id"]);
-        let a3 = parse_ssh(&["ansibleadm@take5", "--secret", "k", "--", "uptime"]);
-        let a4 = parse_ssh(&[
-            "ansibleadm@grotten",
-            "--secret",
-            "k",
-            "-p",
-            "2222",
-            "--",
-            "uptime",
-        ]);
-        let a5 = parse_ssh(&["grotten", "--secret", "k", "--", "uptime"]);
-        let p1 = parse_destination(&a1.destination).unwrap();
-        let p2 = parse_destination(&a2.destination).unwrap();
-        let p3 = parse_destination(&a3.destination).unwrap();
-        let p4 = parse_destination(&a4.destination).unwrap();
-        let p5 = parse_destination(&a5.destination).unwrap();
-
-        let kh = Some(Path::new("/home/ansibleadm/.ssh/known_hosts"));
-        let k1 = call_bound_idempotency_key("same", &p1, &a1, "ansibleadm", kh);
-        let k1_again = call_bound_idempotency_key("same", &p1, &a1, "ansibleadm", kh);
-        let k2 = call_bound_idempotency_key("same", &p2, &a2, "ansibleadm", kh);
-        let k3 = call_bound_idempotency_key("same", &p3, &a3, "ansibleadm", kh);
-        let k4 = call_bound_idempotency_key("same", &p4, &a4, "ansibleadm", kh);
-        let k5_alice = call_bound_idempotency_key("same", &p5, &a5, "alice", kh);
-        let k5_bob = call_bound_idempotency_key("same", &p5, &a5, "bob", kh);
+    fn idempotency_key_binds_secret_and_ssh_args() {
+        let a1 = &["ansibleadm@grotten", "uptime"].map(str::to_string);
+        let a2 = &["ansibleadm@grotten", "id"].map(str::to_string);
+        let k1 = call_bound_idempotency_key("same", "node-ssh-key", a1);
+        let k1_again = call_bound_idempotency_key("same", "node-ssh-key", a1);
+        let k2 = call_bound_idempotency_key("same", "node-ssh-key", a2);
+        let k3 = call_bound_idempotency_key("same", "other-key", a1);
         assert_eq!(k1, k1_again);
         assert_ne!(k1, k2);
         assert_ne!(k1, k3);
-        assert_ne!(k1, k4);
-        assert_ne!(k5_alice, k5_bob);
         assert!(k1.len() <= 124);
+    }
+
+    #[test]
+    fn summary_formats_and_truncates_cleanly() {
+        assert_eq!(
+            format_ssh_summary(&[
+                "ansibleadm@grotten".into(),
+                "sh".into(),
+                "-c".into(),
+                "echo hi".into(),
+            ]),
+            "ssh ansibleadm@grotten sh -c 'echo hi'"
+        );
+        let huge = vec!["ansibleadm@grotten".into(), "x".repeat(2000)];
+        let truncated = format_ssh_summary(&huge);
+        assert_eq!(truncated.chars().count(), MAX_SUMMARY_CHARS);
+        assert!(truncated.ends_with('…'));
     }
 
     #[test]
@@ -2103,13 +1119,5 @@ mod tests {
             Err(m) => m,
         };
         assert!(msg.contains("not found on PATH"), "{msg}");
-    }
-
-    #[test]
-    fn agent_key_lifetime_bounds_track_connect_timeout() {
-        assert_eq!(agent_key_lifetime_seconds(None), 60);
-        assert_eq!(agent_key_lifetime_seconds(Some(5)), 60);
-        assert_eq!(agent_key_lifetime_seconds(Some(90)), 120);
-        assert_eq!(agent_key_lifetime_seconds(Some(270)), 300);
     }
 }

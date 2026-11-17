@@ -182,19 +182,20 @@ both exist so credentials never have to transit an LLM chat to get into the stor
 1. Instead of staging an SSH private key into a temp file and running `ssh -i`
    by hand, the agent runs
    `keychute ssh ansibleadm@grotten --secret node-ssh-key --reason "check k3s logs" -- sudo journalctl -u k3s`.
-2. The CLI performs preflight validation (destination syntax, allowed host-key
-   policy, local OpenSSH binaries), attaches the claimed SSH target and command
-   under `context.structured.ssh`, and requests a single-use `cli-read` grant.
+2. The CLI validates Keychute flags and local OpenSSH binaries (`ssh`,
+   `ssh-agent`, `ssh-add`), attaches the claimed `ssh` invocation under
+   `context.structured.ssh`, and requests a single-use `cli-read` grant.
 3. The approval page renders the tier-2 warning alongside the claimed SSH
    session summary (explicitly marked as client-asserted, not a server-enforced
    constraint — tier 2 releases the key bytes once to the client container).
 4. On approval, the CLI reads the private key into memory, normalizes line
    endings, spawns an isolated ephemeral `ssh-agent` on a `0700` socket
-   directory, feeds the key into `ssh-add -q -t <lifetime> -` over stdin while wiping its own
-   memory buffers, runs `ssh` against that agent with `-F none`,
-   `IdentityFile=none`, `ForwardAgent=no`, and `BatchMode=yes`, then tears down
-   the agent and socket directory and propagates `ssh`'s exit code. The key
-   bytes never touch stdout or disk.
+   directory, feeds the key into `ssh-add -q -t <lifetime> -` over stdin while
+   wiping its own memory buffers, runs `ssh` against that agent with safe
+   defaults (`-F none`, `IdentityFile=none`, `ForwardAgent=no`, `BatchMode=yes`,
+   `StrictHostKeyChecking=accept-new`, overridable via passed SSH flags) and
+   the caller's `SSH_ARGS`, then tears down the agent and socket directory and
+   propagates `ssh`'s exit code. The key bytes never touch stdout or disk.
 
 ### CUJ 3 — Secure agentic autofill for family-assistant (tier 1)
 

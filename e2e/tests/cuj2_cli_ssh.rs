@@ -110,7 +110,7 @@ async fn cli_ssh_shows_claimed_session_and_loads_key_into_ephemeral_agent() {
         .unwrap();
     assert!(page.contains("SSH session claimed by the client"), "{page}");
     assert!(
-        page.contains("ssh ansibleadm@grotten -- sudo journalctl -u k3s"),
+        page.contains("ssh ansibleadm@grotten sudo journalctl -u k3s"),
         "{page}"
     );
     assert!(page.contains("ephemeral local ssh-agent"), "{page}");

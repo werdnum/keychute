@@ -305,14 +305,12 @@ async fn standard_ed25519_key_loads_into_ephemeral_agent_and_cleans_up() {
     assert_eq!(bodies[0]["constraints"]["max_uses"], 1);
     assert_eq!(
         bodies[0]["context"]["structured"]["ssh"]["target"],
-        "ssh ansibleadm@grotten -- sudo systemctl status k3s"
+        "ssh ansibleadm@grotten sudo systemctl status k3s"
     );
-    assert_eq!(bodies[0]["context"]["structured"]["ssh"]["host"], "grotten");
     assert_eq!(
-        bodies[0]["context"]["structured"]["ssh"]["user"],
-        "ansibleadm"
+        bodies[0]["context"]["structured"]["ssh"]["argv"],
+        serde_json::json!(["ansibleadm@grotten", "sudo", "systemctl", "status", "k3s"])
     );
-    assert_eq!(bodies[0]["context"]["structured"]["ssh"]["port"], 22);
 
     // Real ssh-agent held the exact generated public key.
     let agent_keys = std::fs::read_to_string(capture.join("agent_keys")).unwrap();
@@ -324,10 +322,6 @@ async fn standard_ed25519_key_loads_into_ephemeral_agent_and_cleans_up() {
         .lines()
         .map(ToOwned::to_owned)
         .collect();
-    let expected_kh = format!(
-        "UserKnownHostsFile={}",
-        dir.path().join("home/.ssh/known_hosts").display()
-    );
     assert_eq!(
         argv,
         vec![
@@ -345,11 +339,6 @@ async fn standard_ed25519_key_loads_into_ephemeral_agent_and_cleans_up() {
             "BatchMode=yes",
             "-o",
             "StrictHostKeyChecking=accept-new",
-            "-o",
-            &expected_kh,
-            "-o",
-            "ConnectTimeout=30",
-            "--",
             "ansibleadm@grotten",
             "sudo",
             "systemctl",
@@ -569,40 +558,9 @@ async fn preflight_errors_exit_2_with_zero_server_requests() {
     .await;
 
     for bad_args in [
-        vec![
-            "ssh",
-            "grotten",
-            "--secret",
-            "k",
-            "--strict-host-key-checking",
-            "no",
-        ],
-        vec![
-            "ssh",
-            "grotten",
-            "--secret",
-            "k",
-            "--known-hosts-file",
-            "/dev/null",
-        ],
-        vec![
-            "ssh",
-            "grotten",
-            "--secret",
-            "k",
-            "--known-hosts-file",
-            "none",
-        ],
-        vec![
-            "ssh",
-            "grotten",
-            "--secret",
-            "k",
-            "--known-hosts-file",
-            "/nonexistent-keychute-dir/kh",
-        ],
-        vec!["ssh", "grotten", "--secret", "k", "-L", "nonsense"],
-        vec!["ssh", "u@grotten", "-l", "other", "--secret", "k"],
+        vec!["ssh", "grotten", "--secret", ""],
+        vec!["ssh", "grotten", "--secret", "k", "--ttl", "0"],
+        vec!["ssh", "grotten", "--secret", "k", "--idempotency-key", ""],
     ] {
         let u = url.clone();
         let p = path_env.clone();
@@ -617,28 +575,6 @@ async fn preflight_errors_exit_2_with_zero_server_requests() {
         .unwrap();
         assert_eq!(out.status.code(), Some(2));
     }
-
-    // Unwritable/invalid HOME with omitted --known-hosts-file fails locally before contacting Keychute.
-    let bad_home = dir.path().join("home-file");
-    std::fs::write(&bad_home, "x").unwrap();
-    let u2 = url.clone();
-    let p2 = path_env.clone();
-    let c2 = capture.clone();
-    let t2 = sock_tmp.clone();
-    let bad_home_str = bad_home.display().to_string();
-    let out_home = tokio::task::spawn_blocking(move || {
-        run_ssh_cli(
-            &u2,
-            &p2,
-            &c2,
-            &t2,
-            &[("HOME", &bad_home_str)],
-            &["ssh", "grotten", "--secret", "k"],
-        )
-    })
-    .await
-    .unwrap();
-    assert_eq!(out_home.status.code(), Some(2));
 
     // Missing OpenSSH binaries on PATH also fails locally before contacting Keychute.
     let empty_bin = dir.path().join("empty-bin");
@@ -665,14 +601,14 @@ async fn preflight_errors_exit_2_with_zero_server_requests() {
 }
 
 #[tokio::test]
-async fn implicit_user_is_resolved_and_bound_in_context_and_argv() {
-    let dir = TempDir::new("kc-ssh-impuser");
+async fn ssh_flags_pass_through_and_override_defaults() {
+    let dir = TempDir::new("kc-ssh-passthrough");
     let (priv_bytes, _) = generate_ed25519_keypair(dir.path());
     let (_bin, capture, path_env) = install_fake_ssh(dir.path());
     let sock_tmp = dir.path().join("tmp");
     std::fs::create_dir_all(&sock_tmp).unwrap();
 
-    let (url, state) = start_mock(MockConfig {
+    let (url, _state) = start_mock(MockConfig {
         secret_payload: priv_bytes,
         deny: false,
         granted_secret_name: None,
@@ -688,7 +624,19 @@ async fn implicit_user_is_resolved_and_bound_in_context_and_argv() {
             &capture_clone,
             &sock_tmp,
             &[],
-            &["ssh", "grotten", "--secret", "node-ssh-key"],
+            &[
+                "ssh",
+                "--secret",
+                "node-ssh-key",
+                "--",
+                "-p",
+                "2222",
+                "-o",
+                "StrictHostKeyChecking=yes",
+                "ansibleadm@grotten",
+                "uname",
+                "-a",
+            ],
         )
     })
     .await
@@ -699,21 +647,21 @@ async fn implicit_user_is_resolved_and_bound_in_context_and_argv() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let bodies = state.create_bodies.lock().unwrap().clone();
-    let user = bodies[0]["context"]["structured"]["ssh"]["user"]
-        .as_str()
-        .expect("resolved default login user must be attached");
-    assert!(!user.is_empty());
-
     let argv: Vec<String> = std::fs::read_to_string(capture.join("argv"))
         .unwrap()
         .lines()
         .map(ToOwned::to_owned)
         .collect();
-    assert!(
-        argv.windows(2).any(|w| w == ["-l", user]),
-        "expected `-l {user}` in ssh argv: {argv:?}"
-    );
+    assert!(!argv.contains(&"StrictHostKeyChecking=accept-new".to_string()));
+    assert!(argv.ends_with(&[
+        "-p".to_string(),
+        "2222".to_string(),
+        "-o".to_string(),
+        "StrictHostKeyChecking=yes".to_string(),
+        "ansibleadm@grotten".to_string(),
+        "uname".to_string(),
+        "-a".to_string(),
+    ]));
 }
 
 #[cfg(unix)]
