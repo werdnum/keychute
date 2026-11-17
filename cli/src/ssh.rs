@@ -46,7 +46,7 @@ const AGENT_READY_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const AGENT_ORPHAN_BACKSTOP_SECONDS: u64 = 3600;
 
 /// Single-letter OpenSSH `ssh` options that take a separate argument.
-const SSH_ARG_OPTIONS: &[u8] = b"BbcDEeFIiJLlmOopQRSWw";
+const SSH_ARG_OPTIONS: &[u8] = b"BbcDEeFIiJLlmOopPQRSWw";
 
 #[derive(clap::Args)]
 pub(crate) struct SshArgs {
@@ -210,7 +210,7 @@ pub(crate) async fn run_ssh(cfg: &Config, http: &reqwest::Client, args: SshArgs)
 
     #[cfg(unix)]
     let mut signals = UnixSignals::register()?;
-    let key_lifetime_secs = args.ttl.max(AGENT_ORPHAN_BACKSTOP_SECONDS);
+    let key_lifetime_secs = AGENT_ORPHAN_BACKSTOP_SECONDS;
 
     let mut guard = start_ephemeral_agent(&bins, key_lifetime_secs).await?;
     let sock = guard.dir.join("s");
@@ -1046,6 +1046,19 @@ mod tests {
             "2222".to_string(),
             "grotten".to_string(),
         ]));
+
+        let p_tag_args = parse_ssh(&[
+            "--secret",
+            "k",
+            "--",
+            "-P",
+            "prod",
+            "-o",
+            "BatchMode=no",
+            "grotten",
+        ]);
+        let p_tag_argv = build_ssh_argv(&p_tag_args.ssh_args);
+        assert!(!p_tag_argv.contains(&"BatchMode=yes".to_string()));
     }
 
     #[test]
