@@ -54,17 +54,18 @@ const AGENT_READY_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MIN_AGENT_KEY_LIFETIME_SECONDS: u64 = 60;
 const MAX_AGENT_KEY_LIFETIME_SECONDS: u64 = 300;
 const AGENT_HANDSHAKE_GRACE_SECONDS: u64 = 30;
+const DEFAULT_CONNECT_TIMEOUT_SECONDS: u64 = 30;
 const MAX_CONNECT_TIMEOUT_SECONDS: u64 =
     MAX_AGENT_KEY_LIFETIME_SECONDS - AGENT_HANDSHAKE_GRACE_SECONDS;
 
 fn agent_key_lifetime_seconds(connect_timeout: Option<u64>) -> u64 {
-    match connect_timeout {
-        Some(ct) => ct.saturating_add(AGENT_HANDSHAKE_GRACE_SECONDS).clamp(
+    connect_timeout
+        .unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECONDS)
+        .saturating_add(AGENT_HANDSHAKE_GRACE_SECONDS)
+        .clamp(
             MIN_AGENT_KEY_LIFETIME_SECONDS,
             MAX_AGENT_KEY_LIFETIME_SECONDS,
-        ),
-        None => MIN_AGENT_KEY_LIFETIME_SECONDS,
-    }
+        )
 }
 
 #[cfg(unix)]
@@ -149,7 +150,7 @@ pub(crate) struct SshArgs {
     /// Verbose mode (`-v`, repeatable up to `-vvv`).
     #[arg(short = 'v', long, action = clap::ArgAction::Count, conflicts_with = "quiet")]
     pub verbose: u8,
-    /// SSH connection timeout in seconds (`-o ConnectTimeout=N`, 1..=270).
+    /// SSH connection timeout in seconds (`-o ConnectTimeout=N`, 1..=270; defaults to 30).
     #[arg(long, value_name = "SECONDS")]
     pub connect_timeout: Option<u64>,
     /// StrictHostKeyChecking policy: `accept-new` (default) or `yes`.
@@ -499,7 +500,7 @@ fn validate_options(args: &SshArgs, parsed: &ParsedDestination) -> CliResult<()>
         }
     }
     for spec in &args.local_forwards {
-        validate_simple_token("-L", spec, &[])?;
+        validate_local_forward_spec(spec)?;
     }
     match args.strict_host_key_checking.as_str() {
         "accept-new" | "yes" => {}
@@ -513,8 +514,106 @@ fn validate_options(args: &SshArgs, parsed: &ParsedDestination) -> CliResult<()>
         }
     }
     if let Some(path) = &args.known_hosts_file {
-        validate_known_hosts_path(path)?;
+        validate_known_hosts_path(path, &args.strict_host_key_checking)?;
     }
+    Ok(())
+}
+
+fn split_forward_parts(spec: &str) -> Result<Vec<&str>, String> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut in_brackets = false;
+    for (idx, ch) in spec.char_indices() {
+        match ch {
+            '[' => {
+                if in_brackets {
+                    return Err("nested '[' in forwarding spec".into());
+                }
+                in_brackets = true;
+            }
+            ']' => {
+                if !in_brackets {
+                    return Err("unmatched ']' in forwarding spec".into());
+                }
+                in_brackets = false;
+            }
+            ':' if !in_brackets => {
+                parts.push(&spec[start..idx]);
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    if in_brackets {
+        return Err("unclosed '[' in forwarding spec".into());
+    }
+    parts.push(&spec[start..]);
+    Ok(parts)
+}
+
+fn validate_port_token(raw: &str, label: &str) -> Result<(), String> {
+    let port: u16 = raw
+        .parse()
+        .map_err(|_| format!("invalid {label} port {raw:?}"))?;
+    if port == 0 {
+        return Err(format!("{label} port must be between 1 and 65535"));
+    }
+    Ok(())
+}
+
+fn validate_forward_host(raw: &str, allow_empty_or_star: bool, label: &str) -> Result<(), String> {
+    if raw.is_empty() {
+        if allow_empty_or_star {
+            return Ok(());
+        }
+        return Err(format!("missing {label} in forwarding spec"));
+    }
+    if raw == "*" {
+        if allow_empty_or_star {
+            return Ok(());
+        }
+        return Err(format!("invalid {label} \"*\" in forwarding spec"));
+    }
+    if raw.starts_with('[') || raw.ends_with(']') {
+        let inner = raw
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .ok_or_else(|| format!("malformed brackets in {label} {raw:?}"))?;
+        if inner.parse::<Ipv6Addr>().is_err() {
+            return Err(format!("invalid IPv6 address in {label} {raw:?}"));
+        }
+        return Ok(());
+    }
+    if raw.contains(':') || raw.contains('[') || raw.contains(']') || raw.contains('/') {
+        return Err(format!("invalid {label} {raw:?} in forwarding spec"));
+    }
+    Ok(())
+}
+
+fn validate_local_forward_spec(spec: &str) -> CliResult<()> {
+    validate_simple_token("-L", spec, &[])?;
+    let parts = split_forward_parts(spec)
+        .map_err(|msg| fail(EXIT_CONFIG, format!("invalid -L spec {spec:?}: {msg}")))?;
+    let (bind_addr, listen_port, remote_host, host_port) = match parts.as_slice() {
+        [lp, rh, hp] => (None, *lp, *rh, *hp),
+        [ba, lp, rh, hp] => (Some(*ba), *lp, *rh, *hp),
+        _ => {
+            return Err(fail(
+                EXIT_CONFIG,
+                format!("invalid -L spec {spec:?}: expected [bind_address:]port:host:hostport"),
+            ));
+        }
+    };
+    if let Some(ba) = bind_addr {
+        validate_forward_host(ba, true, "bind address")
+            .map_err(|msg| fail(EXIT_CONFIG, format!("invalid -L spec {spec:?}: {msg}")))?;
+    }
+    validate_port_token(listen_port, "listen")
+        .map_err(|msg| fail(EXIT_CONFIG, format!("invalid -L spec {spec:?}: {msg}")))?;
+    validate_forward_host(remote_host, false, "target host")
+        .map_err(|msg| fail(EXIT_CONFIG, format!("invalid -L spec {spec:?}: {msg}")))?;
+    validate_port_token(host_port, "target")
+        .map_err(|msg| fail(EXIT_CONFIG, format!("invalid -L spec {spec:?}: {msg}")))?;
     Ok(())
 }
 
@@ -539,7 +638,7 @@ fn validate_simple_token(flag: &str, value: &str, extra_forbidden: &[char]) -> C
     Ok(())
 }
 
-fn validate_known_hosts_path(path: &Path) -> CliResult<()> {
+fn validate_known_hosts_path(path: &Path, strict_mode: &str) -> CliResult<()> {
     let raw = path
         .to_str()
         .ok_or_else(|| fail(EXIT_CONFIG, "--known-hosts-file must be valid UTF-8"))?;
@@ -585,12 +684,109 @@ fn validate_known_hosts_path(path: &Path) -> CliResult<()> {
             }
         }
     }
-    if let Ok(meta) = std::fs::metadata(path) {
-        if !meta.is_file() {
+    let accept_new = strict_mode == "accept-new";
+    match std::fs::metadata(path) {
+        Ok(meta) => {
+            if !meta.is_file() {
+                return Err(fail(
+                    EXIT_CONFIG,
+                    format!(
+                        "refusing --known-hosts-file {}: existing path is not a regular file",
+                        path.display()
+                    ),
+                ));
+            }
+            let mut opts = std::fs::OpenOptions::new();
+            opts.read(true);
+            if accept_new {
+                opts.write(true);
+            }
+            opts.open(path).map_err(|e| {
+                let need = if accept_new {
+                    "readable and writable"
+                } else {
+                    "readable"
+                };
+                fail(
+                    EXIT_CONFIG,
+                    format!(
+                        "refusing --known-hosts-file {}: not {need} ({e})",
+                        path.display()
+                    ),
+                )
+            })?;
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            if std::fs::symlink_metadata(path).is_ok() {
+                return Err(fail(
+                    EXIT_CONFIG,
+                    format!(
+                        "refusing --known-hosts-file {}: dangling symlink",
+                        path.display()
+                    ),
+                ));
+            }
+            if !accept_new {
+                return Err(fail(
+                    EXIT_CONFIG,
+                    format!(
+                        "refusing --known-hosts-file {}: file does not exist (required with --strict-host-key-checking yes)",
+                        path.display()
+                    ),
+                ));
+            }
+            let parent = match path.parent() {
+                Some(p) if !p.as_os_str().is_empty() => p,
+                _ => Path::new("."),
+            };
+            let parent_meta = std::fs::metadata(parent).map_err(|e| {
+                fail(
+                    EXIT_CONFIG,
+                    format!(
+                        "refusing --known-hosts-file {}: cannot inspect parent directory {} ({e})",
+                        path.display(),
+                        parent.display()
+                    ),
+                )
+            })?;
+            if !parent_meta.is_dir() {
+                return Err(fail(
+                    EXIT_CONFIG,
+                    format!(
+                        "refusing --known-hosts-file {}: parent {} is not a directory",
+                        path.display(),
+                        parent.display()
+                    ),
+                ));
+            }
+            let mut probe_bytes = [0u8; 8];
+            rand::thread_rng().fill_bytes(&mut probe_bytes);
+            let probe = parent.join(format!(".keychute-kh-probe-{}", hex::encode(probe_bytes)));
+            let mut probe_opts = std::fs::OpenOptions::new();
+            probe_opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                probe_opts.mode(0o600);
+            }
+            let file = probe_opts.open(&probe).map_err(|e| {
+                fail(
+                    EXIT_CONFIG,
+                    format!(
+                        "refusing --known-hosts-file {}: cannot create files in {} ({e})",
+                        path.display(),
+                        parent.display()
+                    ),
+                )
+            })?;
+            drop(file);
+            let _ = std::fs::remove_file(&probe);
+        }
+        Err(err) => {
             return Err(fail(
                 EXIT_CONFIG,
                 format!(
-                    "refusing --known-hosts-file {}: existing path is not a regular file",
+                    "refusing --known-hosts-file {}: cannot inspect path ({err})",
                     path.display()
                 ),
             ));
@@ -1035,9 +1231,14 @@ fn build_ssh_argv(parsed: &ParsedDestination, args: &SshArgs) -> Vec<String> {
         argv.push("-o".to_string());
         argv.push(format!("UserKnownHostsFile={}", kh.display()));
     }
-    if let Some(ct) = args.connect_timeout {
+    let connect_timeout = args
+        .connect_timeout
+        .unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECONDS);
+    argv.push("-o".to_string());
+    argv.push(format!("ConnectTimeout={connect_timeout}"));
+    if !args.local_forwards.is_empty() {
         argv.push("-o".to_string());
-        argv.push(format!("ConnectTimeout={ct}"));
+        argv.push("ExitOnForwardFailure=yes".to_string());
     }
     if args.ipv4 {
         argv.push("-4".to_string());
@@ -1285,8 +1486,14 @@ mod tests {
         ]);
         assert!(validate_options(&yes, &parse_destination(&yes.destination).unwrap()).is_ok());
 
-        // Refuses /dev/null and OpenSSH's `none` sentinel for known_hosts_file.
-        for bad_kh in ["/dev/null", "none", "NONE", "/tmp"] {
+        // Refuses /dev/null, `none`, directories, missing parents, and unusable known_hosts files.
+        for bad_kh in [
+            "/dev/null",
+            "none",
+            "NONE",
+            "/tmp",
+            "/nonexistent-keychute-dir/kh",
+        ] {
             let parsed_cmd = parse_ssh(&["grotten", "--secret", "k", "--known-hosts-file", bad_kh]);
             assert_eq!(
                 validate_options(
@@ -1297,6 +1504,136 @@ mod tests {
                 .code,
                 EXIT_CONFIG,
                 "expected {bad_kh:?} to be rejected"
+            );
+        }
+
+        let kh_dir = std::env::temp_dir().join(format!("kc-kh-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&kh_dir).unwrap();
+        let new_kh = kh_dir.join("new_kh");
+        let new_kh_str = new_kh.to_str().unwrap().to_string();
+        let ok_accept_new = parse_ssh(&[
+            "grotten",
+            "--secret",
+            "k",
+            "--known-hosts-file",
+            &new_kh_str,
+        ]);
+        assert!(validate_options(
+            &ok_accept_new,
+            &parse_destination(&ok_accept_new.destination).unwrap()
+        )
+        .is_ok());
+        // Strict `yes` requires the explicit known_hosts file to already exist.
+        let missing_yes = parse_ssh(&[
+            "grotten",
+            "--secret",
+            "k",
+            "--strict-host-key-checking",
+            "yes",
+            "--known-hosts-file",
+            &new_kh_str,
+        ]);
+        assert_eq!(
+            validate_options(
+                &missing_yes,
+                &parse_destination(&missing_yes.destination).unwrap()
+            )
+            .unwrap_err()
+            .code,
+            EXIT_CONFIG
+        );
+        // Existing read-only known_hosts file is accepted for `yes`, rejected for `accept-new` (for non-root).
+        let ro_kh = kh_dir.join("ro_kh");
+        std::fs::write(&ro_kh, "").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&ro_kh, std::fs::Permissions::from_mode(0o444)).unwrap();
+            let ro_str = ro_kh.to_str().unwrap().to_string();
+            let ro_yes = parse_ssh(&[
+                "grotten",
+                "--secret",
+                "k",
+                "--strict-host-key-checking",
+                "yes",
+                "--known-hosts-file",
+                &ro_str,
+            ]);
+            assert!(
+                validate_options(&ro_yes, &parse_destination(&ro_yes.destination).unwrap()).is_ok()
+            );
+            // If the current process is not UID 0, opening a 0o444 file for write fails.
+            let ro_write_blocked = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&ro_kh)
+                .is_err();
+            if ro_write_blocked {
+                let ro_accept_new =
+                    parse_ssh(&["grotten", "--secret", "k", "--known-hosts-file", &ro_str]);
+                assert_eq!(
+                    validate_options(
+                        &ro_accept_new,
+                        &parse_destination(&ro_accept_new.destination).unwrap()
+                    )
+                    .unwrap_err()
+                    .code,
+                    EXIT_CONFIG
+                );
+            }
+            let dangling = kh_dir.join("dangling_kh");
+            std::os::unix::fs::symlink(kh_dir.join("missing_target"), &dangling).unwrap();
+            let dangling_cmd = parse_ssh(&[
+                "grotten",
+                "--secret",
+                "k",
+                "--known-hosts-file",
+                dangling.to_str().unwrap(),
+            ]);
+            assert_eq!(
+                validate_options(
+                    &dangling_cmd,
+                    &parse_destination(&dangling_cmd.destination).unwrap()
+                )
+                .unwrap_err()
+                .code,
+                EXIT_CONFIG
+            );
+        }
+        let _ = std::fs::remove_dir_all(&kh_dir);
+
+        // Validates -L [bind_address:]port:host:hostport syntax during preflight.
+        for ok_fwd in [
+            "8080:127.0.0.1:80",
+            "127.0.0.1:8080:127.0.0.1:80",
+            "*:8080:localhost:80",
+            "[::1]:8080:[::1]:80",
+            ":8080:localhost:80",
+        ] {
+            let cmd = parse_ssh(&["grotten", "--secret", "k", "-L", ok_fwd]);
+            assert!(
+                validate_options(&cmd, &parse_destination(&cmd.destination).unwrap()).is_ok(),
+                "expected -L {ok_fwd:?} to be accepted"
+            );
+        }
+        for bad_fwd in [
+            "nonsense",
+            "8080:localhost",
+            "a:b:c:d",
+            "0:localhost:80",
+            "65536:localhost:80",
+            "8080:localhost:0",
+            "8080::80",
+            "[bad]:8080:localhost:80",
+            "8080:[not-v6]:80",
+            "a:b:c:d:e",
+        ] {
+            let cmd = parse_ssh(&["grotten", "--secret", "k", "-L", bad_fwd]);
+            assert_eq!(
+                validate_options(&cmd, &parse_destination(&cmd.destination).unwrap())
+                    .unwrap_err()
+                    .code,
+                EXIT_CONFIG,
+                "expected -L {bad_fwd:?} to be rejected"
             );
         }
         // Refuses whitespace/quotes in known_hosts_file.
@@ -1442,6 +1779,8 @@ mod tests {
                 "UserKnownHostsFile=/tmp/kh",
                 "-o",
                 "ConnectTimeout=10",
+                "-o",
+                "ExitOnForwardFailure=yes",
                 "-4",
                 "-p",
                 "2222",
@@ -1457,6 +1796,14 @@ mod tests {
                 "k3s",
             ]
         );
+
+        let default_args = parse_ssh(&["grotten", "--secret", "k"]);
+        let default_parsed = parse_destination(&default_args.destination).unwrap();
+        let default_argv = build_ssh_argv(&default_parsed, &default_args);
+        assert!(default_argv.contains(&"ConnectTimeout=30".to_string()));
+        assert!(!default_argv
+            .iter()
+            .any(|arg| arg.starts_with("ExitOnForwardFailure")));
     }
 
     #[test]

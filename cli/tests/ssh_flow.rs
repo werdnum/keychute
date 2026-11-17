@@ -338,6 +338,8 @@ async fn standard_ed25519_key_loads_into_ephemeral_agent_and_cleans_up() {
             "BatchMode=yes",
             "-o",
             "StrictHostKeyChecking=accept-new",
+            "-o",
+            "ConnectTimeout=30",
             "--",
             "ansibleadm@grotten",
             "sudo",
@@ -582,6 +584,15 @@ async fn preflight_errors_exit_2_with_zero_server_requests() {
             "--known-hosts-file",
             "none",
         ],
+        vec![
+            "ssh",
+            "grotten",
+            "--secret",
+            "k",
+            "--known-hosts-file",
+            "/nonexistent-keychute-dir/kh",
+        ],
+        vec!["ssh", "grotten", "--secret", "k", "-L", "nonsense"],
         vec!["ssh", "u@grotten", "-l", "other", "--secret", "k"],
     ] {
         let u = url.clone();
