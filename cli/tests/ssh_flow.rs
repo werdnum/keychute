@@ -224,12 +224,15 @@ fn run_ssh_cli(
     extra_env: &[(&str, &str)],
     args: &[&str],
 ) -> std::process::Output {
+    let home_dir = tmp_dir.parent().unwrap().join("home");
+    std::fs::create_dir_all(&home_dir).unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_keychute"));
     cmd.args(args)
         .env("KEYCHUTE_URL", url)
         .env("KEYCHUTE_TOKEN", "test-token")
         .env("PATH", path_env)
         .env("TMPDIR", tmp_dir)
+        .env("HOME", &home_dir)
         .env("FAKE_SSH_CAPTURE_DIR", capture_dir)
         .env_remove("KEYCHUTE_TOKEN_FILE")
         .env_remove("KEYCHUTE_CA_BUNDLE")
@@ -321,6 +324,10 @@ async fn standard_ed25519_key_loads_into_ephemeral_agent_and_cleans_up() {
         .lines()
         .map(ToOwned::to_owned)
         .collect();
+    let expected_kh = format!(
+        "UserKnownHostsFile={}",
+        dir.path().join("home/.ssh/known_hosts").display()
+    );
     assert_eq!(
         argv,
         vec![
@@ -338,6 +345,8 @@ async fn standard_ed25519_key_loads_into_ephemeral_agent_and_cleans_up() {
             "BatchMode=yes",
             "-o",
             "StrictHostKeyChecking=accept-new",
+            "-o",
+            &expected_kh,
             "-o",
             "ConnectTimeout=30",
             "--",
@@ -609,6 +618,28 @@ async fn preflight_errors_exit_2_with_zero_server_requests() {
         assert_eq!(out.status.code(), Some(2));
     }
 
+    // Unwritable/invalid HOME with omitted --known-hosts-file fails locally before contacting Keychute.
+    let bad_home = dir.path().join("home-file");
+    std::fs::write(&bad_home, "x").unwrap();
+    let u2 = url.clone();
+    let p2 = path_env.clone();
+    let c2 = capture.clone();
+    let t2 = sock_tmp.clone();
+    let bad_home_str = bad_home.display().to_string();
+    let out_home = tokio::task::spawn_blocking(move || {
+        run_ssh_cli(
+            &u2,
+            &p2,
+            &c2,
+            &t2,
+            &[("HOME", &bad_home_str)],
+            &["ssh", "grotten", "--secret", "k"],
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(out_home.status.code(), Some(2));
+
     // Missing OpenSSH binaries on PATH also fails locally before contacting Keychute.
     let empty_bin = dir.path().join("empty-bin");
     std::fs::create_dir_all(&empty_bin).unwrap();
@@ -633,13 +664,67 @@ async fn preflight_errors_exit_2_with_zero_server_requests() {
     );
 }
 
+#[tokio::test]
+async fn implicit_user_is_resolved_and_bound_in_context_and_argv() {
+    let dir = TempDir::new("kc-ssh-impuser");
+    let (priv_bytes, _) = generate_ed25519_keypair(dir.path());
+    let (_bin, capture, path_env) = install_fake_ssh(dir.path());
+    let sock_tmp = dir.path().join("tmp");
+    std::fs::create_dir_all(&sock_tmp).unwrap();
+
+    let (url, state) = start_mock(MockConfig {
+        secret_payload: priv_bytes,
+        deny: false,
+        granted_secret_name: None,
+        auto_approved: true,
+    })
+    .await;
+
+    let capture_clone = capture.clone();
+    let out = tokio::task::spawn_blocking(move || {
+        run_ssh_cli(
+            &url,
+            &path_env,
+            &capture_clone,
+            &sock_tmp,
+            &[],
+            &["ssh", "grotten", "--secret", "node-ssh-key"],
+        )
+    })
+    .await
+    .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let bodies = state.create_bodies.lock().unwrap().clone();
+    let user = bodies[0]["context"]["structured"]["ssh"]["user"]
+        .as_str()
+        .expect("resolved default login user must be attached");
+    assert!(!user.is_empty());
+
+    let argv: Vec<String> = std::fs::read_to_string(capture.join("argv"))
+        .unwrap()
+        .lines()
+        .map(ToOwned::to_owned)
+        .collect();
+    assert!(
+        argv.windows(2).any(|w| w == ["-l", user]),
+        "expected `-l {user}` in ssh argv: {argv:?}"
+    );
+}
+
 #[cfg(unix)]
 async fn assert_signal_stops_ssh_and_cleans_up(sig_flag: &str, expected_code: i32, prefix: &str) {
     let dir = TempDir::new(prefix);
     let (priv_bytes, _) = generate_ed25519_keypair(dir.path());
     let (_bin, capture, path_env) = install_fake_ssh(dir.path());
     let sock_tmp = dir.path().join("tmp");
+    let home_dir = dir.path().join("home");
     std::fs::create_dir_all(&sock_tmp).unwrap();
+    std::fs::create_dir_all(&home_dir).unwrap();
 
     let (url, _state) = start_mock(MockConfig {
         secret_payload: priv_bytes,
@@ -655,6 +740,7 @@ async fn assert_signal_stops_ssh_and_cleans_up(sig_flag: &str, expected_code: i3
         .env("KEYCHUTE_TOKEN", "test-token")
         .env("PATH", &path_env)
         .env("TMPDIR", &sock_tmp)
+        .env("HOME", &home_dir)
         .env("FAKE_SSH_CAPTURE_DIR", &capture)
         .env("FAKE_SSH_SLEEP", "30")
         .env_remove("KEYCHUTE_TOKEN_FILE")

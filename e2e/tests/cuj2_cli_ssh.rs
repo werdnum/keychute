@@ -95,6 +95,7 @@ async fn cli_ssh_shows_claimed_session_and_loads_key_into_ephemeral_agent() {
         .env("KEYCHUTE_URL", &env.base_url)
         .env("KEYCHUTE_TOKEN", K8S_TOKEN)
         .env("PATH", &path_env)
+        .env("HOME", tmp.path())
         .env("FAKE_SSH_CAPTURE_DIR", &capture)
         .env_remove("SSH_AUTH_SOCK")
         .stdout(std::process::Stdio::piped())

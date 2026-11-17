@@ -244,13 +244,25 @@ pub(crate) async fn run_ssh(cfg: &Config, http: &reqwest::Client, args: SshArgs)
     let parsed = parse_destination(&args.destination).map_err(|e| fail(EXIT_CONFIG, e))?;
     validate_options(&args, &parsed)?;
     let bins = resolve_openssh_bins()?;
-    let structured = build_ssh_context(&parsed, &args)?;
+    let effective_user = resolve_effective_user(&parsed, args.login_name.as_deref())?;
+    let effective_known_hosts = resolve_effective_known_hosts(
+        args.known_hosts_file.as_deref(),
+        &args.strict_host_key_checking,
+        std::env::var_os("HOME").as_deref(),
+    )?;
+    let structured = build_ssh_context(&parsed, &args, &effective_user)?;
 
     let user_key = args
         .idempotency_key
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let idem_key = call_bound_idempotency_key(&user_key, &parsed, &args);
+    let idem_key = call_bound_idempotency_key(
+        &user_key,
+        &parsed,
+        &args,
+        &effective_user,
+        effective_known_hosts.as_deref(),
+    );
 
     let body = CreateAccessRequest {
         idempotency_key: idem_key.clone(),
@@ -347,9 +359,28 @@ pub(crate) async fn run_ssh(cfg: &Config, http: &reqwest::Client, args: SshArgs)
     }
 
     #[cfg(unix)]
-    let ssh_res = run_ssh_child(&bins, &sock, &parsed, &args, &mut guard, &mut signals).await;
+    let ssh_res = run_ssh_child(
+        &bins,
+        &sock,
+        &parsed,
+        &args,
+        &effective_user,
+        effective_known_hosts.as_deref(),
+        &mut guard,
+        &mut signals,
+    )
+    .await;
     #[cfg(not(unix))]
-    let ssh_res = run_ssh_child(&bins, &sock, &parsed, &args, &mut guard).await;
+    let ssh_res = run_ssh_child(
+        &bins,
+        &sock,
+        &parsed,
+        &args,
+        &effective_user,
+        effective_known_hosts.as_deref(),
+        &mut guard,
+    )
+    .await;
     guard.shutdown().await;
     let status = ssh_res?;
     if status.success() {
@@ -638,7 +669,7 @@ fn validate_simple_token(flag: &str, value: &str, extra_forbidden: &[char]) -> C
     Ok(())
 }
 
-fn validate_known_hosts_path(path: &Path, strict_mode: &str) -> CliResult<()> {
+fn validate_known_hosts_syntax(path: &Path) -> CliResult<()> {
     let raw = path
         .to_str()
         .ok_or_else(|| fail(EXIT_CONFIG, "--known-hosts-file must be valid UTF-8"))?;
@@ -653,6 +684,15 @@ fn validate_known_hosts_path(path: &Path, strict_mode: &str) -> CliResult<()> {
             EXIT_CONFIG,
             format!(
                 "--known-hosts-file {raw:?} contains whitespace, quotes, or control characters"
+            ),
+        ));
+    }
+    if raw.starts_with('~') || raw.contains('%') || raw.contains('$') {
+        return Err(fail(
+            EXIT_CONFIG,
+            format!(
+                "--known-hosts-file {raw:?} must not start with '~' or contain '%' or '$' \
+                 (OpenSSH expands tokens and environment variables in UserKnownHostsFile)"
             ),
         ));
     }
@@ -684,6 +724,11 @@ fn validate_known_hosts_path(path: &Path, strict_mode: &str) -> CliResult<()> {
             }
         }
     }
+    Ok(())
+}
+
+fn validate_known_hosts_path(path: &Path, strict_mode: &str) -> CliResult<()> {
+    validate_known_hosts_syntax(path)?;
     let accept_new = strict_mode == "accept-new";
     match std::fs::metadata(path) {
         Ok(meta) => {
@@ -795,6 +840,118 @@ fn validate_known_hosts_path(path: &Path, strict_mode: &str) -> CliResult<()> {
     Ok(())
 }
 
+fn resolve_effective_known_hosts(
+    explicit: Option<&Path>,
+    strict_mode: &str,
+    home_dir: Option<&std::ffi::OsStr>,
+) -> CliResult<Option<PathBuf>> {
+    if let Some(path) = explicit {
+        validate_known_hosts_path(path, strict_mode)?;
+        return Ok(Some(path.to_path_buf()));
+    }
+
+    let non_empty_home = home_dir.filter(|h| !h.is_empty()).map(PathBuf::from);
+
+    if strict_mode == "accept-new" {
+        let home = non_empty_home.ok_or_else(|| {
+            fail(
+                EXIT_CONFIG,
+                "HOME is not set; pass --known-hosts-file so SSH host keys can be persisted",
+            )
+        })?;
+        let ssh_dir = home.join(".ssh");
+        let kh = ssh_dir.join("known_hosts");
+        validate_known_hosts_syntax(&kh)?;
+        if let Err(err) = std::fs::symlink_metadata(&ssh_dir) {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::DirBuilderExt;
+                    std::fs::DirBuilder::new()
+                        .mode(0o700)
+                        .create(&ssh_dir)
+                        .map_err(|e| {
+                            fail(
+                                EXIT_CONFIG,
+                                format!(
+                                    "cannot create {} to persist SSH host keys ({e}); \
+                                     pass a writable --known-hosts-file",
+                                    ssh_dir.display()
+                                ),
+                            )
+                        })?;
+                }
+                #[cfg(not(unix))]
+                {
+                    std::fs::create_dir(&ssh_dir).map_err(|e| {
+                        fail(
+                            EXIT_CONFIG,
+                            format!(
+                                "cannot create {} to persist SSH host keys ({e}); \
+                                 pass a writable --known-hosts-file",
+                                ssh_dir.display()
+                            ),
+                        )
+                    })?;
+                }
+            }
+        }
+        validate_known_hosts_path(&kh, "accept-new")?;
+        return Ok(Some(kh));
+    }
+
+    // StrictHostKeyChecking=yes with no explicit --known-hosts-file: require at least
+    // one standard user or global known_hosts file to exist and be readable.
+    let mut candidates = Vec::new();
+    if let Some(home) = non_empty_home {
+        candidates.push(home.join(".ssh/known_hosts"));
+        candidates.push(home.join(".ssh/known_hosts2"));
+    }
+    candidates.push(PathBuf::from("/etc/ssh/ssh_known_hosts"));
+    candidates.push(PathBuf::from("/etc/ssh/ssh_known_hosts2"));
+    let has_readable = candidates.iter().any(|c| {
+        std::fs::metadata(c).map(|m| m.is_file()).unwrap_or(false) && std::fs::File::open(c).is_ok()
+    });
+    if !has_readable {
+        return Err(fail(
+            EXIT_CONFIG,
+            "--strict-host-key-checking yes requires an existing readable known_hosts file \
+             (~/.ssh/known_hosts or /etc/ssh/ssh_known_hosts), or pass --known-hosts-file",
+        ));
+    }
+    Ok(None)
+}
+
+fn resolve_effective_user(
+    parsed: &ParsedDestination,
+    login_name: Option<&str>,
+) -> CliResult<String> {
+    if let Some(user) = parsed.effective_user(login_name) {
+        return Ok(user.to_string());
+    }
+    for bin in ["/usr/bin/id", "/bin/id", "id"] {
+        if let Ok(out) = std::process::Command::new(bin)
+            .arg("-run")
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+        {
+            if out.status.success() {
+                let raw = String::from_utf8_lossy(&out.stdout);
+                let user = raw.trim_end_matches(&['\r', '\n'][..]);
+                if !user.is_empty() {
+                    validate_simple_token("local login user", user, &['@', '/', '\\'])?;
+                    return Ok(user.to_string());
+                }
+            }
+        }
+    }
+    Err(fail(
+        EXIT_CONFIG,
+        "could not determine local login username; pass user@host or -l <user>",
+    ))
+}
+
 fn resolve_openssh_bins() -> CliResult<OpenSshBins> {
     let path_var = std::env::var_os("PATH");
     resolve_openssh_bins_in(path_var.as_deref()).map_err(|e| fail(EXIT_CONFIG, e))
@@ -846,7 +1003,7 @@ fn is_executable_file(path: &Path) -> bool {
     }
 }
 
-fn format_ssh_summary(parsed: &ParsedDestination, args: &SshArgs) -> String {
+fn format_ssh_summary(parsed: &ParsedDestination, args: &SshArgs, effective_user: &str) -> String {
     let mut parts = vec!["ssh".to_string()];
     if let Some(port) = args.port {
         parts.push("-p".to_string());
@@ -859,7 +1016,7 @@ fn format_ssh_summary(parsed: &ParsedDestination, args: &SshArgs) -> String {
     if args.no_remote_command {
         parts.push("-N".to_string());
     }
-    parts.push(parsed.display_target(args.login_name.as_deref()));
+    parts.push(parsed.display_target(Some(effective_user)));
     if !args.command.is_empty() {
         parts.push("--".to_string());
         parts.extend(args.command.iter().cloned());
@@ -867,9 +1024,13 @@ fn format_ssh_summary(parsed: &ParsedDestination, args: &SshArgs) -> String {
     parts.join(" ")
 }
 
-fn build_ssh_context(parsed: &ParsedDestination, args: &SshArgs) -> CliResult<serde_json::Value> {
+fn build_ssh_context(
+    parsed: &ParsedDestination,
+    args: &SshArgs,
+    effective_user: &str,
+) -> CliResult<serde_json::Value> {
     let mut structured = build_structured_context().unwrap_or(serde_json::json!({}));
-    let summary = format_ssh_summary(parsed, args);
+    let summary = format_ssh_summary(parsed, args, effective_user);
 
     let mut ssh_map = serde_json::Map::new();
     ssh_map.insert("target".to_string(), serde_json::Value::String(summary));
@@ -877,12 +1038,10 @@ fn build_ssh_context(parsed: &ParsedDestination, args: &SshArgs) -> CliResult<se
         "host".to_string(),
         serde_json::Value::String(parsed.host.clone()),
     );
-    if let Some(user) = parsed.effective_user(args.login_name.as_deref()) {
-        ssh_map.insert(
-            "user".to_string(),
-            serde_json::Value::String(user.to_string()),
-        );
-    }
+    ssh_map.insert(
+        "user".to_string(),
+        serde_json::Value::String(effective_user.to_string()),
+    );
     ssh_map.insert(
         "port".to_string(),
         serde_json::json!(args.port.unwrap_or(22)),
@@ -919,6 +1078,8 @@ fn call_bound_idempotency_key(
     user_key: &str,
     parsed: &ParsedDestination,
     args: &SshArgs,
+    effective_user: &str,
+    effective_known_hosts: Option<&Path>,
 ) -> String {
     use sha2::{Digest, Sha256};
 
@@ -936,10 +1097,7 @@ fn call_bound_idempotency_key(
     };
 
     update_str(&mut hasher, "ssh");
-    update_opt_str(
-        &mut hasher,
-        parsed.effective_user(args.login_name.as_deref()),
-    );
+    update_str(&mut hasher, effective_user);
     update_str(&mut hasher, &parsed.host);
     hasher.update(args.port.unwrap_or(22).to_be_bytes());
     hasher.update((args.command.len() as u64).to_be_bytes());
@@ -959,18 +1117,13 @@ fn call_bound_idempotency_key(
         _ => 0u8,
     };
     hasher.update([addr_family]);
-    match args.connect_timeout {
-        None => hasher.update([0u8]),
-        Some(secs) => {
-            hasher.update([1u8]);
-            hasher.update(secs.to_be_bytes());
-        }
-    }
-    update_str(&mut hasher, &args.strict_host_key_checking);
-    update_opt_str(
-        &mut hasher,
-        args.known_hosts_file.as_ref().and_then(|p| p.to_str()),
+    hasher.update(
+        args.connect_timeout
+            .unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECONDS)
+            .to_be_bytes(),
     );
+    update_str(&mut hasher, &args.strict_host_key_checking);
+    update_opt_str(&mut hasher, effective_known_hosts.and_then(|p| p.to_str()));
 
     let digest = hex::encode(hasher.finalize());
     format!("{user_key}-{}", &digest[..CALL_BINDING_HEX_CHARS])
@@ -1209,7 +1362,12 @@ async fn load_key_into_agent(
     Ok(())
 }
 
-fn build_ssh_argv(parsed: &ParsedDestination, args: &SshArgs) -> Vec<String> {
+fn build_ssh_argv(
+    parsed: &ParsedDestination,
+    args: &SshArgs,
+    effective_user: &str,
+    effective_known_hosts: Option<&Path>,
+) -> Vec<String> {
     let mut argv = vec![
         "-F".to_string(),
         "none".to_string(),
@@ -1227,7 +1385,7 @@ fn build_ssh_argv(parsed: &ParsedDestination, args: &SshArgs) -> Vec<String> {
         format!("StrictHostKeyChecking={}", args.strict_host_key_checking),
     ];
 
-    if let Some(kh) = &args.known_hosts_file {
+    if let Some(kh) = effective_known_hosts {
         argv.push("-o".to_string());
         argv.push(format!("UserKnownHostsFile={}", kh.display()));
     }
@@ -1249,9 +1407,9 @@ fn build_ssh_argv(parsed: &ParsedDestination, args: &SshArgs) -> Vec<String> {
         argv.push("-p".to_string());
         argv.push(port.to_string());
     }
-    if let Some(user) = &args.login_name {
+    if parsed.inline_user.is_none() {
         argv.push("-l".to_string());
-        argv.push(user.clone());
+        argv.push(effective_user.to_string());
     }
     match args.force_tty {
         0 => {}
@@ -1311,12 +1469,18 @@ async fn run_ssh_child(
     sock: &Path,
     parsed: &ParsedDestination,
     args: &SshArgs,
+    effective_user: &str,
+    effective_known_hosts: Option<&Path>,
     guard: &mut AgentGuard,
     #[cfg(unix)] signals: &mut UnixSignals,
 ) -> CliResult<ExitStatus> {
     let mut cmd = tokio::process::Command::new(&bins.ssh);
-    cmd.env("SSH_AUTH_SOCK", sock)
-        .args(build_ssh_argv(parsed, args));
+    cmd.env("SSH_AUTH_SOCK", sock).args(build_ssh_argv(
+        parsed,
+        args,
+        effective_user,
+        effective_known_hosts,
+    ));
 
     #[cfg(unix)]
     {
@@ -1486,11 +1650,14 @@ mod tests {
         ]);
         assert!(validate_options(&yes, &parse_destination(&yes.destination).unwrap()).is_ok());
 
-        // Refuses /dev/null, `none`, directories, missing parents, and unusable known_hosts files.
+        // Refuses /dev/null, `none`, token/tilde expansions, directories, missing parents, and unusable known_hosts files.
         for bad_kh in [
             "/dev/null",
             "none",
             "NONE",
+            "~/kh",
+            "/tmp/a%db",
+            "/tmp/${FOO}",
             "/tmp",
             "/nonexistent-keychute-dir/kh",
         ] {
@@ -1757,7 +1924,7 @@ mod tests {
             "k3s",
         ]);
         let parsed = parse_destination(&args.destination).unwrap();
-        let argv = build_ssh_argv(&parsed, &args);
+        let argv = build_ssh_argv(&parsed, &args, "ansibleadm", Some(Path::new("/tmp/kh")));
         assert_eq!(
             argv,
             vec![
@@ -1799,11 +1966,64 @@ mod tests {
 
         let default_args = parse_ssh(&["grotten", "--secret", "k"]);
         let default_parsed = parse_destination(&default_args.destination).unwrap();
-        let default_argv = build_ssh_argv(&default_parsed, &default_args);
+        let default_kh = Path::new("/home/tester/.ssh/known_hosts");
+        let default_argv =
+            build_ssh_argv(&default_parsed, &default_args, "tester", Some(default_kh));
         assert!(default_argv.contains(&"ConnectTimeout=30".to_string()));
+        assert!(
+            default_argv.contains(&"UserKnownHostsFile=/home/tester/.ssh/known_hosts".to_string())
+        );
+        assert!(default_argv.windows(2).any(|w| w == ["-l", "tester"]));
         assert!(!default_argv
             .iter()
             .any(|arg| arg.starts_with("ExitOnForwardFailure")));
+    }
+
+    #[test]
+    fn default_known_hosts_resolution_provisions_or_rejects_unwritable_home() {
+        let dir = std::env::temp_dir().join(format!("kc-home-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let kh = resolve_effective_known_hosts(None, "accept-new", Some(dir.as_os_str()))
+            .unwrap()
+            .expect("accept-new resolves default known_hosts path");
+        assert_eq!(kh, dir.join(".ssh/known_hosts"));
+        assert!(dir.join(".ssh").is_dir());
+
+        assert_eq!(
+            resolve_effective_known_hosts(None, "accept-new", None)
+                .unwrap_err()
+                .code,
+            EXIT_CONFIG
+        );
+        assert_eq!(
+            resolve_effective_known_hosts(None, "accept-new", Some(std::ffi::OsStr::new("")))
+                .unwrap_err()
+                .code,
+            EXIT_CONFIG
+        );
+
+        let not_a_dir = dir.join("regular-file");
+        std::fs::write(&not_a_dir, "x").unwrap();
+        assert_eq!(
+            resolve_effective_known_hosts(None, "accept-new", Some(not_a_dir.as_os_str()))
+                .unwrap_err()
+                .code,
+            EXIT_CONFIG
+        );
+
+        assert_eq!(
+            resolve_effective_known_hosts(
+                None,
+                "accept-new",
+                Some(std::ffi::OsStr::new("/tmp/with space"))
+            )
+            .unwrap_err()
+            .code,
+            EXIT_CONFIG
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1830,20 +2050,26 @@ mod tests {
             "--",
             "uptime",
         ]);
+        let a5 = parse_ssh(&["grotten", "--secret", "k", "--", "uptime"]);
         let p1 = parse_destination(&a1.destination).unwrap();
         let p2 = parse_destination(&a2.destination).unwrap();
         let p3 = parse_destination(&a3.destination).unwrap();
         let p4 = parse_destination(&a4.destination).unwrap();
+        let p5 = parse_destination(&a5.destination).unwrap();
 
-        let k1 = call_bound_idempotency_key("same", &p1, &a1);
-        let k1_again = call_bound_idempotency_key("same", &p1, &a1);
-        let k2 = call_bound_idempotency_key("same", &p2, &a2);
-        let k3 = call_bound_idempotency_key("same", &p3, &a3);
-        let k4 = call_bound_idempotency_key("same", &p4, &a4);
+        let kh = Some(Path::new("/home/ansibleadm/.ssh/known_hosts"));
+        let k1 = call_bound_idempotency_key("same", &p1, &a1, "ansibleadm", kh);
+        let k1_again = call_bound_idempotency_key("same", &p1, &a1, "ansibleadm", kh);
+        let k2 = call_bound_idempotency_key("same", &p2, &a2, "ansibleadm", kh);
+        let k3 = call_bound_idempotency_key("same", &p3, &a3, "ansibleadm", kh);
+        let k4 = call_bound_idempotency_key("same", &p4, &a4, "ansibleadm", kh);
+        let k5_alice = call_bound_idempotency_key("same", &p5, &a5, "alice", kh);
+        let k5_bob = call_bound_idempotency_key("same", &p5, &a5, "bob", kh);
         assert_eq!(k1, k1_again);
         assert_ne!(k1, k2);
         assert_ne!(k1, k3);
         assert_ne!(k1, k4);
+        assert_ne!(k5_alice, k5_bob);
         assert!(k1.len() <= 124);
     }
 
