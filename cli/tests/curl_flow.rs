@@ -228,12 +228,7 @@ async fn spawn_mock_full(
 }
 
 fn cli_bin() -> std::path::PathBuf {
-    let mut p = std::env::current_exe().unwrap();
-    p.pop();
-    if p.ends_with("deps") {
-        p.pop();
-    }
-    p.join("keychute")
+    std::path::PathBuf::from(env!("CARGO_BIN_EXE_keychute"))
 }
 
 fn run_cli(base: &str, args: &[&str]) -> (i32, Vec<u8>, String) {

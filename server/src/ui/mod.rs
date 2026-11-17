@@ -1065,6 +1065,14 @@ fn claimed_target(structured: Option<&serde_json::Value>) -> Option<&str> {
     structured?.get("target")?.as_str()
 }
 
+/// The claimed SSH session summary attached by `keychute ssh` under
+/// `structured.ssh.target`, if it is a string. Client-asserted only —
+/// promoted for readability on `cli-read` requests, never treated as a
+/// server-enforced constraint.
+fn claimed_ssh_target(structured: Option<&serde_json::Value>) -> Option<&str> {
+    structured?.get("ssh")?.get("target")?.as_str()
+}
+
 /// Client-asserted context block. ALL values here are untrusted client input
 /// and render as text nodes only — maud escapes them.
 fn context_block(context: Option<&RequestContext>, mechanism: Mechanism) -> Markup {
@@ -1104,6 +1112,16 @@ fn context_block(context: Option<&RequestContext>, mechanism: Mechanism) -> Mark
                         p .caveat {
                             "A claim, not a constraint: only the origin, method and path "
                             "above are enforced. A query string is forwarded as written."
+                        }
+                    }
+                    @if let Some(ssh_target) = claimed_ssh_target(ctx.structured.as_ref())
+                        .filter(|_| mechanism == Mechanism::CliRead) {
+                        h3 { "SSH session claimed by the client" }
+                        p .mono { (ssh_target) }
+                        p .caveat {
+                            "A claim, not a constraint: tier-2 cli-read releases the SSH key once to "
+                            "the client container, where keychute ssh loads it into an ephemeral local "
+                            "ssh-agent without writing it to stdout or disk."
                         }
                     }
                     @if let Some(structured) = &ctx.structured {
@@ -4725,6 +4743,58 @@ mod tests {
             // Still visible as ordinary client context, just not promoted.
             assert!(rendered.contains("Structured context"));
             assert!(rendered.contains("api.example.com"));
+        }
+    }
+
+    #[test]
+    fn a_claimed_ssh_target_is_labelled_a_claim() {
+        let ctx = RequestContext {
+            reason: "check k3s".to_owned(),
+            structured: Some(serde_json::json!({
+                "ssh": {
+                    "target": "ssh ansibleadm@grotten -- sudo systemctl status k3s",
+                    "host": "grotten",
+                    "user": "ansibleadm",
+                    "port": 22,
+                },
+            })),
+        };
+        let rendered = context_block(Some(&ctx), Mechanism::CliRead).into_string();
+        assert!(rendered.contains("SSH session claimed by the client"));
+        assert!(rendered.contains("ssh ansibleadm@grotten -- sudo systemctl status k3s"));
+        assert!(rendered.contains("A claim, not a constraint"));
+        assert!(rendered.contains("ephemeral local ssh-agent"));
+        assert!(rendered.contains("Structured context"));
+
+        // Escaped like every other client string.
+        let xss_ctx = RequestContext {
+            reason: String::new(),
+            structured: Some(serde_json::json!({ "ssh": { "target": "<img src=x>" } })),
+        };
+        let rendered = context_block(Some(&xss_ctx), Mechanism::CliRead).into_string();
+        assert!(rendered.contains("&lt;img src=x&gt;"));
+        assert!(!rendered.contains("<img src=x"));
+
+        // Non-string `ssh.target` is not promoted.
+        let non_str_ctx = RequestContext {
+            reason: String::new(),
+            structured: Some(serde_json::json!({ "ssh": { "target": 42 } })),
+        };
+        let rendered = context_block(Some(&non_str_ctx), Mechanism::CliRead).into_string();
+        assert!(!rendered.contains("SSH session claimed by the client"));
+
+        // Only cli-read promotes the SSH session block.
+        for mechanism in [
+            Mechanism::Brokered,
+            Mechanism::Autofill,
+            Mechanism::DirectRead,
+        ] {
+            let rendered = context_block(Some(&ctx), mechanism).into_string();
+            assert!(
+                !rendered.contains("SSH session claimed by the client"),
+                "{mechanism:?} should not promote ssh session block"
+            );
+            assert!(rendered.contains("Structured context"));
         }
     }
 

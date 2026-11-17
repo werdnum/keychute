@@ -26,6 +26,7 @@ Milestones M0–M3 server-side, minus cluster wiring:
   dev/e2e) or `oidc` mode (JWT validation: issuer, audience, signature via JWKS,
   exp/nbf with skew, group/subject allowlist).
 - `keychute` CLI (`curl` → wait → proxy → stdout for brokered HTTP;
+  `ssh` → wait → read → ephemeral `ssh-agent` → `ssh` for tier-2 SSH;
   `request` → wait → read → stdout for releasing tiers; `store` for deposits).
 - TLS: rustls listener when cert/key paths configured; plain HTTP otherwise
   (dev/e2e). Production charts always configure TLS.
@@ -389,11 +390,12 @@ or Envoy-forwarded JWT in oidc mode):
   `PreEscaped` for anything client-derived. The approval page must render the
   server-parsed grant block separately from client context, labelled.
 - The grant block states that its path prefixes are the *canonical* (once-decoded)
-  forms the proxy matches and forwards, and a `target` string in the client's
-  structured context is promoted into its own labelled line marked as a claim.
-  A client may legitimately display `/users/%7Ealice` for a call the server
-  sends as `/users/~alice`; the page resolves that for the operator rather than
-  leaving each client to police its own spelling.
+  forms the proxy matches and forwards, a `target` string in the client's
+  structured context is promoted on `brokered` requests into its own labelled
+  line marked as a claim, and `ssh.target` is similarly promoted on `cli-read`
+  requests. A client may legitimately display `/users/%7Ealice` for a call the
+  server sends as `/users/~alice`; the page resolves that for the operator
+  rather than leaving each client to police its own spelling.
 
 ## DB schema (migrations)
 
