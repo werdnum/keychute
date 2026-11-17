@@ -1,22 +1,29 @@
 //! keychute CLI: make authenticated HTTP calls without ever holding the
-//! credential (`keychute curl`, CUJ 1, tier-0 brokered), request secrets from
-//! a Keychute server (CUJ 2, tier-2 cli-read), and deposit new ones
-//! (`keychute store`, reading the value from stdin).
+//! credential (`keychute curl`, CUJ 1, tier-0 brokered), SSH with a Keychute
+//! private key without writing it to stdout or disk (`keychute ssh`, CUJ 2c,
+//! tier-2 cli-read via an ephemeral local `ssh-agent`), request secrets from a
+//! Keychute server (`keychute request`, CUJ 2, tier-2 cli-read), and deposit
+//! new ones (`keychute store`, reading the value from stdin).
 //!
-//! `curl` is the one to reach for first: it needs no staging file and no
-//! discipline about what stdout touches, because the secret stays server-side
-//! and only the upstream's response comes back. `request` is for when a
-//! consumer genuinely needs the bytes.
+//! `curl` is the one to reach for first for HTTP: it needs no staging file and
+//! no discipline about what stdout touches, because the secret stays
+//! server-side and only the upstream's response comes back. `ssh` handles SSH
+//! key loading into an isolated ephemeral `ssh-agent` so no private key bytes
+//! touch stdout or disk. `request` is for when a consumer genuinely needs the
+//! bytes.
 //!
-//! The secret goes to STDOUT and nowhere else; all diagnostics go to stderr.
-//! Nothing ever puts a secret value in argv — `store` reads stdin or a file.
+//! For `request`, the secret goes to STDOUT and nowhere else; all diagnostics go
+//! to stderr. Nothing ever puts a secret value in argv — `store` reads stdin
+//! or a file.
 //!
 //! Exit codes: 0 success, 2 usage/config error, 3 denied, 4 timeout/expired
 //! (including an expired grant), 5 payload lost, 1 anything else (including a
-//! grant whose uses are already exhausted).
+//! grant whose uses are already exhausted). Once `keychute ssh` obtains a grant
+//! and launches `ssh`, it propagates `ssh`'s own exit status.
 
 mod curl;
 mod pipeline;
+mod ssh;
 
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
@@ -74,6 +81,12 @@ enum Cmd {
     /// Curl-SHAPED, not a curl: the flags listed here are the whole surface,
     /// they behave as curl's do, and anything absent is absent on purpose.
     Curl(curl::CurlArgs),
+    /// SSH to a host using a Keychute-stored private key via an isolated
+    /// ephemeral local `ssh-agent` (never written to stdout or disk).
+    ///
+    /// Ssh-SHAPED, not an ssh: the flags listed here are the whole surface,
+    /// and anything absent is absent on purpose.
+    Ssh(ssh::SshArgs),
     /// Request a secret; once approved, print it to stdout.
     Request(RequestArgs),
     /// Store a NEW secret, read from stdin (never printed, never in argv).
@@ -155,6 +168,9 @@ pub(crate) struct Failure {
     /// answer about THIS grant and will be repeated, while a dropped
     /// connection says nothing about whether the grant is still good.
     pub(crate) keychute_refusal: bool,
+    /// When true, `main` exits with `code` without printing a `keychute: ...`
+    /// banner (used when forwarding a child `ssh` process's own exit code).
+    pub(crate) silent: bool,
 }
 
 pub(crate) fn fail(code: i32, message: impl Into<String>) -> Failure {
@@ -162,6 +178,16 @@ pub(crate) fn fail(code: i32, message: impl Into<String>) -> Failure {
         code,
         message: message.into(),
         keychute_refusal: false,
+        silent: false,
+    }
+}
+
+pub(crate) fn silent_exit(code: i32) -> Failure {
+    Failure {
+        code,
+        message: String::new(),
+        keychute_refusal: false,
+        silent: true,
     }
 }
 
@@ -347,7 +373,7 @@ pub(crate) fn report_resolution(requested_secret: &str, st: &StatusResponse) {
 
 /// Derive the grant-read idempotency key from the request's idempotency key.
 /// Stable across retries so a lost response replays (IMPLEMENTATION addendum #6).
-fn read_idempotency_key(request_key: &str) -> String {
+pub(crate) fn read_idempotency_key(request_key: &str) -> String {
     format!("cli-{request_key}")
 }
 
@@ -823,7 +849,7 @@ pub(crate) async fn wait_for_resolution(
 /// loop: a truncated or unreadable body retries with the same key and replays
 /// server-side. Only a fully parsed, definitive 4xx (including 410) stops the
 /// retries.
-async fn read_grant(
+pub(crate) async fn read_grant(
     cfg: &Config,
     http: &reqwest::Client,
     grant_id: Uuid,
@@ -1198,6 +1224,7 @@ async fn run(cli: Cli) -> CliResult<()> {
     let http = build_http_client(&cfg)?;
     match cli.cmd {
         Cmd::Curl(args) => curl::run_curl(&cfg, &http, args).await,
+        Cmd::Ssh(args) => ssh::run_ssh(&cfg, &http, args).await,
         Cmd::Request(args) => run_request(&cfg, &http, args).await,
         Cmd::Store(args) => run_store(&cfg, &http, args).await,
         Cmd::Status { request_id } => run_status(&cfg, &http, &request_id).await,
@@ -1211,7 +1238,9 @@ async fn main() {
     let code = match run(cli).await {
         Ok(()) => 0,
         Err(f) => {
-            eprintln!("keychute: {}", f.message);
+            if !f.silent {
+                eprintln!("keychute: {}", f.message);
+            }
             f.code
         }
     };

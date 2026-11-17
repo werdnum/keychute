@@ -17,11 +17,13 @@ v1 server-side implementation (design milestones M0–M3) plus packaging:
   notifier with request-row outbox, audit log.
 - `cli/` — the `keychute` CLI: `keychute curl <url> --secret <name>` to make an
   authenticated HTTP call without ever holding the credential (tier 0 — the
-  server attaches it and streams the response back), `keychute request <secret>
-  | consumer…` to get a secret out when a consumer genuinely needs the bytes
-  (tier 2, human approval in the loop), and `… | keychute store <secret>` to
-  deposit a new one (opt-in per client, create-only — it never replaces a
-  stored secret).
+  server attaches it and streams the response back), `keychute ssh
+  [user@]host --secret <name>` to run OpenSSH `ssh` using a Keychute-stored
+  private key loaded into an ephemeral local `ssh-agent` without writing key
+  bytes to stdout or disk (tier 2, human approval in the loop), `keychute
+  request <secret> | consumer…` to get a secret out when a consumer genuinely
+  needs the bytes (tier 2), and `… | keychute store <secret>` to deposit a new
+  one (opt-in per client, create-only — it never replaces a stored secret).
 - `types/` — shared API types.
 - `e2e/` — black-box end-to-end suite: each test boots a fresh Postgres
   database, a real server process, a TLS recording upstream, a fake Pushover,
