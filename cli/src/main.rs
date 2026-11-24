@@ -66,8 +66,13 @@ const MAX_WAIT_NETWORK_ERRORS: u32 = 5;
 /// upload.
 const MAX_SECRET_BYTES: usize = 64 * 1024;
 
+const VERSION: &str = match option_env!("KEYCHUTE_VERSION") {
+    Some(v) if !v.is_empty() => v,
+    _ => env!("CARGO_PKG_VERSION"),
+};
+
 #[derive(Parser)]
-#[command(name = "keychute", version, about = "Keychute secret delivery CLI")]
+#[command(name = "keychute", version = VERSION, about = "Keychute secret delivery CLI")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
