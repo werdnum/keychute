@@ -51,6 +51,23 @@ E2E_DATABASE_URL=postgres://postgres@127.0.0.1:5432/postgres cargo test -p keych
 cargo test -p keychute-e2e -- --ignored --test-threads=1   # slow sweeper tests
 ```
 
+## Installing the CLI
+
+Prebuilt `keychute` binaries (`linux-x86_64`, `linux-aarch64` as static musl
+executables, and `darwin-arm64`) plus `SHA256SUMS` are published as CalVer
+GitHub Releases (`vYYYY.MM.DD`) by `.github/workflows/release.yaml` (weekly
+when release-relevant code has changed, or on demand via `workflow_dispatch`).
+
+```sh
+# Linux (x86_64) — substitute linux-aarch64 or darwin-arm64 as needed
+archive="keychute-linux-x86_64.tar.gz"
+base="https://github.com/werdnum/keychute/releases/latest/download"
+curl -fsSLO "${base}/${archive}"
+curl -fsSLO "${base}/SHA256SUMS"
+grep "  ${archive}\$" SHA256SUMS | sha256sum -c -
+tar -xzf "${archive}" -C ~/.local/bin
+```
+
 ## Deployment
 
 The Helm chart lives in `charts/keychute`; the multi-arch image build and the

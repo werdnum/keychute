@@ -1,0 +1,306 @@
+name: Release
+
+# Publishes prebuilt `keychute` CLI binaries as GitHub Releases on a weekly
+# CalVer schedule (skipping when no release-relevant code changed since the
+# previous release tag) or on demand via workflow_dispatch.
+#
+# Container images and Helm chart digests continue to deploy continuously from
+# .github/workflows/build.yaml; this workflow adds tag-only GitHub Releases
+# (no commit back to main) so off-cluster hosts and laptops can fetch prebuilt
+# CLI binaries without compiling from source.
+on:
+  schedule:
+    # Weekly on Mondays at 05:17 UTC (Sunday evening US Pacific).
+    - cron: '17 5 * * 1'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Optional release tag (defaults to CalVer vYYYY.MM.DD, with .N suffix if already taken)'
+        required: false
+        type: string
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/release.yaml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+# Read-only by default; only the publish job elevates to contents: write to
+# create the tag and GitHub Release.
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    name: Prepare release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      should-build: ${{ steps.plan.outputs.should-build }}
+      should-release: ${{ steps.plan.outputs.should-release }}
+      tag: ${{ steps.plan.outputs.tag }}
+      version: ${{ steps.plan.outputs.version }}
+      commit-sha: ${{ steps.plan.outputs.commit-sha }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Plan release
+        id: plan
+        # Every expression crosses into the shell via env rather than ${{ }}
+        # interpolation; INPUT_TAG is dispatcher-supplied text.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          COMMIT_SHA: ${{ github.sha }}
+          PR_NUMBER: ${{ github.event.number }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          SHOULD_BUILD="false"
+          SHOULD_RELEASE="false"
+          TAG=""
+
+          if [ "${EVENT_NAME}" = "pull_request" ]; then
+            SHOULD_BUILD="true"
+            SHOULD_RELEASE="false"
+            TAG="v0.0.0-pr.${PR_NUMBER}"
+          else
+            if [ "${EVENT_NAME}" = "schedule" ]; then
+              LAST_TAG="$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)"
+              if [ -n "${LAST_TAG}" ]; then
+                NEW_COMMITS="$(git rev-list --count "${LAST_TAG}..HEAD")"
+                if [ "${NEW_COMMITS}" -eq 0 ]; then
+                  echo "HEAD is already at or behind ${LAST_TAG}; skipping scheduled release."
+                  {
+                    echo "should-build=false"
+                    echo "should-release=false"
+                    echo "tag="
+                    echo "version="
+                    echo "commit-sha=${COMMIT_SHA}"
+                  } >> "$GITHUB_OUTPUT"
+                  exit 0
+                fi
+
+                # Exclude automated image-digest bumps (charts/keychute/Chart.yaml
+                # and values.yaml) plus docs/agent-config files so monthly image
+                # rebuilds or doc edits do not trigger empty releases.
+                CHANGED="$(git diff --name-only "${LAST_TAG}" HEAD -- \
+                  cli/ server/ types/ migrations/ charts/ Cargo.toml Cargo.lock Dockerfile \
+                  ':(exclude)charts/keychute/Chart.yaml' \
+                  ':(exclude)charts/keychute/values.yaml')"
+                if [ -z "${CHANGED}" ]; then
+                  echo "No release-relevant code changes since ${LAST_TAG}; skipping scheduled release."
+                  {
+                    echo "should-build=false"
+                    echo "should-release=false"
+                    echo "tag="
+                    echo "version="
+                    echo "commit-sha=${COMMIT_SHA}"
+                  } >> "$GITHUB_OUTPUT"
+                  exit 0
+                fi
+                echo "Release-relevant files changed since ${LAST_TAG}:"
+                echo "${CHANGED}"
+              else
+                echo "No prior release tag found; cutting initial release."
+              fi
+            fi
+
+            if [ "${EVENT_NAME}" = "workflow_dispatch" ] && [ -n "${INPUT_TAG}" ]; then
+              # Validate before writing to $GITHUB_OUTPUT (multi-line values fail
+              # bash =~ because ^/$ do not match internal newlines) or passing to git/gh.
+              if [[ ! "${INPUT_TAG}" =~ ^v[0-9A-Za-z][0-9A-Za-z._-]{0,63}$ ]]; then
+                echo "invalid tag input: must start with 'v' and contain only [0-9A-Za-z._-]" >&2
+                exit 1
+              fi
+              if git rev-parse -q --verify "refs/tags/${INPUT_TAG}" >/dev/null 2>&1; then
+                echo "tag ${INPUT_TAG} already exists" >&2
+                exit 1
+              fi
+              TAG="${INPUT_TAG}"
+            else
+              BASE="v$(date -u +%Y.%m.%d)"
+              TAG="${BASE}"
+              if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null 2>&1; then
+                N=2
+                while git rev-parse -q --verify "refs/tags/${BASE}.${N}" >/dev/null 2>&1; do
+                  N=$((N + 1))
+                done
+                TAG="${BASE}.${N}"
+              fi
+            fi
+
+            SHOULD_BUILD="true"
+            SHOULD_RELEASE="true"
+          fi
+
+          VERSION="${TAG#v}"
+          echo "Planned tag=${TAG} version=${VERSION} should-build=${SHOULD_BUILD} should-release=${SHOULD_RELEASE}"
+
+          {
+            echo "should-build=${SHOULD_BUILD}"
+            echo "should-release=${SHOULD_RELEASE}"
+            echo "tag=${TAG}"
+            echo "version=${VERSION}"
+            echo "commit-sha=${COMMIT_SHA}"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build keychute-${{ matrix.asset_os }}-${{ matrix.asset_arch }}
+    needs: prepare
+    if: needs.prepare.outputs.should-build == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            asset_os: linux
+            asset_arch: x86_64
+            musl: true
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            asset_os: linux
+            asset_arch: aarch64
+            musl: true
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            asset_os: darwin
+            asset_arch: arm64
+            musl: false
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install musl toolchain
+        if: matrix.musl
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build keychute CLI
+        env:
+          TARGET: ${{ matrix.target }}
+          IS_MUSL: ${{ matrix.musl }}
+          KEYCHUTE_VERSION: ${{ needs.prepare.outputs.version }}
+          CARGO_TERM_COLOR: always
+          CARGO_PROFILE_RELEASE_STRIP: symbols
+        run: |
+          set -euo pipefail
+          if [ "${IS_MUSL}" = "true" ]; then
+            TARGET_UNDER="${TARGET//-/_}"
+            TARGET_UPPER="$(echo "${TARGET_UNDER}" | tr '[:lower:]' '[:upper:]')"
+            export "CC_${TARGET_UNDER}=musl-gcc"
+            export "CARGO_TARGET_${TARGET_UPPER}_LINKER=musl-gcc"
+          fi
+          cargo build --release --locked --target "${TARGET}" -p keychute-cli
+
+      - name: Verify and package binary
+        env:
+          TARGET: ${{ matrix.target }}
+          IS_MUSL: ${{ matrix.musl }}
+          ASSET_NAME: keychute-${{ matrix.asset_os }}-${{ matrix.asset_arch }}
+          EXPECTED_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          BIN="target/${TARGET}/release/keychute"
+          chmod 0755 "${BIN}"
+          file "${BIN}"
+
+          ACTUAL_VERSION="$("${BIN}" --version)"
+          echo "Built: ${ACTUAL_VERSION}"
+          if [ "${ACTUAL_VERSION}" != "keychute ${EXPECTED_VERSION}" ]; then
+            echo "unexpected --version output: got '${ACTUAL_VERSION}', expected 'keychute ${EXPECTED_VERSION}'" >&2
+            exit 1
+          fi
+
+          if [ "${IS_MUSL}" = "true" ]; then
+            LDD_OUT="$(ldd "${BIN}" 2>&1 || true)"
+            echo "${LDD_OUT}"
+            if ! echo "${LDD_OUT}" | grep -qE 'not a dynamic executable|statically linked'; then
+              echo "expected a statically linked musl binary" >&2
+              exit 1
+            fi
+          fi
+
+          mkdir -p dist
+          COPYFILE_DISABLE=1 tar -C "target/${TARGET}/release" -czf "dist/${ASSET_NAME}.tar.gz" keychute
+
+      - name: Upload release archive
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: release-${{ matrix.asset_os }}-${{ matrix.asset_arch }}
+          path: dist/keychute-${{ matrix.asset_os }}-${{ matrix.asset_arch }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub Release
+    needs: [prepare, build]
+    # Double-gate on event_name in addition to should-release so PR runs can
+    # never publish even if prepare were misconfigured.
+    if: github.event_name != 'pull_request' && needs.prepare.outputs.should-release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download release archives
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+
+      - name: Generate checksums and create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          COMMIT_SHA: ${{ needs.prepare.outputs.commit-sha }}
+        run: |
+          set -euo pipefail
+          cd dist
+
+          # Verify all three expected archives are present before publishing.
+          for f in \
+            keychute-linux-x86_64.tar.gz \
+            keychute-linux-aarch64.tar.gz \
+            keychute-darwin-arm64.tar.gz; do
+            test -s "${f}"
+          done
+
+          LC_ALL=C sha256sum keychute-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+          gh release create "${TAG}" \
+            keychute-linux-x86_64.tar.gz \
+            keychute-linux-aarch64.tar.gz \
+            keychute-darwin-arm64.tar.gz \
+            SHA256SUMS \
+            --target "${COMMIT_SHA}" \
+            --title "${TAG}" \
+            --generate-notes \
+            --latest
